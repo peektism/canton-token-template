@@ -4,7 +4,19 @@
 module SimpleToken.Holding where
 
 import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
 import Splice.Api.Token.MetadataV1
+import Splice.TokenStandard.Utils qualified as TokenStandard
+
+import SimpleToken.Experimental.Cip112.Account
+  ( Account
+  , accountAuthority
+  , accountObservers
+  , assertSupportedRegularAccount
+  , isBasicAccount
+  , isProviderManagedRegularAccount
+  , regularAccountProvider
+  )
 
 -- | A simple, unlocked holding of a token instrument.
 template SimpleHolding
@@ -22,6 +34,14 @@ template SimpleHolding
       view = HoldingView with
         owner
         instrumentId
+        amount
+        lock = None
+        meta
+
+    interface instance HoldingV2.Holding for SimpleHolding where
+      view = HoldingV2.HoldingView with
+        account = TokenStandard.basicAccount owner
+        instrumentId = TokenStandard.upcast instrumentId
         amount
         lock = None
         meta
@@ -60,3 +80,156 @@ template LockedSimpleHolding
         amount
         lock = Some lock
         meta
+
+    interface instance HoldingV2.Holding for LockedSimpleHolding where
+      view = HoldingV2.HoldingView with
+        account = TokenStandard.basicAccount owner
+        instrumentId = TokenStandard.upcast instrumentId
+        amount
+        lock = Some (TokenStandard.upcast lock)
+        meta
+
+-- | Experimental V2-only holding for regular provider-managed accounts.
+-- V1 holdings remain party-owned; this template is intentionally not a V1
+-- Holding implementation.
+template ProviderManagedSimpleHolding
+  with
+    admin : Party
+    account : Account
+    instrumentId : InstrumentId
+    amount : Decimal
+    meta : Metadata
+  where
+    signatory admin, regularAccountProvider account
+    observer accountObservers account
+    ensure amount > 0.0 && instrumentId.admin == admin && isProviderManagedRegularAccount account
+
+    interface instance HoldingV2.Holding for ProviderManagedSimpleHolding where
+      view = HoldingV2.HoldingView with
+        account
+        instrumentId = TokenStandard.upcast instrumentId
+        amount
+        lock = None
+        meta
+
+-- | Experimental V2-only locked holding for regular provider-managed
+-- accounts. The provider controls archival/unlock flows; the owner observes.
+template ProviderManagedLockedHolding
+  with
+    admin : Party
+    account : Account
+    instrumentId : InstrumentId
+    amount : Decimal
+    lock : Lock
+    extraObservers : [Party]
+    meta : Metadata
+  where
+    signatory admin, regularAccountProvider account
+    observer accountObservers account
+    observer extraObservers
+    ensure amount > 0.0 && instrumentId.admin == admin && isProviderManagedRegularAccount account
+
+    interface instance HoldingV2.Holding for ProviderManagedLockedHolding where
+      view = HoldingV2.HoldingView with
+        account
+        instrumentId = TokenStandard.upcast instrumentId
+        amount
+        lock = Some (TokenStandard.upcast lock)
+        meta
+
+-- | Convert the preview V2 instrument shape to the V1 shape used internally by
+-- the current simple-token templates.
+downcastInstrumentId : HoldingV2.InstrumentId -> InstrumentId
+downcastInstrumentId instrumentId =
+  InstrumentId with admin = instrumentId.admin; id = instrumentId.id
+
+-- | Create an unlocked V2 holding for either a basic or provider-managed
+-- regular account, preserving V1 behavior for basic accounts.
+createSupportedV2Holding
+  : Party
+  -> Account
+  -> HoldingV2.InstrumentId
+  -> Decimal
+  -> Metadata
+  -> Update (ContractId HoldingV2.Holding)
+createSupportedV2Holding admin account instrumentId amount meta = do
+  assertSupportedRegularAccount "holding.account" account
+  if isBasicAccount account
+    then do
+      cid <- create SimpleHolding with
+        admin
+        owner = accountAuthority admin account
+        instrumentId = downcastInstrumentId instrumentId
+        amount
+        meta
+      pure (toInterfaceContractId @HoldingV2.Holding cid)
+    else do
+      cid <- create ProviderManagedSimpleHolding with
+        admin
+        account
+        instrumentId = downcastInstrumentId instrumentId
+        amount
+        meta
+      pure (toInterfaceContractId @HoldingV2.Holding cid)
+
+-- | Create a locked V2 holding for either supported account shape.
+createSupportedV2LockedHolding
+  : Party
+  -> Account
+  -> HoldingV2.InstrumentId
+  -> Decimal
+  -> Lock
+  -> [Party]
+  -> Metadata
+  -> Update (ContractId HoldingV2.Holding)
+createSupportedV2LockedHolding admin account instrumentId amount lock extraObservers meta = do
+  assertSupportedRegularAccount "lockedHolding.account" account
+  if isBasicAccount account
+    then do
+      cid <- create LockedSimpleHolding with
+        admin
+        owner = accountAuthority admin account
+        instrumentId = downcastInstrumentId instrumentId
+        amount
+        lock
+        extraObservers
+        meta
+      pure (toInterfaceContractId @HoldingV2.Holding cid)
+    else do
+      cid <- create ProviderManagedLockedHolding with
+        admin
+        account
+        instrumentId = downcastInstrumentId instrumentId
+        amount
+        lock
+        extraObservers
+        meta
+      pure (toInterfaceContractId @HoldingV2.Holding cid)
+
+-- | Archive all V2 input holdings and return their total amount. This is the
+-- V2 analogue of the V1 contention guarantee.
+archiveAndSumV2Inputs
+  : Account
+  -> HoldingV2.InstrumentId
+  -> [ContractId HoldingV2.Holding]
+  -> Update Decimal
+archiveAndSumV2Inputs expectedAccount expectedInstrumentId holdingCids = do
+  now <- getTime
+  amounts <- forA holdingCids $ \holdingCid -> do
+    holdingI <- fetch holdingCid
+    let holding = view holdingI
+    assertMsg "V2 input holding account must match transfer/account authorizer"
+      (holding.account == expectedAccount)
+    assertMsg "V2 input holding instrumentId must match transfer/allocation"
+      (holding.instrumentId == expectedInstrumentId)
+    case holding.lock of
+      None -> pure ()
+      Some lock -> do
+        let lockExpired = case lock.expiresAt of
+              None -> False
+              Some t -> now >= t
+        assertMsg "Cannot use V2 holding with unexpired lock as transfer input"
+          lockExpired
+    archive holdingCid
+    pure holding.amount
+  pure (sum amounts)

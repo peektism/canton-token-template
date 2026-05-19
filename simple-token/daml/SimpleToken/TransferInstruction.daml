@@ -4,10 +4,46 @@ module SimpleToken.TransferInstruction where
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
 import Splice.Api.Token.TransferInstructionV1
+import Splice.Api.Token.TransferInstructionV2 qualified as TransferV2
+import Splice.Api.Token.TransferEventsV2 qualified as TransferEventsV2
+import Splice.TokenStandard.Utils qualified as TokenStandard
+
+import DA.Map qualified as Map
 
 import SimpleToken.Holding
 import SimpleToken.ContextUtils
+import SimpleToken.Experimental.Cip112.Account
+  ( accountAuthority
+  , accountObservers
+  , isProviderManagedRegularAccount
+  )
+
+-- | Experimental V2 actor guard markers used before delegating into V1 choices.
+v2TransferAcceptActorFailureMsg : Text
+v2TransferAcceptActorFailureMsg =
+  "SimpleToken V2 TransferInstruction_Accept: actors must equal the receiver owner before V1 delegation"
+
+v2TransferRejectActorFailureMsg : Text
+v2TransferRejectActorFailureMsg =
+  "SimpleToken V2 TransferInstruction_Reject: actors must equal the receiver owner before V1 delegation"
+
+v2TransferWithdrawActorFailureMsg : Text
+v2TransferWithdrawActorFailureMsg =
+  "SimpleToken V2 TransferInstruction_Withdraw: actors must equal the sender owner before V1 delegation"
+
+v2ProviderManagedTransferAcceptActorFailureMsg : Text
+v2ProviderManagedTransferAcceptActorFailureMsg =
+  "SimpleToken V2 provider-managed TransferInstruction_Accept: actors must equal receiver provider"
+
+v2ProviderManagedTransferRejectActorFailureMsg : Text
+v2ProviderManagedTransferRejectActorFailureMsg =
+  "SimpleToken V2 provider-managed TransferInstruction_Reject: actors must equal receiver provider"
+
+v2ProviderManagedTransferWithdrawActorFailureMsg : Text
+v2ProviderManagedTransferWithdrawActorFailureMsg =
+  "SimpleToken V2 provider-managed TransferInstruction_Withdraw: actors must equal sender provider"
 
 -- | A pending transfer instruction backed by a locked holding.
 template SimpleTransferInstruction
@@ -68,6 +104,65 @@ template SimpleTransferInstruction
       transferInstruction_updateImpl _selfCid _arg = do
         fail "TransferInstruction_Update is not supported"
 
+    interface instance TransferV2.TransferInstruction for SimpleTransferInstruction where
+      view = TransferV2.TransferInstructionView with
+        originalInstructionCid = TokenStandard.upcast <$> originalInstructionCid
+        transfer = TokenStandard.upcast transfer
+        expiresAt = Some transfer.executeBefore
+        availableActions = v2PendingTransferActions transfer.sender transfer.receiver
+        meta = emptyMetadata
+
+      transferInstruction_acceptExtraObservers =
+        TokenStandard.transferInstruction_acceptDefaultExtraObservers this
+      transferInstruction_rejectExtraObservers =
+        TokenStandard.transferInstruction_rejectDefaultExtraObservers this
+      transferInstruction_withdrawExtraObservers =
+        TokenStandard.transferInstruction_withdrawDefaultExtraObservers this
+
+      transferInstruction_acceptImpl selfCid arg = do
+        assertMsg v2TransferAcceptActorFailureMsg (arg.actors == [transfer.receiver])
+        result <- TokenStandard.transferInstruction_v2_receiverActor_acceptDefaultImplUsingV1
+          transfer.receiver selfCid arg
+        contextEventLogCid <- lookupFromContextU @(ContractId TransferEventsV2.EventLog)
+          arg.extraArgs.context
+          eventLogContextKey
+        case (contextEventLogCid, result.output) of
+          (Some logCid, TransferV2.TransferInstructionResult_Completed receiverHoldingCids) ->
+            TokenStandard.logTransfer
+              logCid
+              (v2TransferForAcceptEvent transfer lockedHoldingCid)
+              result.senderChangeCids
+              receiverHoldingCids
+          _ -> pure ()
+        pure result
+
+      transferInstruction_rejectImpl selfCid arg = do
+        assertMsg v2TransferRejectActorFailureMsg (arg.actors == [transfer.receiver])
+        TokenStandard.transferInstruction_v2_receiverActor_rejectDefaultImplUsingV1
+          transfer.receiver selfCid arg
+
+      transferInstruction_withdrawImpl selfCid arg = do
+        assertMsg v2TransferWithdrawActorFailureMsg (arg.actors == [transfer.sender])
+        TokenStandard.transferInstruction_v2_senderActor_withdrawDefaultImplUsingV1
+          transfer.sender selfCid arg
+
+
+-- | Experimental CIP-0112 V2 action map for providerless basic accounts only.
+v2PendingTransferActions : Party -> Party -> Map.Map TransferV2.TransferInstructionAction [[Party]]
+v2PendingTransferActions sender receiver = Map.fromList
+  [ (TransferV2.TIA_Withdraw, [[sender]])
+  , (TransferV2.TIA_Accept, [[receiver]])
+  , (TransferV2.TIA_Reject, [[receiver]])
+  ]
+
+v2TransferForAcceptEvent
+  : Transfer
+  -> ContractId LockedSimpleHolding
+  -> TransferV2.Transfer
+v2TransferForAcceptEvent transfer lockedHoldingCid =
+  (TokenStandard.upcast transfer) with
+    inputHoldingCids = [toInterfaceContractId @HoldingV2.Holding lockedHoldingCid]
+
 
 -- | Helper: archive locked holding and return unlocked holding to sender.
 -- Supports the expire-lock pattern: if the locked holding was already archived
@@ -102,3 +197,128 @@ returnLockedFundsToSender admin transfer lockedHoldingCid extraArgs = do
         output = TransferInstructionResult_Failed
         senderChangeCids = []
         meta = txKindMeta "transfer"
+
+
+-- | Experimental V2-only transfer instruction for regular provider-managed
+-- accounts. Basic-account transfers continue to use SimpleTransferInstruction
+-- and V1 delegation.
+template ProviderManagedTransferInstruction
+  with
+    admin : Party
+    transfer : TransferV2.Transfer
+    lockedHoldingCid : ContractId HoldingV2.Holding
+    originalInstructionCid : Optional (ContractId TransferV2.TransferInstruction)
+  where
+    ensure isProviderManagedRegularAccount transfer.sender || isProviderManagedRegularAccount transfer.receiver
+    signatory admin, accountAuthority admin transfer.sender
+    observer accountObservers transfer.sender
+    observer accountObservers transfer.receiver
+
+    interface instance TransferV2.TransferInstruction for ProviderManagedTransferInstruction where
+      view = TransferV2.TransferInstructionView with
+        originalInstructionCid
+        transfer
+        expiresAt = Some transfer.executeBefore
+        availableActions =
+          v2ProviderManagedTransferActions admin transfer.sender transfer.receiver
+        meta = emptyMetadata
+
+      transferInstruction_acceptExtraObservers =
+        TokenStandard.transferInstruction_acceptDefaultExtraObservers this
+      transferInstruction_rejectExtraObservers =
+        TokenStandard.transferInstruction_rejectDefaultExtraObservers this
+      transferInstruction_withdrawExtraObservers =
+        TokenStandard.transferInstruction_withdrawDefaultExtraObservers this
+
+      transferInstruction_acceptImpl selfCid arg = do
+        assertMsg v2ProviderManagedTransferAcceptActorFailureMsg
+          (arg.actors == [accountAuthority admin transfer.receiver])
+        now <- getTime
+        assertMsg "Provider-managed transfer has expired"
+          (now < transfer.executeBefore)
+        archive (coerceContractId selfCid : ContractId ProviderManagedTransferInstruction)
+        lockedHolding <- fetch lockedHoldingCid
+        let lockedView = view lockedHolding
+        assertMsg "Provider-managed transfer locked input account must match sender"
+          (lockedView.account == transfer.sender)
+        assertMsg "Provider-managed transfer locked input instrument must match transfer"
+          (lockedView.instrumentId == transfer.instrumentId)
+        archive lockedHoldingCid
+        receiverCid <- createSupportedV2Holding
+          admin
+          transfer.receiver
+          transfer.instrumentId
+          transfer.amount
+          arg.extraArgs.meta
+        senderChangeCids <- if lockedView.amount > transfer.amount
+          then do
+            changeCid <- createSupportedV2Holding
+              admin
+              transfer.sender
+              transfer.instrumentId
+              (lockedView.amount - transfer.amount)
+              emptyMetadata
+            pure [changeCid]
+          else pure []
+        contextEventLogCid <- lookupFromContextU @(ContractId TransferEventsV2.EventLog)
+          arg.extraArgs.context
+          eventLogContextKey
+        case contextEventLogCid of
+          Some logCid ->
+            TokenStandard.logTransfer
+              logCid
+              (transfer with inputHoldingCids = [lockedHoldingCid])
+              senderChangeCids
+              [receiverCid]
+          None -> pure ()
+        pure TransferV2.TransferInstructionResult with
+          output = TransferV2.TransferInstructionResult_Completed with
+            receiverHoldingCids = [receiverCid]
+          senderChangeCids
+          meta = txKindMeta "transfer"
+
+      transferInstruction_rejectImpl selfCid arg = do
+        assertMsg v2ProviderManagedTransferRejectActorFailureMsg
+          (arg.actors == [accountAuthority admin transfer.receiver])
+        returnProviderManagedTransferFundsToSender selfCid transfer lockedHoldingCid
+
+      transferInstruction_withdrawImpl selfCid arg = do
+        assertMsg v2ProviderManagedTransferWithdrawActorFailureMsg
+          (arg.actors == [accountAuthority admin transfer.sender])
+        returnProviderManagedTransferFundsToSender selfCid transfer lockedHoldingCid
+
+v2ProviderManagedTransferActions
+  : Party
+  -> HoldingV2.Account
+  -> HoldingV2.Account
+  -> Map.Map TransferV2.TransferInstructionAction [[Party]]
+v2ProviderManagedTransferActions admin sender receiver = Map.fromList
+  [ (TransferV2.TIA_Withdraw, [[accountAuthority admin sender]])
+  , (TransferV2.TIA_Accept, [[accountAuthority admin receiver]])
+  , (TransferV2.TIA_Reject, [[accountAuthority admin receiver]])
+  ]
+
+returnProviderManagedTransferFundsToSender
+  : ContractId TransferV2.TransferInstruction
+  -> TransferV2.Transfer
+  -> ContractId HoldingV2.Holding
+  -> Update TransferV2.TransferInstructionResult
+returnProviderManagedTransferFundsToSender selfCid transfer lockedHoldingCid = do
+  archive (coerceContractId selfCid : ContractId ProviderManagedTransferInstruction)
+  lockedHolding <- fetch lockedHoldingCid
+  let lockedView = view lockedHolding
+  assertMsg "Provider-managed transfer locked input account must match sender"
+    (lockedView.account == transfer.sender)
+  assertMsg "Provider-managed transfer locked input instrument must match transfer"
+    (lockedView.instrumentId == transfer.instrumentId)
+  archive lockedHoldingCid
+  returnCid <- createSupportedV2Holding
+    transfer.instrumentId.admin
+    transfer.sender
+    transfer.instrumentId
+    lockedView.amount
+    emptyMetadata
+  pure TransferV2.TransferInstructionResult with
+    output = TransferV2.TransferInstructionResult_Failed
+    senderChangeCids = [returnCid]
+    meta = txKindMeta "transfer"

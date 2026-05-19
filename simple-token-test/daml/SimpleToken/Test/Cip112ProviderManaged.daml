@@ -1,0 +1,592 @@
+-- | Experimental CIP-0112 provider-managed account authority probes.
+module SimpleToken.Test.Cip112ProviderManaged where
+
+import DA.Map qualified as Map
+import DA.Text qualified as Text
+import DA.TextMap qualified as TextMap
+
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.TransferInstructionV2 qualified as TransferV2
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocationInstructionV2
+
+import SimpleToken.Allocation
+  ( v2AllocationCancelActorFailureMsg
+  , v2AllocationInstructionAcceptActorFailureMsg
+  , v2AllocationWithdrawActorFailureMsg
+  )
+import SimpleToken.Experimental.Cip112.Account
+  ( Account
+  , providerManagedAccount
+  , regularAccountProvider
+  , supportedRegularAccountFailureMsg
+  )
+import SimpleToken.Holding
+  ( ProviderManagedSimpleHolding(..)
+  )
+import SimpleToken.Rules
+  ( v2ProviderManagedTransferFactoryActorFailureMsg
+  )
+import SimpleToken.TransferInstruction
+  ( v2ProviderManagedTransferAcceptActorFailureMsg
+  )
+import SimpleToken.Test.Setup
+import SimpleToken.Testing.SimpleRegistry
+import SimpleToken.Test.Cip112Allocation qualified as V2Allocation
+import SimpleToken.Test.Cip112Transfer qualified as V2Transfer
+
+import Daml.Script
+
+staleInstructionFailureMsg : Text
+staleInstructionFailureMsg = "NotActive"
+
+providerManagedInputAccountFailureMsg : Text
+providerManagedInputAccountFailureMsg =
+  "V2 input holding account must match transfer/account authorizer"
+
+providerManagedLockedInputFailureMsg : Text
+providerManagedLockedInputFailureMsg =
+  "Cannot use V2 holding with unexpired lock as transfer input"
+
+providerManagedAllocationLockedInputFailureMsg : Text
+providerManagedAllocationLockedInputFailureMsg =
+  "Cannot use V2 holding with unexpired lock as allocation input"
+
+submitError : Party -> Disclosures -> Commands a -> Script SubmitError
+submitError p (Disclosures ds) cmds =
+  submitWithError (actAs p <> discloseMany ds) cmds
+
+assertSubmitErrorContains : Text -> SubmitError -> Script ()
+assertSubmitErrorContains expected err =
+  assertMsg
+    ("Expected submit error to contain " <> show expected <> ", got: " <> show err)
+    (expected `Text.isInfixOf` show err)
+
+senderAccount : TestParties -> Account
+senderAccount parties =
+  providerManagedAccount parties.alice parties.charlie "alice-managed"
+
+receiverAccount : TestParties -> Account
+receiverAccount parties =
+  providerManagedAccount parties.bob parties.executor "bob-managed"
+
+mkProviderTransfer
+  : SimpleRegistry
+  -> Account
+  -> Account
+  -> Decimal
+  -> [ContractId HoldingV2.Holding]
+  -> TransferV2.Transfer
+mkProviderTransfer registry sender receiver amount inputHoldingCids =
+  TransferV2.Transfer with
+    sender
+    receiver
+    amount
+    instrumentId = HoldingV2.InstrumentId with
+      admin = registry.admin
+      id = registry.instrumentId.id
+    requestedAt = demoTime
+    executeBefore = futureDeadline
+    inputHoldingCids
+    meta = emptyMetadata
+
+createProviderManagedHolding
+  : SimpleRegistry
+  -> Account
+  -> Decimal
+  -> Script (ContractId HoldingV2.Holding)
+createProviderManagedHolding registry account amount = do
+  cid <- submitMulti [registry.admin, regularAccountProvider account] [] $
+    createCmd ProviderManagedSimpleHolding with
+      admin = registry.admin
+      account
+      instrumentId = registry.instrumentId
+      amount
+      meta = emptyMetadata
+  pure (toInterfaceContractId @HoldingV2.Holding cid)
+
+queryV2HoldingsForAccount
+  : Party
+  -> Account
+  -> Script [(ContractId HoldingV2.Holding, HoldingV2.HoldingView)]
+queryV2HoldingsForAccount observer account = do
+  holdings <- queryInterface @HoldingV2.Holding observer
+  pure do
+    (cid, Some holdingView) <- holdings
+    guard (holdingView.account == account)
+    pure (cid, holdingView)
+
+queryUnlockedV2Holdings
+  : Party
+  -> Account
+  -> Script [(ContractId HoldingV2.Holding, HoldingV2.HoldingView)]
+queryUnlockedV2Holdings observer account = do
+  holdings <- queryV2HoldingsForAccount observer account
+  pure do
+    (cid, holdingView) <- holdings
+    guard (holdingView.lock == None)
+    pure (cid, holdingView)
+
+queryLockedV2Holdings
+  : Party
+  -> Account
+  -> Script [(ContractId HoldingV2.Holding, HoldingV2.HoldingView)]
+queryLockedV2Holdings observer account = do
+  holdings <- queryV2HoldingsForAccount observer account
+  pure do
+    (cid, holdingView) <- holdings
+    guard (holdingView.lock /= None)
+    pure (cid, holdingView)
+
+checkProviderManagedBalance : Party -> Account -> Decimal -> Script ()
+checkProviderManagedBalance observer account expected = do
+  holdings <- queryUnlockedV2Holdings observer account
+  let actual = sum (map (\(_, holdingView) -> holdingView.amount) holdings)
+  assertMsg
+    ("Expected provider-managed balance " <> show expected <> ", got " <> show actual)
+    (actual == expected)
+
+assertNoProviderManagedInstructionVisible
+  : Party
+  -> ContractId TransferV2.TransferInstruction
+  -> Script ()
+assertNoProviderManagedInstructionVisible observer instrCid = do
+  instrs <- queryInterface @TransferV2.TransferInstruction observer
+  let matches = do
+        (cid, Some _view) <- instrs
+        guard (cid == instrCid)
+        pure cid
+  assert (null matches)
+
+mkManagedAllocationArgsForSide
+  : SimpleRegistry
+  -> Account
+  -> Account
+  -> Party
+  -> AllocationV2.TransferSide
+  -> Decimal
+  -> [ContractId HoldingV2.Holding]
+  -> Bool
+  -> AllocationInstructionV2.AllocationFactory_Allocate
+mkManagedAllocationArgsForSide registry authorizer otherSide executor side amount inputCids committed =
+  AllocationInstructionV2.AllocationFactory_Allocate with
+    allocation = AllocationV2.AllocationSpecification with
+      settlement = AllocationV2.SettlementInfo with
+        executors = [executor]
+        settlementRef = AllocationV2.Reference with id = "provider-managed-settlement"; cid = None
+        settlementDeadline = Some futureDeadline
+        meta = emptyMetadata
+      admin = registry.admin
+      authorizer
+      transferLegSides =
+        [ AllocationV2.TransferLegSide with
+            transferLegId = "leg-1"
+            side
+            otherside = otherSide
+            amount
+            instrumentId = registry.instrumentId.id
+            meta = emptyMetadata
+        ]
+      nextIterationFunding = None
+      committed
+      meta = emptyMetadata
+    requestedAt = demoTime
+    inputHoldingCids = inputCids
+    extraArgs = emptyExtraArgs
+    actors = [regularAccountProvider authorizer]
+
+mkManagedTransferLeg
+  : SimpleRegistry
+  -> Account
+  -> Account
+  -> Decimal
+  -> AllocationV2.TransferLeg
+mkManagedTransferLeg registry sender receiver amount =
+  AllocationV2.TransferLeg with
+    transferLegId = "leg-1"
+    sender
+    receiver
+    amount
+    instrumentId = registry.instrumentId.id
+    meta = emptyMetadata
+
+createPendingManagedAllocation
+  : SimpleRegistry
+  -> Account
+  -> Account
+  -> Party
+  -> AllocationV2.TransferSide
+  -> Decimal
+  -> [ContractId HoldingV2.Holding]
+  -> Bool
+  -> Script (ContractId AllocationInstructionV2.AllocationInstruction)
+createPendingManagedAllocation registry authorizer otherSide executor side amount inputCids committed = do
+  (afCid, rulesDisc) <- V2Allocation.getV2AllocationFactory registry
+  let args = mkManagedAllocationArgsForSide
+        registry authorizer otherSide executor side amount inputCids committed
+  result <- submitWithDisc (regularAccountProvider authorizer) rulesDisc $
+    V2Allocation.exerciseV2AllocationFactory afCid args
+  case result.output of
+    AllocationInstructionV2.AllocationInstructionResult_Pending instrCid -> pure instrCid
+    _ -> fail "Expected provider-managed allocation factory to create a pending instruction"
+
+acceptManagedAllocation
+  : Account
+  -> ContractId AllocationInstructionV2.AllocationInstruction
+  -> Script AllocationInstructionV2.AllocationInstructionResult
+acceptManagedAllocation authorizer instrCid =
+  submit (regularAccountProvider authorizer) $
+    exerciseCmd instrCid AllocationInstructionV2.AllocationInstruction_Accept with
+      actors = [regularAccountProvider authorizer]
+      extraArgs = emptyExtraArgs
+
+createAcceptedManagedAllocation
+  : SimpleRegistry
+  -> Account
+  -> Account
+  -> Party
+  -> AllocationV2.TransferSide
+  -> Decimal
+  -> [ContractId HoldingV2.Holding]
+  -> Bool
+  -> Script (ContractId AllocationV2.Allocation)
+createAcceptedManagedAllocation registry authorizer otherSide executor side amount inputCids committed = do
+  instrCid <- createPendingManagedAllocation
+    registry authorizer otherSide executor side amount inputCids committed
+  result <- acceptManagedAllocation authorizer instrCid
+  case result.output of
+    AllocationInstructionV2.AllocationInstructionResult_Completed allocCid -> pure allocCid
+    _ -> fail "Expected provider-managed allocation instruction accept to complete"
+
+-- | Provider-managed transfers use provider actors and expose owner/provider
+-- account parties without expanding to unrelated observers.
+test_providerManagedTransferAuthorityMatrix : Script ()
+test_providerManagedTransferAuthorityMatrix = do
+  TestEnv{..} <- setupTestEnv
+  mallory <- allocatePartyByHint (PartyIdHint "mallory-provider-transfer")
+  let sender = senderAccount parties
+      receiver = receiverAccount parties
+  h1 <- createProviderManagedHolding registry sender 100.0
+  (tfCid, rulesDisc) <- V2Transfer.getV2TransferFactory registry
+
+  result <- submitWithDisc parties.charlie rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkProviderTransfer registry sender receiver 70.0 [h1]
+      actors = [parties.charlie]
+      extraArgs = emptyExtraArgs
+
+  case result.output of
+    TransferV2.TransferInstructionResult_Pending instrCid -> do
+      ownerView <- V2Transfer.querySingleV2TransferInstruction parties.alice instrCid
+      providerView <- V2Transfer.querySingleV2TransferInstruction parties.charlie instrCid
+      receiverProviderView <- V2Transfer.querySingleV2TransferInstruction parties.executor instrCid
+      assert (ownerView == providerView)
+      assert (providerView == receiverProviderView)
+      assert (ownerView.transfer.sender == sender)
+      assert (ownerView.transfer.receiver == receiver)
+      assert (ownerView.availableActions == Map.fromList
+        [ (TransferV2.TIA_Withdraw, [[parties.charlie]])
+        , (TransferV2.TIA_Accept, [[parties.executor]])
+        , (TransferV2.TIA_Reject, [[parties.executor]])
+        ])
+      assertNoProviderManagedInstructionVisible mallory instrCid
+
+      acceptResult <- submit parties.executor $
+        exerciseCmd instrCid TransferV2.TransferInstruction_Accept with
+          actors = [parties.executor]
+          extraArgs = emptyExtraArgs
+      case acceptResult.output of
+        TransferV2.TransferInstructionResult_Completed receiverHoldingCids ->
+          assert (length receiverHoldingCids == 1)
+        _ -> fail "Expected provider-managed transfer accept to complete"
+      checkProviderManagedBalance parties.alice sender 30.0
+      checkProviderManagedBalance parties.bob receiver 70.0
+    _ -> fail "Expected provider-managed transfer to create a pending instruction"
+
+-- | Provider-managed allocation creation, acceptance, and settlement preserve
+-- provider movement authority while settlement remains executor/admin driven.
+test_providerManagedAllocationSettlement : Script ()
+test_providerManagedAllocationSettlement = do
+  TestEnv{..} <- setupTestEnv
+  let sender = senderAccount parties
+      receiver = receiverAccount parties
+      amount = 70.0
+      transferLeg = mkManagedTransferLeg registry sender receiver amount
+      settlement = (mkManagedAllocationArgsForSide
+        registry sender receiver parties.executor AllocationV2.SenderSide amount [] False).allocation.settlement
+  h1 <- createProviderManagedHolding registry sender 100.0
+
+  senderInstrCid <- createPendingManagedAllocation
+    registry sender receiver parties.executor AllocationV2.SenderSide amount [h1] False
+  senderInstrView <- V2Allocation.querySingleV2AllocationInstruction parties.charlie senderInstrCid
+  assert (senderInstrView.availableActions == Map.fromList
+    [ (AllocationInstructionV2.AIA_Accept, [[parties.charlie]])
+    , (AllocationInstructionV2.AIA_Withdraw, [[parties.charlie]])
+    ])
+  senderAllocResult <- acceptManagedAllocation sender senderInstrCid
+  senderAllocCid <- case senderAllocResult.output of
+    AllocationInstructionV2.AllocationInstructionResult_Completed allocCid -> pure allocCid
+    _ -> fail "Expected sender provider-managed allocation to complete"
+
+  receiverAllocCid <- createAcceptedManagedAllocation
+    registry receiver sender parties.executor AllocationV2.ReceiverSide amount [] False
+  senderAllocView <- V2Allocation.querySingleV2Allocation parties.charlie senderAllocCid
+  assert (senderAllocView.availableActions == Map.fromList
+    [ (AllocationV2.AA_Withdraw, [[parties.charlie]])
+    , (AllocationV2.AA_Cancel, [[parties.executor]])
+    , (AllocationV2.AA_Settle, [[registry.admin, parties.executor]])
+    ])
+
+  (sfCid, rulesDisc) <- V2Allocation.getV2SettlementFactory registry
+  settleResult <- submitWithDisc parties.executor rulesDisc $
+    V2Allocation.exerciseV2SettlementFactory
+      sfCid settlement [transferLeg] [senderAllocCid, receiverAllocCid] [parties.executor]
+
+  assert (length settleResult.allocationSettleResults == 2)
+  V2Allocation.assertNoV2Allocation parties.charlie senderAllocCid
+  V2Allocation.assertNoV2Allocation parties.executor receiverAllocCid
+  checkProviderManagedBalance parties.alice sender 30.0
+  checkProviderManagedBalance parties.bob receiver 70.0
+
+-- | Provider-managed allocation recovery paths stay explicit: pending
+-- instruction withdraw is provider-controlled, allocation withdraw is
+-- provider-controlled, and cancel remains executor-controlled.
+test_providerManagedAllocationWithdrawAndCancel : Script ()
+test_providerManagedAllocationWithdrawAndCancel = do
+  TestEnv{..} <- setupTestEnv
+  let sender = senderAccount parties
+      receiver = receiverAccount parties
+      amount = 40.0
+  h1 <- createProviderManagedHolding registry sender 100.0
+  pendingCid <- createPendingManagedAllocation
+    registry sender receiver parties.executor AllocationV2.SenderSide amount [h1] False
+  withdrawPending <- submit parties.charlie $
+    exerciseCmd pendingCid AllocationInstructionV2.AllocationInstruction_Withdraw with
+      actors = [parties.charlie]
+      extraArgs = emptyExtraArgs
+  case TextMap.lookup registry.instrumentId.id withdrawPending.authorizerChangeCids of
+    Some returnedCids -> assert (returnedCids == [h1])
+    None -> fail "Expected pending provider-managed withdraw to return input CID"
+  V2Allocation.assertNoV2AllocationInstruction parties.charlie pendingCid
+
+  h2 <- createProviderManagedHolding registry sender 60.0
+  withdrawAllocCid <- createAcceptedManagedAllocation
+    registry sender receiver parties.executor AllocationV2.SenderSide amount [h2] False
+  withdrawResult <- submit parties.charlie $
+    exerciseCmd withdrawAllocCid AllocationV2.Allocation_Withdraw with
+      actors = [parties.charlie]
+      extraArgs = emptyExtraArgs
+  case withdrawResult.output of
+    AllocationV2.AllocationResult_Withdrawn -> pure ()
+    _ -> fail "Expected provider-managed allocation withdraw"
+  V2Allocation.assertNoV2Allocation parties.charlie withdrawAllocCid
+
+  h3 <- createProviderManagedHolding registry sender 50.0
+  cancelAllocCid <- createAcceptedManagedAllocation
+    registry sender receiver parties.executor AllocationV2.SenderSide amount [h3] False
+  wrongCancelErr <- submitError parties.charlie mempty $
+    exerciseCmd cancelAllocCid AllocationV2.Allocation_Cancel with
+      actors = [parties.charlie]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains v2AllocationCancelActorFailureMsg wrongCancelErr
+  cancelResult <- submit parties.executor $
+    exerciseCmd cancelAllocCid AllocationV2.Allocation_Cancel with
+      actors = [parties.executor]
+      extraArgs = emptyExtraArgs
+  case cancelResult.output of
+    AllocationV2.AllocationResult_Cancelled -> pure ()
+    _ -> fail "Expected provider-managed allocation cancel"
+  V2Allocation.assertNoV2Allocation parties.executor cancelAllocCid
+
+-- | Missing providers and unauthorized actor lists are rejected before input
+-- consumption.
+test_providerManagedRejectsMissingProviderAndUnauthorizedActors : Script ()
+test_providerManagedRejectsMissingProviderAndUnauthorizedActors = do
+  TestEnv{..} <- setupTestEnv
+  let missingProvider = HoldingV2.Account with
+        owner = Some parties.alice
+        provider = None
+        id = "managed-but-missing-provider"
+      receiver = receiverAccount parties
+  (tfCid, rulesDisc) <- V2Transfer.getV2TransferFactory registry
+
+  missingProviderErr <- submitError parties.alice rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkProviderTransfer registry missingProvider receiver 10.0 []
+      actors = [parties.alice]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains supportedRegularAccountFailureMsg missingProviderErr
+
+  duplicateActorErr <- submitError parties.charlie rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkProviderTransfer registry (senderAccount parties) receiver 10.0 []
+      actors = [parties.charlie, parties.charlie]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains v2ProviderManagedTransferFactoryActorFailureMsg duplicateActorErr
+
+  wrongProviderErr <- submitError parties.executor rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkProviderTransfer registry (senderAccount parties) receiver 10.0 []
+      actors = [parties.executor]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains v2ProviderManagedTransferFactoryActorFailureMsg wrongProviderErr
+
+-- | Wrong owner and provider spoofing attempts fail on the V2 input account
+-- match, leaving the referenced holding live.
+test_providerManagedRejectsWrongOwnerAndProviderSpoofing : Script ()
+test_providerManagedRejectsWrongOwnerAndProviderSpoofing = do
+  TestEnv{..} <- setupTestEnv
+  let sender = senderAccount parties
+      receiver = receiverAccount parties
+      wrongOwnerSender = providerManagedAccount parties.bob parties.charlie "alice-managed"
+      spoofedProviderSender = providerManagedAccount parties.alice parties.executor "alice-managed"
+  h1 <- createProviderManagedHolding registry sender 100.0
+  h2 <- createProviderManagedHolding registry sender 100.0
+  (tfCid, rulesDisc) <- V2Transfer.getV2TransferFactory registry
+
+  wrongOwnerErr <- submitError parties.charlie rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkProviderTransfer registry wrongOwnerSender receiver 10.0 [h1]
+      actors = [parties.charlie]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains providerManagedInputAccountFailureMsg wrongOwnerErr
+
+  h2Disc <- queryDisc @ProviderManagedSimpleHolding parties.charlie (coerceContractId h2)
+  spoofErr <- submitError parties.executor (rulesDisc <> h2Disc) $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkProviderTransfer registry spoofedProviderSender receiver 10.0 [h2]
+      actors = [parties.executor]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains providerManagedInputAccountFailureMsg spoofErr
+  checkProviderManagedBalance parties.alice sender 200.0
+
+-- | Stale provider-managed transfer instructions cannot be reused after a
+-- successful accept archives the instruction.
+test_providerManagedRejectsStaleTransferInstruction : Script ()
+test_providerManagedRejectsStaleTransferInstruction = do
+  TestEnv{..} <- setupTestEnv
+  let sender = senderAccount parties
+      receiver = receiverAccount parties
+  h1 <- createProviderManagedHolding registry sender 100.0
+  (tfCid, rulesDisc) <- V2Transfer.getV2TransferFactory registry
+  result <- submitWithDisc parties.charlie rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkProviderTransfer registry sender receiver 70.0 [h1]
+      actors = [parties.charlie]
+      extraArgs = emptyExtraArgs
+  instrCid <- case result.output of
+    TransferV2.TransferInstructionResult_Pending cid -> pure cid
+    _ -> fail "Expected provider-managed transfer to create a pending instruction"
+  _ <- submit parties.executor $
+    exerciseCmd instrCid TransferV2.TransferInstruction_Accept with
+      actors = [parties.executor]
+      extraArgs = emptyExtraArgs
+
+  staleErr <- submitWithError (actAs parties.charlie) $
+    exerciseCmd instrCid TransferV2.TransferInstruction_Withdraw with
+      actors = [parties.charlie]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains staleInstructionFailureMsg staleErr
+
+-- | Locked provider-managed inputs cannot be reused while a pending transfer
+-- still owns the lock.
+test_providerManagedRejectsLockedInputContention : Script ()
+test_providerManagedRejectsLockedInputContention = do
+  TestEnv{..} <- setupTestEnv
+  let sender = senderAccount parties
+      receiver = receiverAccount parties
+  h1 <- createProviderManagedHolding registry sender 100.0
+  (tfCid, rulesDisc) <- V2Transfer.getV2TransferFactory registry
+  result <- submitWithDisc parties.charlie rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkProviderTransfer registry sender receiver 70.0 [h1]
+      actors = [parties.charlie]
+      extraArgs = emptyExtraArgs
+  instrCid <- case result.output of
+    TransferV2.TransferInstructionResult_Pending cid -> pure cid
+    _ -> fail "Expected provider-managed transfer to create a pending instruction"
+  locked <- queryLockedV2Holdings parties.charlie sender
+  lockedCid <- case locked of
+    [(cid, holdingView)] -> do
+      assert (holdingView.amount == 70.0)
+      pure cid
+    _ -> fail $ "Expected one provider-managed locked holding, found " <> show (length locked)
+
+  contentionErr <- submitError parties.charlie rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkProviderTransfer registry sender receiver 10.0 [lockedCid]
+      actors = [parties.charlie]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains providerManagedLockedInputFailureMsg contentionErr
+  _ <- V2Transfer.querySingleV2TransferInstruction parties.charlie instrCid
+  lockedAfter <- queryLockedV2Holdings parties.charlie sender
+  assert (length lockedAfter == 1)
+
+-- | Allocation acceptance has the same locked-input contention guard for
+-- provider-managed accounts.
+test_providerManagedAllocationRejectsLockedInputContention : Script ()
+test_providerManagedAllocationRejectsLockedInputContention = do
+  TestEnv{..} <- setupTestEnv
+  let sender = senderAccount parties
+      receiver = receiverAccount parties
+      amount = 70.0
+  h1 <- createProviderManagedHolding registry sender 100.0
+  allocCid <- createAcceptedManagedAllocation
+    registry sender receiver parties.executor AllocationV2.SenderSide amount [h1] False
+  locked <- queryLockedV2Holdings parties.charlie sender
+  lockedCid <- case locked of
+    [(cid, _holdingView)] -> pure cid
+    _ -> fail $ "Expected one provider-managed locked allocation holding, found " <> show (length locked)
+  pendingCid <- createPendingManagedAllocation
+    registry sender receiver parties.executor AllocationV2.SenderSide 10.0 [lockedCid] False
+  acceptErr <- submitWithError (actAs parties.charlie) $
+    exerciseCmd pendingCid AllocationInstructionV2.AllocationInstruction_Accept with
+      actors = [parties.charlie]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains providerManagedAllocationLockedInputFailureMsg acceptErr
+  _ <- V2Allocation.querySingleV2Allocation parties.charlie allocCid
+  _ <- V2Allocation.querySingleV2AllocationInstruction parties.charlie pendingCid
+  pure ()
+
+-- | Owner-only attempts against provider-managed actions fail with the local
+-- actor markers.
+test_providerManagedRejectsOwnerOnlyInstructionActions : Script ()
+test_providerManagedRejectsOwnerOnlyInstructionActions = do
+  TestEnv{..} <- setupTestEnv
+  let sender = senderAccount parties
+      receiver = receiverAccount parties
+      amount = 25.0
+  h1 <- createProviderManagedHolding registry sender 100.0
+  (tfCid, rulesDisc) <- V2Transfer.getV2TransferFactory registry
+  result <- submitWithDisc parties.charlie rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkProviderTransfer registry sender receiver amount [h1]
+      actors = [parties.charlie]
+      extraArgs = emptyExtraArgs
+  instrCid <- case result.output of
+    TransferV2.TransferInstructionResult_Pending cid -> pure cid
+    _ -> fail "Expected provider-managed transfer to create a pending instruction"
+  acceptErr <- submitWithError (actAs parties.bob) $
+    exerciseCmd instrCid TransferV2.TransferInstruction_Accept with
+      actors = [parties.bob]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains v2ProviderManagedTransferAcceptActorFailureMsg acceptErr
+
+  h2 <- createProviderManagedHolding registry sender 50.0
+  allocInstrCid <- createPendingManagedAllocation
+    registry sender receiver parties.executor AllocationV2.SenderSide amount [h2] False
+  allocAcceptErr <- submitWithError (actAs parties.alice) $
+    exerciseCmd allocInstrCid AllocationInstructionV2.AllocationInstruction_Accept with
+      actors = [parties.alice]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains v2AllocationInstructionAcceptActorFailureMsg allocAcceptErr
+
+  h3 <- createProviderManagedHolding registry sender 50.0
+  allocCid <- createAcceptedManagedAllocation
+    registry sender receiver parties.executor AllocationV2.SenderSide amount [h3] False
+  allocWithdrawErr <- submitWithError (actAs parties.alice) $
+    exerciseCmd allocCid AllocationV2.Allocation_Withdraw with
+      actors = [parties.alice]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains v2AllocationWithdrawActorFailureMsg allocWithdrawErr

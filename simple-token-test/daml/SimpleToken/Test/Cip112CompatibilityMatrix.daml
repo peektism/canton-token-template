@@ -1,0 +1,429 @@
+-- | Focused experimental CIP-0112 compatibility-matrix probes.
+-- These tests exercise high-signal V1/V2 rows and negative cases for the
+-- current non-conformant Token Standard V2 prototype.
+module SimpleToken.Test.Cip112CompatibilityMatrix where
+
+import DA.Date
+import DA.Map qualified as Map
+import DA.Text qualified as Text
+import DA.Time
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.TransferInstructionV1 qualified as TransferV1
+import Splice.Api.Token.TransferInstructionV2 qualified as TransferV2
+import Splice.Api.Token.AllocationV1 qualified as AllocationV1
+import Splice.Api.Token.AllocationInstructionV1 qualified as AllocationInstructionV1
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocationInstructionV2
+import Splice.TokenStandard.Utils qualified as TokenStandard
+
+import SimpleToken.ContextUtils (withEventLogContext)
+import SimpleToken.Rules (SimpleTokenRules, v2TransferFactoryActorFailureMsg)
+import SimpleToken.Test.Allocation qualified as V1Allocation
+import SimpleToken.Test.Cip112Allocation qualified as V2Allocation
+import SimpleToken.Test.Cip112Transfer qualified as V2Transfer
+import SimpleToken.Test.Setup
+import SimpleToken.Testing.SimpleRegistry
+import SimpleToken.Testing.WalletClient
+
+import Daml.Script
+
+basicReceiverAccountFailureMsg : Text
+basicReceiverAccountFailureMsg =
+  "Expected a basic account for field 'transfer.receiver'"
+
+rulesDisclosureFailureMsg : Text
+rulesDisclosureFailureMsg =
+  "NotVisible"
+
+v1AllocationAsV2FailureMsg : Text
+v1AllocationAsV2FailureMsg =
+  "does not implement"
+
+staleAllocationCidFailureMsg : Text
+staleAllocationCidFailureMsg =
+  "NotActive"
+
+unexpiredLockedInputFailureMsg : Text
+unexpiredLockedInputFailureMsg =
+  "Cannot use V2 holding with unexpired lock as allocation input"
+
+settlementDeadlineFailureMsg : Text
+settlementDeadlineFailureMsg =
+  "V2 allocation settlement deadline has passed"
+
+assertSubmitErrorContains : Text -> SubmitError -> Script ()
+assertSubmitErrorContains expected err =
+  assertMsg
+    ("Expected submit error to contain " <> show expected <> ", got: " <> show err)
+    (expected `Text.isInfixOf` show err)
+
+v1ToV2TransferInstruction
+  : ContractId TransferV1.TransferInstruction
+  -> ContractId TransferV2.TransferInstruction
+v1ToV2TransferInstruction = coerceContractId
+
+v2ToV1TransferInstruction
+  : ContractId TransferV2.TransferInstruction
+  -> ContractId TransferV1.TransferInstruction
+v2ToV1TransferInstruction = coerceContractId
+
+v1ToV2Allocation
+  : ContractId AllocationV1.Allocation
+  -> ContractId AllocationV2.Allocation
+v1ToV2Allocation = coerceContractId
+
+-- | CIP-0112 §5.4: V1 sender flow on a V2 asset remains usable, and a V2
+-- receiver can still inspect and accept the resulting dual-version pending
+-- instruction with basic-account fallback.
+test_cip112TransferMatrixV1FactoryV2ReceiverBasicAccountFallback : Script ()
+test_cip112TransferMatrixV1FactoryV2ReceiverBasicAccountFallback = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  [h1] <- fundParty registry alice 100.0
+  let transfer = TransferV1.Transfer with
+        sender = alice
+        receiver = bob
+        amount = 70.0
+        instrumentId = registry.instrumentId
+        requestedAt = demoTime
+        executeBefore = futureDeadline
+        inputHoldingCids = [h1]
+        meta = emptyMetadata
+  enriched <- getTransferFactory registry transfer emptyExtraArgs
+  result <- submitWithDisc alice enriched.disclosures $
+    exerciseCmd enriched.factoryCid enriched.arg
+
+  case result.output of
+    TransferV1.TransferInstructionResult_Pending v1InstrCid -> do
+      let v2InstrCid = v1ToV2TransferInstruction v1InstrCid
+      instrView <- V2Transfer.querySingleV2TransferInstruction bob v2InstrCid
+      V2Transfer.assertPendingBasicActions alice bob instrView
+      acceptResult <- submit bob $
+        exerciseCmd v2InstrCid TransferV2.TransferInstruction_Accept with
+          actors = [bob]
+          extraArgs = emptyExtraArgs
+      case acceptResult.output of
+        TransferV2.TransferInstructionResult_Completed receiverCids ->
+          assert (length receiverCids == 1)
+        _ -> fail "Expected V2 accept after V1 factory transfer"
+      V2Transfer.assertNoV2TransferInstruction bob v2InstrCid
+      checkBalance alice registry.instrumentId 30.0
+      checkBalance bob registry.instrumentId 70.0
+    _ -> fail "Expected V1 factory transfer to create a pending instruction"
+
+-- | CIP-0112 §5.4: a V2 sender can use the V2 factory while a V1 receiver
+-- wallet still completes the pending instruction through the V1 choice.
+test_cip112TransferMatrixV2FactoryV1ReceiverChoice : Script ()
+test_cip112TransferMatrixV2FactoryV1ReceiverChoice = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  [h1] <- fundParty registry alice 100.0
+  v2InstrCid <- V2Transfer.createPendingV2Transfer registry alice bob 70.0 [h1]
+  let v1InstrCid = v2ToV1TransferInstruction v2InstrCid
+
+  acceptResult <- submit bob $
+    exerciseCmd v1InstrCid TransferV1.TransferInstruction_Accept with
+      extraArgs = emptyExtraArgs
+  case acceptResult.output of
+    TransferV1.TransferInstructionResult_Completed receiverCids ->
+      assert (length receiverCids == 1)
+    _ -> fail "Expected V1 accept after V2 factory transfer"
+  V2Transfer.assertNoV2TransferInstruction bob v2InstrCid
+  checkBalance alice registry.instrumentId 30.0
+  checkBalance bob registry.instrumentId 70.0
+
+-- | Actor sets are deliberately exact for the current basic-account slice:
+-- duplicates or extra actors must fail before V1 delegation.
+test_cip112TransferMatrixRejectsDuplicateActors : Script ()
+test_cip112TransferMatrixRejectsDuplicateActors = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  [h1] <- fundParty registry alice 100.0
+  (tfCid, rulesDisc) <- V2Transfer.getV2TransferFactory registry
+
+  err <- V2Transfer.submitWithDiscError alice rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = V2Transfer.mkV2Transfer registry alice bob 70.0 [h1]
+      actors = [alice, alice]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains v2TransferFactoryActorFailureMsg err
+  checkBalance alice registry.instrumentId 100.0
+
+-- | Provider-managed receiver accounts now enter the provider-managed
+-- authority path instead of the older basic-account rejection path.
+test_cip112TransferMatrixSupportsProviderManagedReceiverAccount : Script ()
+test_cip112TransferMatrixSupportsProviderManagedReceiverAccount = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  [h1] <- fundParty registry alice 100.0
+  (tfCid, rulesDisc) <- V2Transfer.getV2TransferFactory registry
+  let transfer = (V2Transfer.mkV2Transfer registry alice bob 70.0 [h1]) with
+        receiver = HoldingV2.Account with
+          owner = Some bob
+          provider = Some registry.admin
+          id = "managed"
+
+  result <- submitWithDisc alice rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer
+      actors = [alice]
+      extraArgs = emptyExtraArgs
+  case result.output of
+    TransferV2.TransferInstructionResult_Pending instrCid -> do
+      instrView <- V2Transfer.querySingleV2TransferInstruction bob instrCid
+      assert (instrView.availableActions == Map.fromList
+        [ (TransferV2.TIA_Withdraw, [[alice]])
+        , (TransferV2.TIA_Accept, [[registry.admin]])
+        , (TransferV2.TIA_Reject, [[registry.admin]])
+        ])
+      locked <- listLockedHoldings alice registry.instrumentId
+      assert (length locked == 1)
+      checkBalance alice registry.instrumentId 100.0
+    _ -> fail "Expected provider-managed receiver transfer to create a pending instruction"
+
+-- | The private rules/factory contract is not visible to ordinary holders.
+-- The local harness must disclose it explicitly before a V2 factory call.
+test_cip112TransferFactoryRequiresRulesDisclosure : Script ()
+test_cip112TransferFactoryRequiresRulesDisclosure = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  [h1] <- fundParty registry alice 100.0
+  [(rulesCid, _)] <- query @SimpleTokenRules registry.admin
+  let tfCid = toInterfaceContractId @TransferV2.TransferFactory rulesCid
+
+  err <- submitWithError (actAs alice) $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = V2Transfer.mkV2Transfer registry alice bob 70.0 [h1]
+      actors = [alice]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains rulesDisclosureFailureMsg err
+  checkBalance alice registry.instrumentId 100.0
+
+-- | EventLog reporting is explicit-context driven and should not add unrelated
+-- observers. Admin and account parties can inspect the test event entries;
+-- a non-participant cannot.
+test_cip112TransferEventLogKeepsNonParticipantPrivate : Script ()
+test_cip112TransferEventLogKeepsNonParticipantPrivate = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      charlie = parties.charlie
+  [h1] <- fundParty registry alice 100.0
+  eventLogCid <- V2Transfer.createTestEventLog registry.admin [alice, bob]
+  instrCid <- V2Transfer.createPendingV2Transfer registry alice bob 70.0 [h1]
+
+  acceptResult <- submit bob $
+    exerciseCmd instrCid TransferV2.TransferInstruction_Accept with
+      actors = [bob]
+      extraArgs = withEventLogContext eventLogCid emptyExtraArgs
+  case acceptResult.output of
+    TransferV2.TransferInstructionResult_Completed _ -> pure ()
+    _ -> fail "Expected V2 transfer accept with EventLog context"
+  adminEvents <- V2Transfer.queryTestEventLogEntries registry.admin
+  aliceEvents <- V2Transfer.queryTestEventLogEntries alice
+  charlieEvents <- V2Transfer.queryTestEventLogEntries charlie
+  assert (length adminEvents == 2)
+  assert (length aliceEvents == 2)
+  assert (null charlieEvents)
+
+-- | CIP-0112 §5.5: V2 settlement is not available for a V1-only allocation
+-- artifact. Coercing the CID into the V2 interface is a test-only way to prove
+-- the current asset rejects that matrix row without consuming locked funds.
+test_cip112AllocationMatrixRejectsV2SettlementOfV1Allocation : Script ()
+test_cip112AllocationMatrixRejectsV2SettlementOfV1Allocation = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      amount = 70.0
+      transferLeg = V2Allocation.mkV2TransferLeg registry alice bob amount
+      settlement = (V2Allocation.mkV2AllocationArgs registry alice bob executor amount [] False).allocation.settlement
+  [h1] <- fundParty registry alice 100.0
+  let v1Args = V1Allocation.mkAllocationArgs registry alice bob executor amount [h1]
+  enriched <- getAllocationFactory registry v1Args
+  result <- submitWithDisc alice enriched.disclosures $
+    exerciseCmd enriched.factoryCid enriched.arg
+  v1AllocCid <- case result.output of
+    AllocationInstructionV1.AllocationInstructionResult_Completed allocCid -> pure allocCid
+    _ -> fail "Expected V1 allocation factory to create a completed allocation"
+  let v2AllocCid = v1ToV2Allocation v1AllocCid
+  (sfCid, rulesDisc) <- V2Allocation.getV2SettlementFactory registry
+
+  err <- V2Allocation.submitWithDiscError executor rulesDisc $
+    V2Allocation.exerciseV2SettlementFactory sfCid settlement [transferLeg] [v2AllocCid] [executor]
+  assertSubmitErrorContains v1AllocationAsV2FailureMsg err
+  locked <- listLockedHoldings alice registry.instrumentId
+  assert (length locked == 1)
+  checkBalance alice registry.instrumentId 100.0
+  checkBalance bob registry.instrumentId 0.0
+
+-- | Multi-leg allocations should only lock the author's net debit. This covers
+-- the CIP-0112 §4.3.4 funding rule without adding duplicate settlement happy
+-- paths.
+test_cip112AllocationMatrixMultiLegLocksOnlyNetDebit : Script ()
+test_cip112AllocationMatrixMultiLegLocksOnlyNetDebit = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      charlie = parties.charlie
+      executor = parties.executor
+  [h1] <- fundParty registry alice 100.0
+  (afCid, rulesDisc) <- V2Allocation.getV2AllocationFactory registry
+  let baseArgs = V2Allocation.mkV2AllocationArgs registry alice bob executor 100.0 [h1] False
+      [outSide] = baseArgs.allocation.transferLegSides
+      inSide = AllocationV2.TransferLegSide with
+        transferLegId = "leg-2"
+        side = AllocationV2.ReceiverSide
+        otherside = TokenStandard.basicAccount charlie
+        amount = 40.0
+        instrumentId = registry.instrumentId.id
+        meta = emptyMetadata
+      multiArgs = baseArgs with
+        allocation = baseArgs.allocation with
+          transferLegSides = [outSide, inSide]
+
+  result <- submitWithDisc alice rulesDisc $
+    V2Allocation.exerciseV2AllocationFactory afCid multiArgs
+  instrCid <- case result.output of
+    AllocationInstructionV2.AllocationInstructionResult_Pending cid -> pure cid
+    _ -> fail "Expected V2 allocation factory to create a pending instruction"
+  acceptResult <- V2Allocation.acceptV2AllocationInstruction alice instrCid
+  allocCid <- case acceptResult.output of
+    AllocationInstructionV2.AllocationInstructionResult_Completed cid -> pure cid
+    _ -> fail "Expected V2 allocation instruction accept to complete"
+  allocView <- V2Allocation.querySingleV2Allocation alice allocCid
+  assert (length allocView.allocation.transferLegSides == 2)
+  assert (length allocView.holdingCids == 1)
+  case Map.lookup AllocationV2.AA_Settle allocView.availableActions of
+    Some [[adminActor, executorActor]] -> do
+      assert (adminActor == registry.admin)
+      assert (executorActor == executor)
+    _ -> fail "Expected basic settlement action for multi-leg allocation"
+  locked <- listLockedHoldings alice registry.instrumentId
+  case locked of
+    [(_, lockedView)] -> assert (lockedView.amount == 60.0)
+    _ -> fail $ "Expected exactly one net-debit locked holding, found " <> show (length locked)
+  checkHoldingWithAmountExists alice registry.instrumentId 40.0
+  checkBalance alice registry.instrumentId 100.0
+
+-- | Allocation instructions are intentionally private to the authorizer,
+-- admin, and executors. The other-side account owner should not observe the
+-- pending instruction in the private-asset baseline.
+test_cip112AllocationInstructionObserversExcludeCounterparty : Script ()
+test_cip112AllocationInstructionObserversExcludeCounterparty = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+  [h1] <- fundParty registry alice 100.0
+  instrCid <- V2Allocation.createPendingV2AllocationInstruction
+    registry alice bob executor 70.0 [h1] False
+
+  _ <- V2Allocation.querySingleV2AllocationInstruction alice instrCid
+  _ <- V2Allocation.querySingleV2AllocationInstruction executor instrCid
+  V2Allocation.assertNoV2AllocationInstruction bob instrCid
+
+-- | Unexpired locked holdings are not valid allocation funding. This probes
+-- lock contention at instruction accept time and verifies the pending
+-- instruction is preserved by rollback.
+test_cip112AllocationAcceptRejectsUnexpiredLockedInput : Script ()
+test_cip112AllocationAcceptRejectsUnexpiredLockedInput = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      charlie = parties.charlie
+      executor = parties.executor
+  [h1] <- fundParty registry alice 100.0
+  _ <- V2Transfer.createPendingV2Transfer registry alice bob 70.0 [h1]
+  lockedBefore <- listLockedHoldings alice registry.instrumentId
+  lockedCid <- case lockedBefore of
+    [(cid, lockedView)] -> do
+      assert (lockedView.amount == 70.0)
+      pure cid
+    _ -> fail $ "Expected exactly one locked transfer holding, found " <> show (length lockedBefore)
+
+  instrCid <- V2Allocation.createPendingV2AllocationInstruction
+    registry alice charlie executor 70.0 [lockedCid] False
+  err <- submitWithError (actAs alice) $
+    exerciseCmd instrCid AllocationInstructionV2.AllocationInstruction_Accept with
+      actors = [alice]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains unexpiredLockedInputFailureMsg err
+  _ <- V2Allocation.querySingleV2AllocationInstruction alice instrCid
+  lockedAfter <- listLockedHoldings alice registry.instrumentId
+  assert (length lockedAfter == 1)
+  checkBalance alice registry.instrumentId 100.0
+
+-- | Stale allocation CIDs must not partially settle a batch. The sender-side
+-- allocation and its locked funds remain live after the stale receiver CID
+-- causes the settlement transaction to fail.
+test_cip112SettlementRejectsStaleAllocationCidAndPreservesLocks : Script ()
+test_cip112SettlementRejectsStaleAllocationCidAndPreservesLocks = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      amount = 70.0
+      transferLeg = V2Allocation.mkV2TransferLeg registry alice bob amount
+      settlement = (V2Allocation.mkV2AllocationArgs registry alice bob executor amount [] False).allocation.settlement
+  [h1] <- fundParty registry alice 100.0
+  senderAllocCid <- V2Allocation.createAcceptedV2AllocationForSide
+    registry alice bob executor AllocationV2.SenderSide amount [h1] False
+  receiverAllocCid <- V2Allocation.createAcceptedV2AllocationForSide
+    registry bob alice executor AllocationV2.ReceiverSide amount [] False
+  _ <- submit bob $
+    exerciseCmd receiverAllocCid AllocationV2.Allocation_Withdraw with
+      actors = [bob]
+      extraArgs = emptyExtraArgs
+  V2Allocation.assertNoV2Allocation bob receiverAllocCid
+  (sfCid, rulesDisc) <- V2Allocation.getV2SettlementFactory registry
+
+  err <- V2Allocation.submitWithDiscError executor rulesDisc $
+    V2Allocation.exerciseV2SettlementFactory
+      sfCid settlement [transferLeg] [senderAllocCid, receiverAllocCid] [executor]
+  assertSubmitErrorContains staleAllocationCidFailureMsg err
+  senderView <- V2Allocation.querySingleV2Allocation alice senderAllocCid
+  assert (length senderView.holdingCids == 1)
+  locked <- listLockedHoldings alice registry.instrumentId
+  assert (length locked == 1)
+  checkBalance alice registry.instrumentId 100.0
+  checkBalance bob registry.instrumentId 0.0
+
+-- | Settlement after the V2 settlement deadline fails before allocation or
+-- locked-holding archival. This keeps stale timing behavior explicit.
+test_cip112SettlementRejectsAfterDeadlineAndPreservesAllocations : Script ()
+test_cip112SettlementRejectsAfterDeadlineAndPreservesAllocations = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      amount = 70.0
+      transferLeg = V2Allocation.mkV2TransferLeg registry alice bob amount
+      settlement = (V2Allocation.mkV2AllocationArgs registry alice bob executor amount [] False).allocation.settlement
+  [h1] <- fundParty registry alice 100.0
+  senderAllocCid <- V2Allocation.createAcceptedV2AllocationForSide
+    registry alice bob executor AllocationV2.SenderSide amount [h1] False
+  receiverAllocCid <- V2Allocation.createAcceptedV2AllocationForSide
+    registry bob alice executor AllocationV2.ReceiverSide amount [] False
+  (sfCid, rulesDisc) <- V2Allocation.getV2SettlementFactory registry
+
+  setTime (time (date 2025 Jan 1) 0 0 0)
+  err <- V2Allocation.submitWithDiscError executor rulesDisc $
+    V2Allocation.exerciseV2SettlementFactory
+      sfCid settlement [transferLeg] [senderAllocCid, receiverAllocCid] [executor]
+  assertSubmitErrorContains settlementDeadlineFailureMsg err
+  senderView <- V2Allocation.querySingleV2Allocation alice senderAllocCid
+  receiverView <- V2Allocation.querySingleV2Allocation bob receiverAllocCid
+  assert (length senderView.holdingCids == 1)
+  assert (null receiverView.holdingCids)
+  locked <- listLockedHoldings alice registry.instrumentId
+  assert (length locked == 1)
+  checkBalance alice registry.instrumentId 100.0
+  checkBalance bob registry.instrumentId 0.0
