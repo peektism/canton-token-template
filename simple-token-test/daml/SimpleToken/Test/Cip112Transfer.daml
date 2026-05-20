@@ -12,6 +12,10 @@ import Splice.Api.Token.TransferEventsV2 qualified as TransferEventsV2
 import Splice.TokenStandard.Utils qualified as TokenStandard
 
 import SimpleToken.ContextUtils (withEventLogContext)
+import SimpleToken.Reporting
+  ( SimpleEventLog(..)
+  , SimpleEventLogEntry(..)
+  )
 import SimpleToken.Rules (SimpleTokenRules, v2TransferFactoryActorFailureMsg)
 import SimpleToken.TransferInstruction
   ( SimpleTransferInstruction
@@ -24,38 +28,6 @@ import SimpleToken.Testing.SimpleRegistry
 import SimpleToken.Testing.WalletClient
 
 import Daml.Script
-
--- Test-only EventLog harness. Keep this package non-uploadable while it depends
--- on daml-script; split the harness into a separate non-script test package if
--- these templates ever need to be uploaded.
-template TestEventLog
-  with
-    admin : Party
-    observers : [Party]
-  where
-    signatory admin
-    observer observers
-
-    interface instance TransferEventsV2.EventLog for TestEventLog where
-      view = TransferEventsV2.EventLogView with
-        admin
-        meta = emptyMetadata
-
-      eventLog_holdingsChangeImpl _selfCid arg = do
-        _ <- create TestEventLogEntry with
-          admin
-          event = arg
-          observers = observers ++ arg.observers
-        pure TransferEventsV2.EventLog_HoldingsChangeResult
-
-template TestEventLogEntry
-  with
-    admin : Party
-    event : TransferEventsV2.EventLog_HoldingsChange
-    observers : [Party]
-  where
-    signatory admin
-    observer observers
 
 mkV2Transfer
   : SimpleRegistry
@@ -104,7 +76,7 @@ createTestEventLog
   -> [Party]
   -> Script (ContractId TransferEventsV2.EventLog)
 createTestEventLog admin observers = do
-  cid <- submit admin $ createCmd TestEventLog with
+  cid <- submit admin $ createCmd SimpleEventLog with
     admin
     observers
   pure (toInterfaceContractId @TransferEventsV2.EventLog cid)
@@ -113,7 +85,7 @@ queryTestEventLogEntries
   : Party
   -> Script [TransferEventsV2.EventLog_HoldingsChange]
 queryTestEventLogEntries observer = do
-  entries <- query @TestEventLogEntry observer
+  entries <- query @SimpleEventLogEntry observer
   pure (map (\(_, entry) -> entry.event) entries)
 
 assertSingleEvent

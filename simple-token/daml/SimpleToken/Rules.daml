@@ -22,6 +22,7 @@ import SimpleToken.Preapproval
 import SimpleToken.TransferInstruction
 import SimpleToken.Allocation
 import SimpleToken.ContextUtils
+import SimpleToken.Reporting (recordHoldingsChangeEvent)
 import SimpleToken.Experimental.Cip112.Account
   ( accountAuthority
   , accountObservers
@@ -104,14 +105,14 @@ template SimpleTokenRules
         -- 3-way dispatch
         if transfer.sender == transfer.receiver then
           -- Self-transfer path (merge/defragment)
-          selfTransfer admin transfer totalInput arg.extraArgs.meta
+          selfTransfer admin transfer totalInput arg.extraArgs
         else do
           -- Check for preapproval in context
           optPreapprovalCid <- lookupFromContextU @(ContractId TransferPreapproval) arg.extraArgs.context transferPreapprovalContextKey
           case optPreapprovalCid of
             Some preapprovalCid ->
               -- Direct transfer path
-              directTransfer admin transfer totalInput preapprovalCid arg.extraArgs.meta
+              directTransfer admin transfer totalInput preapprovalCid arg.extraArgs
             None ->
               -- Two-step transfer path
               twoStepTransfer admin transfer totalInput arg.extraArgs
@@ -147,7 +148,9 @@ template SimpleTokenRules
         meta = emptyMetadata
 
       eventLog_holdingsChangeImpl =
-        TokenStandard.eventLog_holdingsChangeDefaultImpl admin
+        \_selfCid arg -> do
+          _ <- recordHoldingsChangeEvent admin [] arg
+          pure TransferEventsV2.EventLog_HoldingsChangeResult
 
     interface instance AllocationFactory for SimpleTokenRules where
       view = AllocationFactoryView with
@@ -440,15 +443,15 @@ archiveAndSumInputs sender expectedInstrumentId holdingCids = do
   pure (sum amounts)
 
 -- | Self-transfer: merge inputs into one holding + optional change.
-selfTransfer : Party -> Transfer -> Decimal -> Metadata -> Update TransferInstructionResult
-selfTransfer admin transfer totalInput meta = do
+selfTransfer : Party -> Transfer -> Decimal -> ExtraArgs -> Update TransferInstructionResult
+selfTransfer admin transfer totalInput extraArgs = do
   -- Create single merged holding
   receiverCid <- create SimpleHolding with
     admin
     owner = transfer.sender
     instrumentId = transfer.instrumentId
     amount = transfer.amount
-    meta
+    meta = extraArgs.meta
   -- Change back to sender
   senderChangeCids <- if totalInput > transfer.amount
     then do
@@ -460,6 +463,7 @@ selfTransfer admin transfer totalInput meta = do
         meta = emptyMetadata
       pure [toInterfaceContractId @Holding changeCid]
     else pure []
+  logCompletedTransferFromContext transfer extraArgs senderChangeCids [toInterfaceContractId @Holding receiverCid]
   pure TransferInstructionResult with
     output = TransferInstructionResult_Completed with
       receiverHoldingCids = [toInterfaceContractId @Holding receiverCid]
@@ -468,15 +472,16 @@ selfTransfer admin transfer totalInput meta = do
 
 -- | Direct transfer: preapproval exists, send directly.
 -- The preapproval choice creates the receiver holding (needs receiver auth from preapproval signatories).
-directTransfer : Party -> Transfer -> Decimal -> ContractId TransferPreapproval -> Metadata -> Update TransferInstructionResult
-directTransfer admin transfer totalInput preapprovalCid meta = do
+directTransfer : Party -> Transfer -> Decimal -> ContractId TransferPreapproval -> ExtraArgs -> Update TransferInstructionResult
+directTransfer admin transfer totalInput preapprovalCid extraArgs = do
   -- Exercise nonconsuming send on preapproval (validates instrumentId match - invariant #16)
   (receiverHoldingCids, senderChangeCids) <- exercise preapprovalCid TransferPreapproval_Send with
     sender = transfer.sender
     transferInstrumentId = transfer.instrumentId
     amount = transfer.amount
     totalInput
-    holdingMeta = meta
+    holdingMeta = extraArgs.meta
+  logCompletedTransferFromContext transfer extraArgs senderChangeCids receiverHoldingCids
   pure TransferInstructionResult with
     output = TransferInstructionResult_Completed with
       receiverHoldingCids
@@ -520,3 +525,22 @@ twoStepTransfer admin transfer totalInput extraArgs = do
       transferInstructionCid = toInterfaceContractId @TransferInstruction instrCid
     senderChangeCids
     meta = txKindMeta "transfer"
+
+logCompletedTransferFromContext
+  : Transfer
+  -> ExtraArgs
+  -> [ContractId Holding]
+  -> [ContractId Holding]
+  -> Update ()
+logCompletedTransferFromContext transfer extraArgs senderChangeCids receiverHoldingCids = do
+  contextEventLogCid <- lookupFromContextU @(ContractId TransferEventsV2.EventLog)
+    extraArgs.context
+    eventLogContextKey
+  case contextEventLogCid of
+    Some logCid ->
+      TokenStandard.logTransfer
+        logCid
+        (TokenStandard.upcast transfer)
+        (map TokenStandard.upcast senderChangeCids)
+        (map TokenStandard.upcast receiverHoldingCids)
+    None -> pure ()

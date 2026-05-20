@@ -1,0 +1,232 @@
+-- | Experimental CIP-112 reporting helpers.
+-- This module is non-release and non-conformant. It exists to make local
+-- receipt/event reconstruction durable without depending on daml-script-only
+-- test templates.
+module SimpleToken.Reporting where
+
+import DA.Text qualified as Text
+import DA.TextMap qualified as TextMap
+
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.TransferEventsV2 qualified as TransferEventsV2
+
+receiptSchemaVersion : Text
+receiptSchemaVersion = "simple-token.receipt.v0"
+
+receiptReasonMetaKey : Text
+receiptReasonMetaKey = "splice.lfdecentralizedtrust.org/reason"
+
+data SimpleReceipt = SimpleReceipt with
+    schemaVersion : Text
+    kind : Text
+    outcome : Text
+    settlementRef : Optional Text
+    transferLegIds : [Text]
+    inputHoldingCount : Int
+    outputHoldingCount : Int
+    allocationCount : Int
+    providerManagedAuthorization : Optional Text
+    notes : [Text]
+  deriving (Eq, Show)
+
+-- | A durable EventLog implementation for local reconstruction tests and RI
+-- backends. It records the preview transfer-events payload plus a small stable
+-- receipt summary. It is not a production reporting, compliance, tax, or
+-- regulatory surface.
+template SimpleEventLog
+  with
+    admin : Party
+    observers : [Party]
+  where
+    signatory admin
+    observer observers
+
+    interface instance TransferEventsV2.EventLog for SimpleEventLog where
+      view = TransferEventsV2.EventLogView with
+        admin
+        meta = emptyMetadata
+
+      eventLog_holdingsChangeImpl _selfCid arg = do
+        _ <- recordHoldingsChangeEvent admin observers arg
+        pure TransferEventsV2.EventLog_HoldingsChangeResult
+
+    nonconsuming choice SimpleEventLog_RecordReceipt : ContractId SimpleReceiptReport
+      with
+        receipt : SimpleReceipt
+        extraObservers : [Party]
+      controller admin
+      do
+        create SimpleReceiptReport with
+          admin
+          receipt
+          observers = dedupParties (observers <> extraObservers)
+
+template SimpleEventLogEntry
+  with
+    admin : Party
+    event : TransferEventsV2.EventLog_HoldingsChange
+    receipt : SimpleReceipt
+    observers : [Party]
+  where
+    signatory admin
+    observer observers
+
+template SimpleReceiptReport
+  with
+    admin : Party
+    receipt : SimpleReceipt
+    observers : [Party]
+  where
+    signatory admin
+    observer observers
+
+recordHoldingsChangeEvent
+  : Party
+  -> [Party]
+  -> TransferEventsV2.EventLog_HoldingsChange
+  -> Update (ContractId SimpleEventLogEntry)
+recordHoldingsChangeEvent expectedAdmin logObservers event = do
+  assertMsg "SimpleToken reporting EventLog admin mismatch"
+    (event.admin == expectedAdmin)
+  create SimpleEventLogEntry with
+    admin = expectedAdmin
+    event
+    receipt = receiptFromHoldingsChange event
+    observers = dedupParties (logObservers <> event.observers)
+
+receiptFromHoldingsChange
+  : TransferEventsV2.EventLog_HoldingsChange
+  -> SimpleReceipt
+receiptFromHoldingsChange event =
+  let
+    reason = reasonFromMeta event.extraArgs.meta
+    kind = receiptKindFromEvent reason event
+  in SimpleReceipt with
+    schemaVersion = receiptSchemaVersion
+    kind
+    outcome = "recorded"
+    settlementRef = None
+    transferLegIds = dedupTexts (map (.transferLegId) event.transferLegSides)
+    inputHoldingCount = length event.inputHoldingCids
+    outputHoldingCount = length event.outputHoldingCids
+    allocationCount = 0
+    providerManagedAuthorization = None
+    notes = receiptNotesFromEvent reason event
+
+mkReceipt
+  : Text
+  -> Text
+  -> Optional Text
+  -> [Text]
+  -> Int
+  -> Int
+  -> Int
+  -> Optional Text
+  -> [Text]
+  -> SimpleReceipt
+mkReceipt kind outcome settlementRef transferLegIds inputHoldingCount outputHoldingCount allocationCount providerManagedAuthorization notes =
+  SimpleReceipt with
+    schemaVersion = receiptSchemaVersion
+    kind
+    outcome
+    settlementRef
+    transferLegIds = dedupTexts transferLegIds
+    inputHoldingCount
+    outputHoldingCount
+    allocationCount
+    providerManagedAuthorization
+    notes
+
+renderReceiptJson : SimpleReceipt -> Text
+renderReceiptJson receipt =
+  "{"
+    <> Text.intercalate ","
+      [ jsonField "schemaVersion" (jsonString receipt.schemaVersion)
+      , jsonField "kind" (jsonString receipt.kind)
+      , jsonField "outcome" (jsonString receipt.outcome)
+      , jsonField "settlementRef" (jsonOptionalText receipt.settlementRef)
+      , jsonField "transferLegIds" (jsonTextList receipt.transferLegIds)
+      , jsonField "inputHoldingCount" (show receipt.inputHoldingCount)
+      , jsonField "outputHoldingCount" (show receipt.outputHoldingCount)
+      , jsonField "allocationCount" (show receipt.allocationCount)
+      , jsonField "providerManagedAuthorization" (jsonOptionalText receipt.providerManagedAuthorization)
+      , jsonField "notes" (jsonTextList receipt.notes)
+      ]
+    <> "}"
+
+receiptKindFromEvent
+  : Text
+  -> TransferEventsV2.EventLog_HoldingsChange
+  -> Text
+receiptKindFromEvent reason event
+  | reason == "settle allocation" = "settlement"
+  | reason == "cancel allocation" = "cancellation"
+  | reason == "withdraw allocation" = "withdrawal"
+  | reason == "reject transfer" = "reject"
+  | reason == "withdraw transfer" = "withdrawal"
+  | any isBurnSide event.transferLegSides = "burn"
+  | null event.transferLegSides = "change"
+  | otherwise = "transfer"
+
+receiptNotesFromEvent
+  : Text
+  -> TransferEventsV2.EventLog_HoldingsChange
+  -> [Text]
+receiptNotesFromEvent reason event =
+  dedupTexts $
+    (if reason == "" then [] else ["reason:" <> reason])
+      <> (if event.account.owner == None then ["special-account"] else [])
+      <> (if any isProviderManaged event.transferLegSides || isProviderManagedAccount event.account
+            then ["provider-managed-authorization"]
+            else [])
+
+isBurnSide : TransferEventsV2.TransferLegSide -> Bool
+isBurnSide leg =
+  leg.side == TransferEventsV2.SenderSide && leg.otherside.owner == None && leg.otherside.id == "cip-112/burn"
+
+isProviderManaged : TransferEventsV2.TransferLegSide -> Bool
+isProviderManaged leg = isProviderManagedAccount leg.otherside
+
+isProviderManagedAccount : HoldingV2.Account -> Bool
+isProviderManagedAccount account = case account.provider of
+  Some _ -> True
+  None -> False
+
+reasonFromMeta : Metadata -> Text
+reasonFromMeta meta = case TextMap.lookup receiptReasonMetaKey meta.values of
+  Some reason -> reason
+  None -> ""
+
+jsonField : Text -> Text -> Text
+jsonField name value = jsonString name <> ":" <> value
+
+jsonOptionalText : Optional Text -> Text
+jsonOptionalText value = case value of
+  Some text -> jsonString text
+  None -> "null"
+
+jsonTextList : [Text] -> Text
+jsonTextList values =
+  "[" <> Text.intercalate "," (map jsonString values) <> "]"
+
+-- This renderer is intentionally narrow: test fixtures and receipt kinds use
+-- stable ASCII labels. It is not a general-purpose JSON encoder.
+jsonString : Text -> Text
+jsonString value = "\"" <> value <> "\""
+
+dedupParties : [Party] -> [Party]
+dedupParties parties = case parties of
+  [] -> []
+  party :: rest ->
+    if party `elem` rest
+      then dedupParties rest
+      else party :: dedupParties rest
+
+dedupTexts : [Text] -> [Text]
+dedupTexts values = case values of
+  [] -> []
+  value :: rest ->
+    if value `elem` rest
+      then dedupTexts rest
+      else value :: dedupTexts rest

@@ -138,13 +138,29 @@ template SimpleTransferInstruction
 
       transferInstruction_rejectImpl selfCid arg = do
         assertMsg v2TransferRejectActorFailureMsg (arg.actors == [transfer.receiver])
-        TokenStandard.transferInstruction_v2_receiverActor_rejectDefaultImplUsingV1
+        result <- TokenStandard.transferInstruction_v2_receiverActor_rejectDefaultImplUsingV1
           transfer.receiver selfCid arg
+        logReturnedTransferFromContext
+          transfer.instrumentId.admin
+          (TokenStandard.basicAccount transfer.sender)
+          arg.extraArgs
+          "reject transfer"
+          [toInterfaceContractId @HoldingV2.Holding lockedHoldingCid]
+          result.senderChangeCids
+        pure result
 
       transferInstruction_withdrawImpl selfCid arg = do
         assertMsg v2TransferWithdrawActorFailureMsg (arg.actors == [transfer.sender])
-        TokenStandard.transferInstruction_v2_senderActor_withdrawDefaultImplUsingV1
+        result <- TokenStandard.transferInstruction_v2_senderActor_withdrawDefaultImplUsingV1
           transfer.sender selfCid arg
+        logReturnedTransferFromContext
+          transfer.instrumentId.admin
+          (TokenStandard.basicAccount transfer.sender)
+          arg.extraArgs
+          "withdraw transfer"
+          [toInterfaceContractId @HoldingV2.Holding lockedHoldingCid]
+          result.senderChangeCids
+        pure result
 
 
 -- | Experimental CIP-0112 V2 action map for providerless basic accounts only.
@@ -280,12 +296,12 @@ template ProviderManagedTransferInstruction
       transferInstruction_rejectImpl selfCid arg = do
         assertMsg v2ProviderManagedTransferRejectActorFailureMsg
           (arg.actors == [accountAuthority admin transfer.receiver])
-        returnProviderManagedTransferFundsToSender selfCid transfer lockedHoldingCid
+        returnProviderManagedTransferFundsToSender selfCid transfer lockedHoldingCid arg.extraArgs "reject transfer"
 
       transferInstruction_withdrawImpl selfCid arg = do
         assertMsg v2ProviderManagedTransferWithdrawActorFailureMsg
           (arg.actors == [accountAuthority admin transfer.sender])
-        returnProviderManagedTransferFundsToSender selfCid transfer lockedHoldingCid
+        returnProviderManagedTransferFundsToSender selfCid transfer lockedHoldingCid arg.extraArgs "withdraw transfer"
 
 v2ProviderManagedTransferActions
   : Party
@@ -302,8 +318,10 @@ returnProviderManagedTransferFundsToSender
   : ContractId TransferV2.TransferInstruction
   -> TransferV2.Transfer
   -> ContractId HoldingV2.Holding
+  -> ExtraArgs
+  -> Text
   -> Update TransferV2.TransferInstructionResult
-returnProviderManagedTransferFundsToSender selfCid transfer lockedHoldingCid = do
+returnProviderManagedTransferFundsToSender selfCid transfer lockedHoldingCid extraArgs reason = do
   archive (coerceContractId selfCid : ContractId ProviderManagedTransferInstruction)
   lockedHolding <- fetch lockedHoldingCid
   let lockedView = view lockedHolding
@@ -315,10 +333,42 @@ returnProviderManagedTransferFundsToSender selfCid transfer lockedHoldingCid = d
   returnCid <- createSupportedV2Holding
     transfer.instrumentId.admin
     transfer.sender
-    transfer.instrumentId
-    lockedView.amount
-    emptyMetadata
+      transfer.instrumentId
+      lockedView.amount
+      emptyMetadata
+  logReturnedTransferFromContext
+    transfer.instrumentId.admin
+    transfer.sender
+    extraArgs
+    reason
+    [lockedHoldingCid]
+    [returnCid]
   pure TransferV2.TransferInstructionResult with
     output = TransferV2.TransferInstructionResult_Failed
     senderChangeCids = [returnCid]
     meta = txKindMeta "transfer"
+
+logReturnedTransferFromContext
+  : Party
+  -> HoldingV2.Account
+  -> ExtraArgs
+  -> Text
+  -> [ContractId HoldingV2.Holding]
+  -> [ContractId HoldingV2.Holding]
+  -> Update ()
+logReturnedTransferFromContext admin account extraArgs reason inputHoldingCids outputHoldingCids = do
+  contextEventLogCid <- lookupFromContextU @(ContractId TransferEventsV2.EventLog)
+    extraArgs.context
+    eventLogContextKey
+  case contextEventLogCid of
+    Some logCid ->
+      if null outputHoldingCids
+        then pure ()
+        else TokenStandard.logMergeSplit
+          logCid
+          admin
+          account
+          inputHoldingCids
+          reason
+          outputHoldingCids
+    None -> pure ()

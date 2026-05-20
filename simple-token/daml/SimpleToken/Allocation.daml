@@ -328,6 +328,12 @@ template SimpleAllocationV2
           (samePartySet allocation.settlement.executors arg.actors)
         archive selfCid
         authorizerHoldingCids <- unlockV2AllocationFunds admin allocation lockedHoldingCids
+        logAllocationRecoveryFromContext
+          allocation
+          arg.extraArgs
+          "cancel allocation"
+          lockedHoldingCids
+          authorizerHoldingCids
         pure AllocationV2.AllocationResult with
           output = AllocationV2.AllocationResult_Cancelled
           authorizerHoldingCids
@@ -339,6 +345,12 @@ template SimpleAllocationV2
         TokenStandard.ensureWithdrawIsAllowed allocation
         archive selfCid
         authorizerHoldingCids <- unlockV2AllocationFunds admin allocation lockedHoldingCids
+        logAllocationRecoveryFromContext
+          allocation
+          arg.extraArgs
+          "withdraw allocation"
+          lockedHoldingCids
+          authorizerHoldingCids
         pure AllocationV2.AllocationResult with
           output = AllocationV2.AllocationResult_Withdrawn
           authorizerHoldingCids
@@ -703,6 +715,28 @@ unlockV2AllocationFunds admin allocation lockedHoldingCids = do
       emptyMetadata
     pure (locked.instrumentId.id, [returnCid])
   pure (TextMap.fromListWithR (++) entries)
+
+logAllocationRecoveryFromContext
+  : AllocationV2.AllocationSpecification
+  -> ExtraArgs
+  -> Text
+  -> TextMap.TextMap [ContractId HoldingV2.Holding]
+  -> TextMap.TextMap [ContractId HoldingV2.Holding]
+  -> Update ()
+logAllocationRecoveryFromContext allocation extraArgs reason inputHoldingCids outputHoldingCids = do
+  contextEventLogCid <- lookupFromContextU @(ContractId TransferEventsV2.EventLog)
+    extraArgs.context
+    eventLogContextKey
+  case contextEventLogCid of
+    Some logCid ->
+      TokenStandard.logMergeSplit
+        logCid
+        allocation.admin
+        allocation.authorizer
+        (flattenTextMap inputHoldingCids)
+        reason
+        (flattenTextMap outputHoldingCids)
+    None -> pure ()
 
 flattenTextMap : TextMap.TextMap [a] -> [a]
 flattenTextMap values = concatMap snd (TextMap.toList values)
