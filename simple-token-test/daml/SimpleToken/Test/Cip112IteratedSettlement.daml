@@ -1,0 +1,582 @@
+-- | Focused experimental CIP-0112 iterated-settlement and partial-progress probes.
+module SimpleToken.Test.Cip112IteratedSettlement where
+
+import DA.Text qualified as Text
+import DA.TextMap qualified as TextMap
+import DA.Date
+import DA.Time
+
+import Splice.Api.Token.HoldingV1 qualified as HoldingV1
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocationInstructionV2
+import Splice.TokenStandard.Utils qualified as TokenStandard
+
+import SimpleToken.Allocation
+  ( v2AllocationExtraTransferLegSidesFailureMsg
+  , v2AllocationNextIterationFundingFailureMsg
+  )
+import SimpleToken.Rules
+  ( v2SettlementFactoryBasicAccountFailureMsg
+  )
+import SimpleToken.Test.Cip112Allocation qualified as V2Allocation
+import SimpleToken.Test.Setup
+import SimpleToken.Testing.SimpleRegistry
+import SimpleToken.Testing.WalletClient
+
+import Daml.Script
+
+staleCidFailureMsg : Text
+staleCidFailureMsg = "NotActive"
+
+cannotWithdrawCommittedFailureMsg : Text
+cannotWithdrawCommittedFailureMsg = "cannot-withdraw-committed-allocation"
+
+missingAuthorizationsFailureMsg : Text
+missingAuthorizationsFailureMsg = "missing authorizations"
+
+settlementDeadlineFailureMsg : Text
+settlementDeadlineFailureMsg = "V2 allocation settlement deadline has passed"
+
+mkSettlement : Party -> Text -> AllocationV2.SettlementInfo
+mkSettlement executor refId =
+  AllocationV2.SettlementInfo with
+    executors = [executor]
+    settlementRef = AllocationV2.Reference with id = refId; cid = None
+    settlementDeadline = Some futureDeadline
+    meta = emptyMetadata
+
+mkLeg
+  : SimpleRegistry
+  -> Text
+  -> Party
+  -> Party
+  -> Decimal
+  -> AllocationV2.TransferLeg
+mkLeg registry transferLegId sender receiver amount =
+  AllocationV2.TransferLeg with
+    transferLegId
+    sender = TokenStandard.basicAccount sender
+    receiver = TokenStandard.basicAccount receiver
+    amount
+    instrumentId = registry.instrumentId.id
+    meta = emptyMetadata
+
+mkAllocationFactoryArgs
+  : AllocationV2.AllocationSpecification
+  -> [ContractId HoldingV2.Holding]
+  -> Party
+  -> AllocationInstructionV2.AllocationFactory_Allocate
+mkAllocationFactoryArgs allocation inputHoldingCids actor =
+  AllocationInstructionV2.AllocationFactory_Allocate with
+    allocation
+    requestedAt = demoTime
+    inputHoldingCids
+    extraArgs = emptyExtraArgs
+    actors = [actor]
+
+createAcceptedAllocation
+  : SimpleRegistry
+  -> Party
+  -> AllocationV2.AllocationSpecification
+  -> [ContractId HoldingV2.Holding]
+  -> Script (ContractId AllocationV2.Allocation)
+createAcceptedAllocation registry actor allocation inputHoldingCids = do
+  (afCid, rulesDisc) <- V2Allocation.getV2AllocationFactory registry
+  result <- submitWithDisc actor rulesDisc $
+    V2Allocation.exerciseV2AllocationFactory afCid
+      (mkAllocationFactoryArgs allocation inputHoldingCids actor)
+  instrCid <- case result.output of
+    AllocationInstructionV2.AllocationInstructionResult_Pending cid -> pure cid
+    _ -> fail "Expected iterated V2 allocation factory to create a pending instruction"
+  acceptResult <- V2Allocation.acceptV2AllocationInstruction actor instrCid
+  case acceptResult.output of
+    AllocationInstructionV2.AllocationInstructionResult_Completed allocCid -> pure allocCid
+    _ -> fail "Expected iterated V2 allocation instruction accept to complete"
+
+mkPrefundedAllocation
+  : SimpleRegistry
+  -> Party
+  -> AllocationV2.SettlementInfo
+  -> Decimal
+  -> Bool
+  -> AllocationV2.AllocationSpecification
+mkPrefundedAllocation registry authorizer settlement fundingAmount committed =
+  AllocationV2.AllocationSpecification with
+    settlement
+    admin = registry.admin
+    authorizer = TokenStandard.basicAccount authorizer
+    transferLegSides = []
+    nextIterationFunding = Some (TextMap.singleton registry.instrumentId.id fundingAmount)
+    committed
+    meta = emptyMetadata
+
+mkReceiptAllocation
+  : SimpleRegistry
+  -> Party
+  -> AllocationV2.SettlementInfo
+  -> AllocationV2.TransferLeg
+  -> AllocationV2.AllocationSpecification
+mkReceiptAllocation registry receiver settlement leg =
+  AllocationV2.AllocationSpecification with
+    settlement
+    admin = registry.admin
+    authorizer = TokenStandard.basicAccount receiver
+    transferLegSides = [TokenStandard.receiverSide leg]
+    nextIterationFunding = None
+    committed = False
+    meta = emptyMetadata
+
+mkAllocationWithSides
+  : SimpleRegistry
+  -> Party
+  -> AllocationV2.SettlementInfo
+  -> [AllocationV2.TransferLegSide]
+  -> Optional (TextMap.TextMap Decimal)
+  -> Bool
+  -> AllocationV2.AllocationSpecification
+mkAllocationWithSides registry authorizer settlement transferLegSides nextIterationFunding committed =
+  AllocationV2.AllocationSpecification with
+    settlement
+    admin = registry.admin
+    authorizer = TokenStandard.basicAccount authorizer
+    transferLegSides
+    nextIterationFunding
+    committed
+    meta = emptyMetadata
+
+finalized
+  : ContractId AllocationV2.Allocation
+  -> [AllocationV2.TransferLegSide]
+  -> Optional (TextMap.TextMap Decimal)
+  -> AllocationV2.FinalizedAllocation
+finalized allocationCid extraTransferLegSides nextIterationFunding =
+  AllocationV2.FinalizedAllocation with
+    allocationCid
+    extraTransferLegSides
+    nextIterationFunding
+
+nextFunding : SimpleRegistry -> Decimal -> Optional (TextMap.TextMap Decimal)
+nextFunding registry amount =
+  Some (TextMap.singleton registry.instrumentId.id amount)
+
+settleFinalized
+  : SimpleRegistry
+  -> Party
+  -> AllocationV2.SettlementInfo
+  -> [AllocationV2.TransferLeg]
+  -> [AllocationV2.FinalizedAllocation]
+  -> Script AllocationV2.SettlementFactory_SettleBatchResult
+settleFinalized registry executor settlement transferLegs allocations = do
+  (sfCid, rulesDisc) <- V2Allocation.getV2SettlementFactory registry
+  submitWithDisc executor rulesDisc $
+    V2Allocation.exerciseV2SettlementFactoryWithFinalized
+      sfCid settlement transferLegs allocations [executor]
+
+settleFinalizedError
+  : SimpleRegistry
+  -> Party
+  -> AllocationV2.SettlementInfo
+  -> [AllocationV2.TransferLeg]
+  -> [AllocationV2.FinalizedAllocation]
+  -> Script SubmitError
+settleFinalizedError registry executor settlement transferLegs allocations = do
+  (sfCid, rulesDisc) <- V2Allocation.getV2SettlementFactory registry
+  V2Allocation.submitWithDiscError executor rulesDisc $
+    V2Allocation.exerciseV2SettlementFactoryWithFinalized
+      sfCid settlement transferLegs allocations [executor]
+
+directSettleError
+  : SimpleRegistry
+  -> Party
+  -> ContractId AllocationV2.Allocation
+  -> [AllocationV2.TransferLegSide]
+  -> Optional (TextMap.TextMap Decimal)
+  -> Script SubmitError
+directSettleError registry executor allocationCid extraTransferLegSides nextIterationFunding =
+  submitWithError (actAs registry.admin <> actAs executor) $
+    exerciseCmd allocationCid AllocationV2.Allocation_Settle with
+      actors = [registry.admin, executor]
+      extraTransferLegSides
+      nextIterationFunding
+      extraArgs = emptyExtraArgs
+
+extractNextAllocationCid
+  : AllocationV2.AllocationResult
+  -> Script (ContractId AllocationV2.Allocation)
+extractNextAllocationCid result = case result.output of
+  AllocationV2.AllocationResult_Settled with nextIterationAllocationCid ->
+    case nextIterationAllocationCid of
+      Some cid -> pure cid
+      None -> fail "Expected iterated settlement to return a successor allocation"
+  _ -> fail "Expected iterated settlement to return a successor allocation"
+
+assertNoNextAllocation : AllocationV2.AllocationResult -> Script ()
+assertNoNextAllocation result = case result.output of
+  AllocationV2.AllocationResult_Settled with nextIterationAllocationCid ->
+    case nextIterationAllocationCid of
+      None -> pure ()
+      Some _ -> fail "Expected final settlement to return no successor allocation"
+  _ -> fail "Expected final settlement to return no successor allocation"
+
+assertSingleLockedAmount
+  : Party -> HoldingV1.InstrumentId -> Decimal -> Script ()
+assertSingleLockedAmount owner instrumentId expected = do
+  locked <- listLockedHoldings owner instrumentId
+  case locked of
+    [(_, lockedView)] -> assert (lockedView.amount == expected)
+    _ -> fail $ "Expected exactly one locked holding, found " <> show (length locked)
+
+assertSubmitErrorContains : Text -> SubmitError -> Script ()
+assertSubmitErrorContains expected err =
+  assertMsg
+    ("Expected submit error to contain " <> show expected <> ", got: " <> show err)
+    (expected `Text.isInfixOf` show err)
+
+-- | A prefunded allocation can settle partial extra transfer-leg sides across
+-- multiple iterations, reject stale repeat settlement, and finalize by
+-- returning the remaining reserved funds.
+test_v2IteratedSettlementPartialRepeatedFinalizesAndConserves : Script ()
+test_v2IteratedSettlementPartialRepeatedFinalizesAndConserves = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      executor = parties.executor
+      settlement = mkSettlement executor "iterated-partial-repeat-finalize"
+  [hAlice] <- fundParty registry alice 100.0
+  aliceAlloc0 <- createAcceptedAllocation registry alice
+    (mkPrefundedAllocation registry alice settlement 100.0 False)
+    (map TokenStandard.upcast [hAlice])
+  assertSingleLockedAmount alice registry.instrumentId 100.0
+
+  let leg1 = mkLeg registry "billing-1" alice executor 10.0
+  executorAlloc1 <- createAcceptedAllocation registry executor
+    (mkReceiptAllocation registry executor settlement leg1)
+    []
+  result1 <- settleFinalized registry executor settlement [leg1]
+    [ TokenStandard.nonIteratedAllocation executorAlloc1
+    , finalized aliceAlloc0 [TokenStandard.senderSide leg1] (nextFunding registry 90.0)
+    ]
+  aliceAlloc1 <- case result1.allocationSettleResults of
+    [_, aliceResult] -> extractNextAllocationCid aliceResult
+    _ -> fail "Expected first iterated settlement to return two results"
+
+  staleErr <- settleFinalizedError registry executor settlement [leg1]
+    [ TokenStandard.nonIteratedAllocation executorAlloc1
+    , finalized aliceAlloc0 [TokenStandard.senderSide leg1] (nextFunding registry 90.0)
+    ]
+  assertSubmitErrorContains staleCidFailureMsg staleErr
+  _ <- V2Allocation.querySingleV2Allocation alice aliceAlloc1
+  assertSingleLockedAmount alice registry.instrumentId 90.0
+  checkBalance alice registry.instrumentId 90.0
+  checkBalance executor registry.instrumentId 10.0
+
+  let leg2 = mkLeg registry "billing-2" alice executor 15.0
+  executorAlloc2 <- createAcceptedAllocation registry executor
+    (mkReceiptAllocation registry executor settlement leg2)
+    []
+  result2 <- settleFinalized registry executor settlement [leg2]
+    [ TokenStandard.nonIteratedAllocation executorAlloc2
+    , finalized aliceAlloc1 [TokenStandard.senderSide leg2] (nextFunding registry 75.0)
+    ]
+  aliceAlloc2 <- case result2.allocationSettleResults of
+    [_, aliceResult] -> extractNextAllocationCid aliceResult
+    _ -> fail "Expected second iterated settlement to return two results"
+  aliceView2 <- V2Allocation.querySingleV2Allocation alice aliceAlloc2
+  assert (aliceView2.numIterations == 2)
+  assertSingleLockedAmount alice registry.instrumentId 75.0
+  checkBalance alice registry.instrumentId 75.0
+  checkBalance executor registry.instrumentId 25.0
+
+  finalResult <- settleFinalized registry executor settlement []
+    [finalized aliceAlloc2 [] None]
+  case finalResult.allocationSettleResults of
+    [aliceResult] -> assertNoNextAllocation aliceResult
+    _ -> fail "Expected finalization to settle one allocation"
+  V2Allocation.assertNoV2Allocation alice aliceAlloc2
+  V2Allocation.assertNoLockedHoldings alice registry.instrumentId
+  checkBalance alice registry.instrumentId 75.0
+  checkBalance executor registry.instrumentId 25.0
+
+-- | Receiver-side allocations can combine an incoming settlement credit with
+-- a small authorizer top-up and reserve the combined amount for the next
+-- iteration.
+test_v2IteratedSettlementReceiverSideTopUpLocksCreditPlusInput : Script ()
+test_v2IteratedSettlementReceiverSideTopUpLocksCreditPlusInput = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      settlement = mkSettlement executor "iterated-receiver-top-up"
+      leg = mkLeg registry "receiver-top-up" alice bob 15.0
+  [hAlice] <- fundParty registry alice 100.0
+  [hBob] <- fundParty registry bob 5.0
+
+  senderAlloc <- createAcceptedAllocation registry alice
+    (mkAllocationWithSides
+      registry alice settlement [TokenStandard.senderSide leg] None False)
+    (map TokenStandard.upcast [hAlice])
+  receiverAlloc <- createAcceptedAllocation registry bob
+    (mkAllocationWithSides
+      registry bob settlement [TokenStandard.receiverSide leg] (nextFunding registry 20.0) False)
+    (map TokenStandard.upcast [hBob])
+
+  settleResult <- settleFinalized registry executor settlement [leg]
+    [ TokenStandard.nonIteratedAllocation senderAlloc
+    , finalized receiverAlloc [] (nextFunding registry 20.0)
+    ]
+  receiverNext <- case settleResult.allocationSettleResults of
+    [senderResult, receiverResult] -> do
+      assertNoNextAllocation senderResult
+      extractNextAllocationCid receiverResult
+    _ -> fail "Expected sender and receiver settlement results"
+  receiverView <- V2Allocation.querySingleV2Allocation bob receiverNext
+  assert (receiverView.numIterations == 1)
+  assertSingleLockedAmount bob registry.instrumentId 20.0
+  checkBalance alice registry.instrumentId 85.0
+  checkBalance bob registry.instrumentId 20.0
+
+  finalResult <- settleFinalized registry executor settlement []
+    [finalized receiverNext [] None]
+  case finalResult.allocationSettleResults of
+    [receiverResult] -> assertNoNextAllocation receiverResult
+    _ -> fail "Expected receiver finalization result"
+  V2Allocation.assertNoLockedHoldings bob registry.instrumentId
+  checkBalance alice registry.instrumentId 85.0
+  checkBalance bob registry.instrumentId 20.0
+
+-- | Executor cancellation after one iteration releases the remaining reserved
+-- funding and archives the successor allocation.
+test_v2IteratedSettlementCancelAfterIterationReturnsReservedFunds : Script ()
+test_v2IteratedSettlementCancelAfterIterationReturnsReservedFunds = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      executor = parties.executor
+      settlement = mkSettlement executor "iterated-cancel"
+      leg = mkLeg registry "billing-cancel" alice executor 20.0
+  [hAlice] <- fundParty registry alice 100.0
+  aliceAlloc0 <- createAcceptedAllocation registry alice
+    (mkPrefundedAllocation registry alice settlement 100.0 False)
+    (map TokenStandard.upcast [hAlice])
+  executorAlloc <- createAcceptedAllocation registry executor
+    (mkReceiptAllocation registry executor settlement leg)
+    []
+  settleResult <- settleFinalized registry executor settlement [leg]
+    [ TokenStandard.nonIteratedAllocation executorAlloc
+    , finalized aliceAlloc0 [TokenStandard.senderSide leg] (nextFunding registry 80.0)
+    ]
+  aliceAlloc1 <- case settleResult.allocationSettleResults of
+    [_, aliceResult] -> extractNextAllocationCid aliceResult
+    _ -> fail "Expected iterated settlement to return two results"
+
+  cancelResult <- submit executor $
+    exerciseCmd aliceAlloc1 AllocationV2.Allocation_Cancel with
+      actors = [executor]
+      extraArgs = emptyExtraArgs
+  case cancelResult.output of
+    AllocationV2.AllocationResult_Cancelled -> pure ()
+    _ -> fail "Expected iterated allocation cancel"
+  V2Allocation.assertNoV2Allocation alice aliceAlloc1
+  V2Allocation.assertNoLockedHoldings alice registry.instrumentId
+  checkBalance alice registry.instrumentId 80.0
+  checkBalance executor registry.instrumentId 20.0
+
+-- | Uncommitted successor allocations remain authorizer-recoverable before
+-- the settlement deadline.
+test_v2IteratedSettlementUncommittedWithdrawBeforeDeadlineReturnsReservedFunds : Script ()
+test_v2IteratedSettlementUncommittedWithdrawBeforeDeadlineReturnsReservedFunds = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      executor = parties.executor
+      settlement = mkSettlement executor "iterated-uncommitted-withdraw"
+      leg = mkLeg registry "billing-withdraw" alice executor 30.0
+  [hAlice] <- fundParty registry alice 100.0
+  aliceAlloc0 <- createAcceptedAllocation registry alice
+    (mkPrefundedAllocation registry alice settlement 100.0 False)
+    (map TokenStandard.upcast [hAlice])
+  executorAlloc <- createAcceptedAllocation registry executor
+    (mkReceiptAllocation registry executor settlement leg)
+    []
+  settleResult <- settleFinalized registry executor settlement [leg]
+    [ TokenStandard.nonIteratedAllocation executorAlloc
+    , finalized aliceAlloc0 [TokenStandard.senderSide leg] (nextFunding registry 70.0)
+    ]
+  aliceAlloc1 <- case settleResult.allocationSettleResults of
+    [_, aliceResult] -> extractNextAllocationCid aliceResult
+    _ -> fail "Expected iterated settlement to return two results"
+
+  withdrawResult <- submit alice $
+    exerciseCmd aliceAlloc1 AllocationV2.Allocation_Withdraw with
+      actors = [alice]
+      extraArgs = emptyExtraArgs
+  case withdrawResult.output of
+    AllocationV2.AllocationResult_Withdrawn -> pure ()
+    _ -> fail "Expected uncommitted iterated withdrawal before deadline"
+  V2Allocation.assertNoV2Allocation alice aliceAlloc1
+  V2Allocation.assertNoLockedHoldings alice registry.instrumentId
+  checkBalance alice registry.instrumentId 70.0
+  checkBalance executor registry.instrumentId 30.0
+
+-- | Committed successor allocations cannot be withdrawn before the deadline;
+-- settlement after the deadline rolls back, and withdrawal then releases the
+-- remaining reserved funds.
+test_v2IteratedSettlementCommittedDeadlineAndWithdrawalRecovery : Script ()
+test_v2IteratedSettlementCommittedDeadlineAndWithdrawalRecovery = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      executor = parties.executor
+      settlement = mkSettlement executor "iterated-committed-deadline"
+      leg1 = mkLeg registry "billing-deadline-1" alice executor 10.0
+      leg2 = mkLeg registry "billing-deadline-2" alice executor 10.0
+  [hAlice] <- fundParty registry alice 100.0
+  aliceAlloc0 <- createAcceptedAllocation registry alice
+    (mkPrefundedAllocation registry alice settlement 100.0 True)
+    (map TokenStandard.upcast [hAlice])
+  executorAlloc1 <- createAcceptedAllocation registry executor
+    (mkReceiptAllocation registry executor settlement leg1)
+    []
+  settleResult <- settleFinalized registry executor settlement [leg1]
+    [ TokenStandard.nonIteratedAllocation executorAlloc1
+    , finalized aliceAlloc0 [TokenStandard.senderSide leg1] (nextFunding registry 90.0)
+    ]
+  aliceAlloc1 <- case settleResult.allocationSettleResults of
+    [_, aliceResult] -> extractNextAllocationCid aliceResult
+    _ -> fail "Expected iterated settlement to return two results"
+
+  earlyWithdrawErr <- submitWithError (actAs alice) $
+    exerciseCmd aliceAlloc1 AllocationV2.Allocation_Withdraw with
+      actors = [alice]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains cannotWithdrawCommittedFailureMsg earlyWithdrawErr
+
+  executorAlloc2 <- createAcceptedAllocation registry executor
+    (mkReceiptAllocation registry executor settlement leg2)
+    []
+  setTime (time (date 2025 Jan 1) 0 0 0)
+  expiredSettleErr <- settleFinalizedError registry executor settlement [leg2]
+    [ TokenStandard.nonIteratedAllocation executorAlloc2
+    , finalized aliceAlloc1 [TokenStandard.senderSide leg2] (nextFunding registry 80.0)
+    ]
+  assertSubmitErrorContains settlementDeadlineFailureMsg expiredSettleErr
+  _ <- V2Allocation.querySingleV2Allocation alice aliceAlloc1
+  assertSingleLockedAmount alice registry.instrumentId 90.0
+
+  withdrawResult <- submit alice $
+    exerciseCmd aliceAlloc1 AllocationV2.Allocation_Withdraw with
+      actors = [alice]
+      extraArgs = emptyExtraArgs
+  case withdrawResult.output of
+    AllocationV2.AllocationResult_Withdrawn -> pure ()
+    _ -> fail "Expected committed iterated withdrawal after deadline"
+  V2Allocation.assertNoV2Allocation alice aliceAlloc1
+  V2Allocation.assertNoLockedHoldings alice registry.instrumentId
+  checkBalance alice registry.instrumentId 90.0
+  checkBalance executor registry.instrumentId 10.0
+
+-- | Invalid next-iteration funding is rejected both when creating an
+-- iterated allocation and when settling an existing one.
+test_v2IteratedSettlementRejectsInvalidFunding : Script ()
+test_v2IteratedSettlementRejectsInvalidFunding = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      executor = parties.executor
+      settlement = mkSettlement executor "iterated-invalid-funding"
+  [hAlice] <- fundParty registry alice 100.0
+  (afCid, rulesDisc) <- V2Allocation.getV2AllocationFactory registry
+
+  zeroCreateErr <- V2Allocation.submitWithDiscError alice rulesDisc $
+    V2Allocation.exerciseV2AllocationFactory afCid
+      (mkAllocationFactoryArgs
+        (mkPrefundedAllocation registry alice settlement 0.0 False)
+        (map TokenStandard.upcast [hAlice])
+        alice)
+  assertSubmitErrorContains v2AllocationNextIterationFundingFailureMsg zeroCreateErr
+
+  let unsupportedFunding =
+        (mkPrefundedAllocation registry alice settlement 1.0 False) with
+          nextIterationFunding = Some (TextMap.singleton "unsupported-instrument" 1.0)
+  unsupportedCreateErr <- V2Allocation.submitWithDiscError alice rulesDisc $
+    V2Allocation.exerciseV2AllocationFactory afCid
+      (mkAllocationFactoryArgs unsupportedFunding (map TokenStandard.upcast [hAlice]) alice)
+  assertSubmitErrorContains v2AllocationNextIterationFundingFailureMsg unsupportedCreateErr
+
+  aliceAlloc <- createAcceptedAllocation registry alice
+    (mkPrefundedAllocation registry alice settlement 50.0 False)
+    (map TokenStandard.upcast [hAlice])
+  zeroSettleErr <- directSettleError registry executor aliceAlloc [] $
+    Some (TextMap.singleton registry.instrumentId.id 0.0)
+  assertSubmitErrorContains v2AllocationNextIterationFundingFailureMsg zeroSettleErr
+  _ <- V2Allocation.querySingleV2Allocation alice aliceAlloc
+  assertSingleLockedAmount alice registry.instrumentId 50.0
+  checkBalance alice registry.instrumentId 100.0
+
+-- | Direct Allocation_Settle validates its local extra-side arguments, while
+-- SettlementFactory_SettleBatch validates full transfer-leg shape before
+-- delegating into allocation settlement.
+test_v2DirectAllocationSettleAndFactoryValidationBoundaries : Script ()
+test_v2DirectAllocationSettleAndFactoryValidationBoundaries = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      settlement = mkSettlement executor "iterated-direct-vs-factory"
+      goodLeg = mkLeg registry "direct-boundary-good" alice bob 10.0
+      badLeg = goodLeg with
+        transferLegId = "direct-boundary-bad"
+        receiver = HoldingV2.Account with
+          owner = Some bob
+          provider = None
+          id = "non-basic"
+  [hDirect] <- fundParty registry alice 100.0
+  [hFactory] <- fundParty registry alice 100.0
+
+  directAlloc <- createAcceptedAllocation registry alice
+    (mkPrefundedAllocation registry alice settlement 100.0 False)
+    (map TokenStandard.upcast [hDirect])
+  directErr <- directSettleError registry executor directAlloc
+    [TokenStandard.senderSide badLeg]
+    (nextFunding registry 90.0)
+  assertSubmitErrorContains v2AllocationExtraTransferLegSidesFailureMsg directErr
+  _ <- V2Allocation.querySingleV2Allocation alice directAlloc
+  assertSingleLockedAmount alice registry.instrumentId 100.0
+
+  factoryAlloc <- createAcceptedAllocation registry alice
+    (mkPrefundedAllocation registry alice settlement 100.0 False)
+    (map TokenStandard.upcast [hFactory])
+  factoryErr <- settleFinalizedError registry executor settlement [badLeg]
+    [finalized factoryAlloc [TokenStandard.senderSide badLeg] (nextFunding registry 90.0)]
+  assertSubmitErrorContains v2SettlementFactoryBasicAccountFailureMsg factoryErr
+  _ <- V2Allocation.querySingleV2Allocation alice factoryAlloc
+  locked <- listLockedHoldings alice registry.instrumentId
+  assert (length locked == 2)
+
+-- | Receipt-allocation auto-creation remains blocked by the accepted preview
+-- shape: `SettlementFactory_SettleBatch` has no `extraReceiptAuthorizers`
+-- argument, so a missing receiver allocation still fails validation.
+test_v2SettlementReceiptAutoCreationBlockedByPreviewShape : Script ()
+test_v2SettlementReceiptAutoCreationBlockedByPreviewShape = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      settlement = mkSettlement executor "receipt-auto-create-blocked"
+      leg = mkLeg registry "receipt-gap" alice bob 30.0
+  [hAlice] <- fundParty registry alice 100.0
+  senderAlloc <- createAcceptedAllocation registry alice
+    (AllocationV2.AllocationSpecification with
+      settlement
+      admin = registry.admin
+      authorizer = TokenStandard.basicAccount alice
+      transferLegSides = [TokenStandard.senderSide leg]
+      nextIterationFunding = None
+      committed = False
+      meta = emptyMetadata)
+    (map TokenStandard.upcast [hAlice])
+
+  err <- settleFinalizedError registry executor settlement [leg]
+    [TokenStandard.nonIteratedAllocation senderAlloc]
+  assertSubmitErrorContains missingAuthorizationsFailureMsg err
+  _ <- V2Allocation.querySingleV2Allocation alice senderAlloc
+  assertSingleLockedAmount alice registry.instrumentId 30.0
+  checkBalance alice registry.instrumentId 100.0
+  checkBalance bob registry.instrumentId 0.0

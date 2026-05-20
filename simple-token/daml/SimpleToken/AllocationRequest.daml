@@ -2,24 +2,74 @@
 -- Allows an executor to request allocations from senders.
 module SimpleToken.AllocationRequest where
 
+import DA.Map qualified as Map
 import DA.TextMap qualified as TextMap
 
 import Splice.Api.Token.MetadataV1
-import Splice.Api.Token.AllocationV1
-import Splice.Api.Token.AllocationRequestV1
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.AllocationV1 qualified as AllocationV1
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocationInstructionV2
+import Splice.Api.Token.AllocationRequestV1 qualified as AllocationRequestV1
+import Splice.Api.Token.AllocationRequestV2 qualified as AllocationRequestV2
+import Splice.TokenStandard.Utils qualified as TokenStandard
+
+import SimpleToken.Experimental.Cip112.Account
+  ( Account
+  , accountAuthority
+  , accountObservers
+  , isSupportedRegularAccount
+  )
+
+-- | Experimental V2 actor guard marker for allocation-request acceptance.
+v2AllocationRequestAcceptActorFailureMsg : Text
+v2AllocationRequestAcceptActorFailureMsg =
+  "SimpleToken V2 AllocationRequest_Accept: actors must equal the account authority"
+
+-- | Experimental V2 actor guard marker for allocation-request rejection.
+v2AllocationRequestRejectActorFailureMsg : Text
+v2AllocationRequestRejectActorFailureMsg =
+  "SimpleToken V2 AllocationRequest_Reject: actors must equal the account authority"
+
+-- | Experimental V2 actor guard marker for allocation-request withdrawal.
+v2AllocationRequestWithdrawActorFailureMsg : Text
+v2AllocationRequestWithdrawActorFailureMsg =
+  "SimpleToken V2 AllocationRequest_Withdraw: actors must equal settlement executors"
+
+v2AllocationRequestExpiredFailureMsg : Text
+v2AllocationRequestExpiredFailureMsg =
+  "SimpleToken V2 AllocationRequest_Accept: settleAt has passed"
+
+v2AllocationRequestUnsupportedShapeFailureMsg : Text
+v2AllocationRequestUnsupportedShapeFailureMsg =
+  "SimpleToken V2 AllocationRequest: requested allocations must be non-iterated regular-account allocation shapes"
+
+v2AllocationRequestFactoryCoverageFailureMsg : Text
+v2AllocationRequestFactoryCoverageFailureMsg =
+  "SimpleToken V2 AllocationRequest: factory calls must cover each requested allocation exactly once"
+
+-- | Wallet-style allocation factory call to execute while accepting a V2
+-- allocation request. This is an experimental local convenience shape, not a
+-- Token Standard API addition.
+data AllocationRequestFactoryCall = AllocationRequestFactoryCall with
+    factoryCid : ContractId AllocationInstructionV2.AllocationFactory
+    requestedAllocation : AllocationRequestV2.RequestedAllocation
+    inputHoldingCids : [ContractId HoldingV2.Holding]
+    extraArgs : ExtraArgs
+  deriving (Eq, Show)
 
 -- | A request for allocations, created by the executor.
 template SimpleAllocationRequest
   with
-    settlement : SettlementInfo
-    transferLegs : TextMap.TextMap TransferLeg
+    settlement : AllocationV1.SettlementInfo
+    transferLegs : TextMap.TextMap AllocationV1.TransferLeg
     senders : [Party]
   where
     signatory settlement.executor
     observer senders
 
-    interface instance AllocationRequest for SimpleAllocationRequest where
-      view = AllocationRequestView with
+    interface instance AllocationRequestV1.AllocationRequest for SimpleAllocationRequest where
+      view = AllocationRequestV1.AllocationRequestView with
         settlement
         transferLegs
         meta = emptyMetadata
@@ -29,3 +79,229 @@ template SimpleAllocationRequest
 
       allocationRequest_WithdrawImpl selfCid arg = do
         pure ChoiceExecutionMetadata with meta = emptyMetadata
+
+
+-- | Experimental V2 app/wallet-facing allocation request.
+--
+-- This template deliberately models only persisted request signalling. Wallets
+-- still create allocations through the existing V2 AllocationFactory path,
+-- ideally in the same transaction as AllocationRequest_Accept for replay
+-- protection.
+template SimpleAllocationRequestV2
+  with
+    authorizer : Account
+    settlement : AllocationV2.SettlementInfo
+    allocations : [AllocationRequestV2.RequestedAllocation]
+    requestedAt : Time
+    settleAt : Optional Time
+    originalRequestCid : Optional (ContractId AllocationRequestV2.AllocationRequest)
+    meta : Metadata
+  where
+    ensure isSupportedRegularAccount authorizer
+      && not (null settlement.executors)
+      && not (null allocations)
+    signatory settlement.executors
+    observer accountObservers authorizer
+
+    choice SimpleAllocationRequestV2_AcceptAndCreateAllocations
+        : [AllocationInstructionV2.AllocationInstructionResult]
+      with
+        calls : [AllocationRequestFactoryCall]
+      controller v2AllocationRequestAuthority authorizer allocations
+      do
+        assertV2AllocationRequestAcceptOpen settleAt
+        assertMsg v2AllocationRequestUnsupportedShapeFailureMsg
+          (all (isSupportedRequestedAllocation authorizer) allocations)
+        assertAllocationRequestFactoryCallsCover allocations calls
+        forA calls $ \call -> do
+          exercise call.factoryCid AllocationInstructionV2.AllocationFactory_Allocate with
+            allocation =
+              TokenStandard.requestedAllocationToSpecification
+                settlement
+                authorizer
+                call.requestedAllocation
+            requestedAt
+            inputHoldingCids = call.inputHoldingCids
+            extraArgs = call.extraArgs
+            actors = [v2AllocationRequestAuthority authorizer allocations]
+
+    interface instance AllocationRequestV1.AllocationRequest for SimpleAllocationRequestV2 where
+      view =
+        v1AllocationRequestViewFromV2
+          authorizer
+          settlement
+          allocations
+          requestedAt
+          settleAt
+          meta
+
+      allocationRequest_RejectImpl _selfCid arg = do
+        assertMsg v2AllocationRequestRejectActorFailureMsg
+          (arg.actor == v2AllocationRequestAuthority authorizer allocations)
+        pure ChoiceExecutionMetadata with meta = emptyMetadata
+
+      allocationRequest_WithdrawImpl _selfCid _arg = do
+        pure ChoiceExecutionMetadata with meta = emptyMetadata
+
+    interface instance AllocationRequestV2.AllocationRequest for SimpleAllocationRequestV2 where
+      view = AllocationRequestV2.AllocationRequestView with
+        originalRequestCid
+        authorizer
+        settlement
+        allocations
+        requestedAt
+        settleAt
+        availableActions = v2AllocationRequestActions authorizer allocations
+        meta
+
+      allocationRequest_acceptExtraObservers =
+        TokenStandard.allocationRequestV2_acceptDefaultExtraObservers this
+      allocationRequest_rejectExtraObservers =
+        TokenStandard.allocationRequestV2_rejectDefaultExtraObservers this
+      allocationRequest_withdrawExtraObservers =
+        TokenStandard.allocationRequestV2_withdrawDefaultExtraObservers this
+
+      allocationRequest_acceptImpl selfCid arg = do
+        assertMsg v2AllocationRequestAcceptActorFailureMsg
+          (arg.actors == [v2AllocationRequestAuthority authorizer allocations])
+        assertV2AllocationRequestAcceptOpen settleAt
+        assertMsg v2AllocationRequestUnsupportedShapeFailureMsg
+          (all (isSupportedRequestedAllocation authorizer) allocations)
+        archive selfCid
+        pure AllocationRequestV2.AllocationRequest_AcceptResult with
+          meta = emptyMetadata
+
+      allocationRequest_rejectImpl selfCid arg = do
+        assertMsg v2AllocationRequestRejectActorFailureMsg
+          (arg.actors == [v2AllocationRequestAuthority authorizer allocations])
+        archive selfCid
+        pure AllocationRequestV2.AllocationRequest_RejectResult with
+          meta = emptyMetadata
+
+      allocationRequest_withdrawImpl selfCid arg = do
+        assertMsg v2AllocationRequestWithdrawActorFailureMsg
+          (samePartySet settlement.executors arg.actors)
+        archive selfCid
+        pure AllocationRequestV2.AllocationRequest_WithdrawResult with
+          meta = emptyMetadata
+
+
+v2AllocationRequestAuthority
+  : Account -> [AllocationRequestV2.RequestedAllocation] -> Party
+v2AllocationRequestAuthority authorizer allocations =
+  accountAuthority (firstRequestedAllocationAdmin allocations) authorizer
+
+firstRequestedAllocationAdmin : [AllocationRequestV2.RequestedAllocation] -> Party
+firstRequestedAllocationAdmin allocations = case allocations of
+  allocation :: _ -> allocation.admin
+  [] -> error "SimpleToken V2 AllocationRequest requires at least one requested allocation"
+
+v2AllocationRequestActions
+  : Account
+  -> [AllocationRequestV2.RequestedAllocation]
+  -> Map.Map AllocationRequestV2.AllocationRequestAction [[Party]]
+v2AllocationRequestActions authorizer allocations =
+  Map.fromList
+    [ (AllocationRequestV2.ARA_Accept, [[authority]])
+    , (AllocationRequestV2.ARA_Reject, [[authority]])
+    ]
+  where
+    authority = v2AllocationRequestAuthority authorizer allocations
+
+assertV2AllocationRequestAcceptOpen : Optional Time -> Update ()
+assertV2AllocationRequestAcceptOpen settleAt = do
+  now <- getTime
+  case settleAt of
+    None -> pure ()
+    Some deadline -> assertMsg v2AllocationRequestExpiredFailureMsg (now < deadline)
+
+assertAllocationRequestFactoryCallsCover
+  : [AllocationRequestV2.RequestedAllocation]
+  -> [AllocationRequestFactoryCall]
+  -> Update ()
+assertAllocationRequestFactoryCallsCover allocations calls =
+  assertMsg v2AllocationRequestFactoryCoverageFailureMsg
+    (sameRequestedAllocationBag allocations suppliedAllocations)
+  where
+    suppliedAllocations = map (\call -> call.requestedAllocation) calls
+
+sameRequestedAllocationBag
+  : [AllocationRequestV2.RequestedAllocation]
+  -> [AllocationRequestV2.RequestedAllocation]
+  -> Bool
+sameRequestedAllocationBag expected actual =
+  length expected == length actual
+    && all
+      (\allocation ->
+        countRequestedAllocation allocation expected
+          == countRequestedAllocation allocation actual)
+      expected
+    && all
+      (\allocation ->
+        countRequestedAllocation allocation actual
+          == countRequestedAllocation allocation expected)
+      actual
+
+countRequestedAllocation
+  : AllocationRequestV2.RequestedAllocation
+  -> [AllocationRequestV2.RequestedAllocation]
+  -> Int
+countRequestedAllocation needle allocations =
+  length (filter (\allocation -> allocation == needle) allocations)
+
+isSupportedRequestedAllocation
+  : Account -> AllocationRequestV2.RequestedAllocation -> Bool
+isSupportedRequestedAllocation authorizer requestedAllocation =
+  case requestedAllocation.nextIterationFunding of
+    Some _ -> False
+    None ->
+      not (null requestedAllocation.transferLegSides)
+        && isSupportedRegularAccount authorizer
+        && all
+          (\leg ->
+            leg.amount > 0.0
+              && isSupportedRegularAccount leg.otherside)
+          requestedAllocation.transferLegSides
+
+v1AllocationRequestViewFromV2
+  : Account
+  -> AllocationV2.SettlementInfo
+  -> [AllocationRequestV2.RequestedAllocation]
+  -> Time
+  -> Optional Time
+  -> Metadata
+  -> AllocationRequestV1.AllocationRequestView
+v1AllocationRequestViewFromV2 authorizer settlement allocations requestedAt settleAt meta =
+  AllocationRequestV1.AllocationRequestView with
+    settlement =
+      TokenStandard.downcast_v2_v1_SettlementInfo
+        requestedAt
+        (case settleAt of None -> TokenStandard.maxTime; Some t -> t)
+        settlement
+    transferLegs = TextMap.fromList $ do
+      requestedAllocation <- allocations
+      legSide <- requestedAllocation.transferLegSides
+      let leg = TokenStandard.transferLegFromSide authorizer legSide
+      pure
+        ( leg.transferLegId
+        , TokenStandard.downcast_v2_v1_TransferLeg requestedAllocation.admin leg
+        )
+    meta
+
+samePartySet : [Party] -> [Party] -> Bool
+samePartySet expected actual =
+  let
+    expectedSet = dedupParties expected
+    actualSet = dedupParties actual
+  in
+    length expectedSet == length actualSet &&
+    all (\party -> party `elem` actualSet) expectedSet &&
+    all (\party -> party `elem` expectedSet) actualSet
+
+dedupParties : [Party] -> [Party]
+dedupParties parties = case parties of
+  [] -> []
+  party :: rest ->
+    if party `elem` rest
+      then dedupParties rest
+      else party :: dedupParties rest

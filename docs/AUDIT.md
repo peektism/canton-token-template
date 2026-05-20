@@ -12,8 +12,8 @@ Three open-source verification tools and manual code review by the author were u
 | Acknowledged | 1 (G4 — contract keys dropped in Daml LF 2.1) |
 | Low severity (test only) | 1 (G5 — head-of-list in test harness) |
 | Informational | 1 (unbounded list fields — admin-only creation) |
-| Formal properties proved | 9/9 |
-| Property-based tests passed | 5/5 (200 random sequences each) |
+| Formal properties proved | 9/9 legacy rows; V2 rows are re-baselining targets |
+| Property/model tests passed | 9/9 rows (7 randomized, 2 deterministic) |
 
 ---
 
@@ -90,13 +90,15 @@ Pure DAML property-based testing library with shrinking. Generates random action
 **How it was run:**
 
 ```bash
-cd daml-props && dpm build
-cd daml-props-dogfood && dpm build
-JAVA_HOME=/opt/homebrew/Cellar/openjdk@21/21.0.10/libexec/openjdk.jdk/Contents/Home \
-  PATH="$JAVA_HOME/bin:$PATH" dpm test
+cd /Users/x/canton/tools/daml-props && dpm build
+export JAVA_HOME=/opt/homebrew/Cellar/openjdk@21/21.0.10/libexec/openjdk.jdk/Contents/Home
+export PATH="$JAVA_HOME/bin:$PATH"
+cd /Users/x/canton/tools/canton-token-template/simple-token-test && dpm test
 ```
 
-**Results:** All 5 SimpleToken property tests passed (200 random sequences each, up to 15 actions per sequence).
+**Results:** All 9 SimpleToken property/model rows passed. The original 5 V1
+property tests and 2 experimental V2 iterated-settlement property rows run 200
+random sequences each; the 2 stale-replay regressions are deterministic rows.
 
 ---
 
@@ -158,6 +160,19 @@ These proofs establish that the transfer engine cannot create or destroy tokens.
 
 27 guards were cataloged across all source files: 2 template ensure clauses, 8 transfer factory guards, 8 allocation factory guards, 3 per-input guards, and 6 choice-level guards.
 
+### CIP-112 V2 Proof Rows
+
+The V2 rows below are explicit proof targets for the preview-based
+implementation. They are not formal proof claims until `daml-verify` grows a
+per-account allocation model and is re-run against this code.
+
+| Property | Statement | Result |
+|----------|-----------|--------|
+| CIP112-C1: iterated reserve conservation | For each iterated sender-side settlement, `lockedBefore + netCredit == authorizerPayout + nextReserve`; repeated settlement cannot create or destroy value. | TARGET; covered today by Daml Script and `daml-props` regressions |
+| CIP112-C2: receiver-side top-up conservation | Receiver-side next reserve may be funded by `incomingCredit + authorizerTopUp`; the successor reserve must equal requested `nextIterationFunding`. | TARGET; covered today by focused Daml Script |
+| CIP112-A1: settlement actor authorization | Direct `Allocation_Settle` requires `admin + executors`; factory settlement requires `executors` and supplies default allocation actors. | TARGET; covered today by focused negative tests |
+| CIP112-A2: direct/factory validation boundary | Direct `Allocation_Settle` performs local actor and extra-side argument validation only; full batch transfer-leg shape and authorization matching remain factory-owned. | TARGET; covered today by focused negative tests |
+
 ## Temporal Proofs (daml-verify)
 
 These proofs establish that time-dependent logic is consistent.
@@ -178,7 +193,14 @@ D1 and D2 are Splice-specific properties (scaleFees and issuance tranche divisio
 
 ## Property-Based Testing Results (daml-props)
 
-Pure state-machine model of the transfer engine. 4 parties, 6 action types (self-transfer, direct transfer, two-step initiate/accept/reject/withdraw). Each test runs 200 random sequences.
+Pure state-machine model of the transfer engine plus an experimental V2
+iterated-settlement accounting model. The V1 model uses 4 parties and 6 action
+types (self-transfer, direct transfer, two-step initiate/accept/reject/withdraw).
+The V2 model tracks one authorizer, one receiver, active successor reserve,
+active allocation id, consumed allocation ids, successor allocation ids,
+partial settlement, finalization, cancellation, withdrawal, explicit stale
+replay target ids, and rejected repeated settlement attempts. Random property
+rows run 200 sequences; deterministic stale-replay rows run one sequence each.
 
 | Test | Property | Sequences | Max Length | Result |
 |------|----------|-----------|------------|--------|
@@ -187,6 +209,10 @@ Pure state-machine model of the transfer engine. 4 parties, 6 action types (self
 | `test_simpleTokenNonNegativeBalances` | No party's balance goes negative | 200 | 15 | PASS |
 | `test_simpleTokenLifecycle` | Full two-step lifecycle preserves invariants | 200 | 20 | PASS |
 | `test_simpleTokenSelfTransferExact` | Self-transfer of exact balance produces single output | 200 | 1 | PASS |
+| `test_v2IteratedSettlementConservation` | V2 iterated reserve + authorizer payout + receiver credit stays constant | 200 | 15 | PASS |
+| `test_v2IteratedSettlementNoDoubleSettle` | Replays against consumed allocation ids do not alter modeled reserve or double-settle value | 200 | 25 | PASS |
+| `test_v2IteratedSettlementStaleReplayModelTracksRejectedRepeat` | Replaying explicit consumed allocation id `1` records a rejected repeat without changing accounting fields | deterministic | 1 | PASS |
+| `test_v2IteratedSettlementStaleReplayModelIgnoresLiveTarget` | Replaying explicit live allocation id `2` does not record a consumed-allocation repeat or change accounting fields | deterministic | 1 | PASS |
 
 **Methodology:** Executors return `Right state` (no-op) for invalid preconditions (insufficient funds, bad amounts), matching Echidna/Foundry semantics. `Left` is reserved for true invariant violations. Generators bias toward edge cases using `genFrequency` for weighted selection.
 
@@ -230,7 +256,7 @@ The following 22 MEDIUM-severity issues were identified through tool-based analy
 All symbolic models and pure state-machine models were validated against actual DAML source code through line-by-line comparison:
 
 - **daml-verify models** (`transfer.py`, `allocation.py`, `fees.py`): 27 guards inventoried, all arithmetic relationships verified exact. Three discrepancies found and corrected during dogfooding (see `daml-verify/DOGFOOD.md`).
-- **daml-props models** (`SimpleToken/Model.daml`, 249 LOC): Pure executor faithfully reproduces all 6 action types from `Rules.daml`. Invalid preconditions return `Right state` (no-op).
+- **daml-props models** (`SimpleToken/Model.daml`): Pure executor faithfully reproduces all 6 V1 transfer action types from `Rules.daml` and adds an experimental V2 iterated-settlement accounting model with allocation lifecycle ids, explicit stale-replay target ids, and rejected repeated-settlement tracking. Invalid preconditions return `Right state` (no-op).
 
 ### Unmodeled Paths
 

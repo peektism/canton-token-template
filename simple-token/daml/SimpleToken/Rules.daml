@@ -248,6 +248,7 @@ template SimpleTokenRules
         now <- getTime
         assertMsg "V2 allocation requestedAt must not be in the future"
           (arg.requestedAt <= now)
+        assertV2NextIterationFunding supportedInstruments allocation.nextIterationFunding
         assertMsg "V2 allocation specification is malformed or unsupported"
           (TokenStandard.isValidAllocationSpecificationV2
             (\instrumentId -> instrumentId `elem` supportedInstruments)
@@ -259,13 +260,16 @@ template SimpleTokenRules
         let authorizer = accountAuthority admin allocation.authorizer
         assertMsg v2AllocationFactoryActorFailureMsg (arg.actors == [authorizer])
         inputHoldingCidMap <- v2AllocationInputCidMap arg.inputHoldingCids
+        allocationLockViewPolicy <- allocationLockViewPolicyFromContext arg.extraArgs.context
         instrCid <- create SimpleAllocationInstructionV2 with
           admin
+          supportedInstruments
           allocation
           requestedAt = arg.requestedAt
           inputHoldingCids = arg.inputHoldingCids
           inputHoldingCidMap
           originalInstructionCid = None
+          allocationLockViewPolicy
         pure AllocationInstructionV2.AllocationInstructionResult with
           output = AllocationInstructionV2.AllocationInstructionResult_Pending with
             allocationInstructionCid =
@@ -287,8 +291,8 @@ template SimpleTokenRules
       settlementFactory_settleBatchImpl selfCid arg = do
         assertMsg v2SettlementFactoryActorFailureMsg
           (samePartySet arg.settlement.executors arg.actors)
-        assertMsg "V2 settlement transfer legs must not be empty"
-          (not $ null arg.transferLegs)
+        assertMsg "V2 settlement transfer legs or allocations must not be empty"
+          (not (null arg.transferLegs) || not (null arg.allocations))
         _ <- mapA (\leg -> do
           assertMsg "V2 settlement transfer amount must be positive"
             (leg.amount > 0.0)

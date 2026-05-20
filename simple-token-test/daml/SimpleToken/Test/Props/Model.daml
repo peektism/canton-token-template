@@ -50,6 +50,47 @@ data TokenAction
   | TwoStepWithdraw with tswInstrId : Int
     deriving (Show, Eq)
 
+-- | V2 iterated-settlement model for one authorizer and one receiver.
+-- Tracks the accounting shape implemented by SimpleAllocationV2:
+-- locked reserve + net credit/debit -> authorizer payout + next reserve.
+data IteratedSettlementState = IteratedSettlementState with
+  authorizerUnlocked : Decimal
+  authorizerLocked : Decimal
+  receiverUnlocked : Decimal
+  activeAllocationId : Optional Int
+  nextAllocationId : Int
+  consumedAllocationIds : [Int]
+  settledIterations : Int
+  acceptedSettlementAmount : Decimal
+  rejectedRepeatedSettlements : Int
+  iteratedInitialSupply : Decimal
+    deriving (Show, Eq)
+
+mkIteratedSettlementState : Decimal -> IteratedSettlementState
+mkIteratedSettlementState reserve =
+  IteratedSettlementState with
+    authorizerUnlocked = 0.0
+    authorizerLocked = reserve
+    receiverUnlocked = 0.0
+    activeAllocationId = Some 1
+    nextAllocationId = 2
+    consumedAllocationIds = []
+    settledIterations = 0
+    acceptedSettlementAmount = 0.0
+    rejectedRepeatedSettlements = 0
+    iteratedInitialSupply = reserve
+
+data IteratedSettlementAction
+  = IteratedPartialSettlement with ipsAmount : Decimal; ipsNextFunding : Decimal
+  | IteratedFinalize
+  | IteratedCancel
+  | IteratedWithdraw
+  | IteratedStaleReplay with
+      isrTargetAllocationId : Int
+      isrAmount : Decimal
+      isrNextFunding : Decimal
+    deriving (Show, Eq)
+
 -- | Get total holdings for a party.
 partyBalance : Int -> TokenState -> Decimal
 partyBalance idx state =
@@ -164,6 +205,56 @@ executeTokenAction state (TwoStepWithdraw instrId) =
           locked = newLocked
           pending = newPending
 
+executeIteratedSettlementAction
+  : IteratedSettlementState
+  -> IteratedSettlementAction
+  -> Either Text IteratedSettlementState
+executeIteratedSettlementAction state (IteratedPartialSettlement amount nextFunding) =
+  case state.activeAllocationId of
+    None -> Right state
+    Some allocationId ->
+      if amount <= 0.0 then Right state
+      else if nextFunding <= 0.0 then Right state
+      else
+        let available = state.authorizerLocked - amount
+        in if available < nextFunding then Right state
+           else
+            let successorId = state.nextAllocationId
+            in Right state with
+              authorizerUnlocked = state.authorizerUnlocked + available - nextFunding
+              authorizerLocked = nextFunding
+              receiverUnlocked = state.receiverUnlocked + amount
+              activeAllocationId = Some successorId
+              nextAllocationId = successorId + 1
+              consumedAllocationIds = allocationId :: state.consumedAllocationIds
+              settledIterations = state.settledIterations + 1
+              acceptedSettlementAmount = state.acceptedSettlementAmount + amount
+
+executeIteratedSettlementAction state IteratedFinalize =
+  closeIteratedAllocation state
+
+executeIteratedSettlementAction state IteratedCancel =
+  closeIteratedAllocation state
+
+executeIteratedSettlementAction state IteratedWithdraw =
+  closeIteratedAllocation state
+
+executeIteratedSettlementAction state (IteratedStaleReplay targetAllocationId _ _) =
+  if targetAllocationId `elem` state.consumedAllocationIds
+  then Right state with
+      rejectedRepeatedSettlements = state.rejectedRepeatedSettlements + 1
+  else Right state
+
+closeIteratedAllocation : IteratedSettlementState -> Either Text IteratedSettlementState
+closeIteratedAllocation state =
+  case state.activeAllocationId of
+    None -> Right state
+    Some allocationId -> Right state with
+      authorizerUnlocked = state.authorizerUnlocked + state.authorizerLocked
+      authorizerLocked = 0.0
+      activeAllocationId = None
+      consumedAllocationIds = allocationId :: state.consumedAllocationIds
+
 -- | Find a pending instruction by ID.
 findPending : Int -> [PendingInstruction] -> Optional PendingInstruction
 findPending _ [] = None
@@ -196,6 +287,45 @@ checkPartyBalances idx state
     in if bal < 0.0
        then Left ("Negative balance for party " <> show idx <> ": " <> show bal)
        else checkPartyBalances (idx + 1) state
+
+totalIteratedSettlementSupply : IteratedSettlementState -> Decimal
+totalIteratedSettlementSupply state =
+  state.authorizerUnlocked + state.authorizerLocked + state.receiverUnlocked
+
+checkIteratedSettlementInvariants : IteratedSettlementState -> Either Text ()
+checkIteratedSettlementInvariants state =
+  if totalIteratedSettlementSupply state /= state.iteratedInitialSupply
+  then Left
+    ("V2 iterated conservation violated: expected="
+      <> show state.iteratedInitialSupply
+      <> " actual="
+      <> show (totalIteratedSettlementSupply state))
+  else if state.authorizerUnlocked < 0.0 || state.authorizerLocked < 0.0 || state.receiverUnlocked < 0.0
+  then Left ("V2 iterated negative balance: " <> show state)
+  else if state.receiverUnlocked /= state.acceptedSettlementAmount
+  then Left ("V2 iterated receiver balance does not match accepted settlement total: " <> show state)
+  else if not (uniqueInts state.consumedAllocationIds)
+  then Left ("V2 iterated consumed allocation ids are not unique: " <> show state)
+  else if not (all (\cid -> cid < state.nextAllocationId) state.consumedAllocationIds)
+  then Left ("V2 iterated consumed allocation id is outside issued range: " <> show state)
+  else case state.activeAllocationId of
+    Some allocationId ->
+      if allocationId `elem` state.consumedAllocationIds
+      then Left ("V2 iterated active allocation id was already consumed: " <> show state)
+      else if allocationId >= state.nextAllocationId
+      then Left ("V2 iterated active allocation id is outside issued range: " <> show state)
+      else if state.authorizerLocked <= 0.0
+      then Left ("V2 iterated active allocation has no positive reserve: " <> show state)
+      else Right ()
+    None ->
+      if state.authorizerLocked /= 0.0
+      then Left ("V2 iterated closed allocation still has locked reserve: " <> show state)
+      else Right ()
+
+uniqueInts : [Int] -> Bool
+uniqueInts values = case values of
+  [] -> True
+  value :: rest -> not (value `elem` rest) && uniqueInts rest
 
 -- | Generate a random token action.
 genTokenAction : Gen TokenAction
@@ -246,3 +376,29 @@ genTwoStepWithdraw : Gen TokenAction
 genTwoStepWithdraw =
   genBind (genInt 0 20) $ \instrId ->
   genPure (TwoStepWithdraw instrId)
+
+genIteratedSettlementAction : Gen IteratedSettlementAction
+genIteratedSettlementAction = genFrequency
+  [ (6, genIteratedPartialSettlement)
+  , (1, genPure IteratedFinalize)
+  , (1, genPure IteratedCancel)
+  , (1, genPure IteratedWithdraw)
+  , (2, genIteratedStaleReplay)
+  ]
+
+genIteratedPartialSettlement : Gen IteratedSettlementAction
+genIteratedPartialSettlement =
+  genBind (genDecimal 0.0000000001 50.0) $ \amount ->
+  genBind (genDecimal 0.0000000001 100.0) $ \nextFunding ->
+  genPure (IteratedPartialSettlement amount nextFunding)
+
+genIteratedStaleReplay : Gen IteratedSettlementAction
+genIteratedStaleReplay =
+  genBind (genInt 0 20) $ \targetAllocationId ->
+  genBind (genDecimal 0.0000000001 50.0) $ \amount ->
+  genBind (genDecimal 0.0000000001 100.0) $ \nextFunding ->
+  genPure
+    (IteratedStaleReplay with
+      isrTargetAllocationId = targetAllocationId
+      isrAmount = amount
+      isrNextFunding = nextFunding)

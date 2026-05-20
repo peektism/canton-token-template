@@ -20,7 +20,6 @@ import SimpleToken.Allocation
   , SimpleAllocationV2
   , v2AllocationCancelActorFailureMsg
   , v2AllocationInstructionAcceptActorFailureMsg
-  , v2AllocationSettleIteratedUnsupportedFailureMsg
   )
 import SimpleToken.Rules
   ( SimpleTokenRules
@@ -458,9 +457,10 @@ test_v2SettlementFactoryAcceptsAdminExecutorOverlap = do
   checkBalance alice registry.instrumentId 30.0
   checkBalance bob registry.instrumentId 70.0
 
--- | Iterated-settlement arguments are rejected explicitly until this slice supports them.
-test_v2SettlementFactoryRejectsIteratedSettlementArgs : Script ()
-test_v2SettlementFactoryRejectsIteratedSettlementArgs = do
+-- | Iterated-settlement arguments create successor allocations when the
+-- authorizer enabled iteration up front.
+test_v2SettlementFactorySupportsIteratedSettlementArgs : Script ()
+test_v2SettlementFactorySupportsIteratedSettlementArgs = do
   TestEnv{..} <- setupTestEnv
   let alice = parties.alice
       bob = parties.bob
@@ -478,7 +478,7 @@ test_v2SettlementFactoryRejectsIteratedSettlementArgs = do
     registry bob alice executor AllocationV2.ReceiverSide amount [] False
   (sfCid, rulesDisc) <- getV2SettlementFactory registry
 
-  err <- submitWithDiscError executor rulesDisc $
+  settleResult <- submitWithDisc executor rulesDisc $
     exerciseV2SettlementFactoryWithFinalized
       sfCid
       settlement
@@ -488,15 +488,26 @@ test_v2SettlementFactoryRejectsIteratedSettlementArgs = do
       ]
       [executor]
 
-  assertSubmitErrorContains v2AllocationSettleIteratedUnsupportedFailureMsg err
-  senderView <- querySingleV2Allocation alice senderAllocCid
-  receiverView <- querySingleV2Allocation bob receiverAllocCid
-  assert (length senderView.holdingCids == 1)
-  assert (length receiverView.holdingCids == 0)
-  locked <- listLockedHoldings alice registry.instrumentId
-  assert (length locked == 1)
-  checkBalance alice registry.instrumentId 100.0
-  checkBalance bob registry.instrumentId 0.0
+  case settleResult.allocationSettleResults of
+    [senderResult, receiverResult] -> do
+      case senderResult.output of
+        AllocationV2.AllocationResult_Settled with nextIterationAllocationCid ->
+          case nextIterationAllocationCid of
+            Some _ -> pure ()
+            None -> fail "Expected sender iterated settlement to create a successor allocation"
+        _ -> fail "Expected sender iterated settlement result"
+      case receiverResult.output of
+        AllocationV2.AllocationResult_Settled with nextIterationAllocationCid ->
+          case nextIterationAllocationCid of
+            Some _ -> pure ()
+            None -> fail "Expected receiver iterated settlement to create a successor allocation"
+        _ -> fail "Expected receiver iterated settlement result"
+    _ -> fail "Expected two iterated settlement results"
+  assertNoV2Allocation alice senderAllocCid
+  assertNoV2Allocation bob receiverAllocCid
+  assertNoLockedHoldings alice registry.instrumentId
+  checkBalance alice registry.instrumentId 30.0
+  checkBalance bob registry.instrumentId 70.0
 
 -- | V2 SettlementFactory rejects settlement actors outside the executor set.
 test_v2SettlementFactoryRejectsWrongActor : Script ()

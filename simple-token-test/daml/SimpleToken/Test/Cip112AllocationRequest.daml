@@ -1,0 +1,621 @@
+-- | Experimental CIP-0112 AllocationRequest workflow probes.
+module SimpleToken.Test.Cip112AllocationRequest where
+
+import DA.Map qualified as Map
+import DA.Optional (fromSomeNote, isNone)
+import DA.Text qualified as Text
+import DA.TextMap qualified as TextMap
+
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocationInstructionV2
+import Splice.Api.Token.AllocationRequestV1 qualified as AllocationRequestV1
+import Splice.Api.Token.AllocationRequestV2 qualified as AllocationRequestV2
+import Splice.TokenStandard.Utils qualified as TokenStandard
+
+import SimpleToken.AllocationRequest
+import SimpleToken.Experimental.Cip112.Account
+  ( Account
+  , providerManagedAccount
+  )
+import SimpleToken.Holding
+  ( ProviderManagedSimpleHolding(..)
+  )
+import SimpleToken.Rules
+  ( SimpleTokenRules
+  , v2AllocationFactoryActorFailureMsg
+  )
+import SimpleToken.Test.Cip112Allocation qualified as V2Allocation
+import SimpleToken.Test.Setup
+import SimpleToken.Testing.SimpleRegistry
+import SimpleToken.Testing.WalletClient
+
+import Daml.Script
+
+staleCidFailureMsg : Text
+staleCidFailureMsg = "NotActive"
+
+rulesDisclosureFailureMsg : Text
+rulesDisclosureFailureMsg = "NotVisible"
+
+assertSubmitErrorContains : Text -> SubmitError -> Script ()
+assertSubmitErrorContains expected err =
+  assertMsg
+    ("Expected submit error to contain " <> show expected <> ", got: " <> show err)
+    (expected `Text.isInfixOf` show err)
+
+mkSettlement : Party -> Text -> AllocationV2.SettlementInfo
+mkSettlement executor refId =
+  AllocationV2.SettlementInfo with
+    executors = [executor]
+    settlementRef = AllocationV2.Reference with id = refId; cid = None
+    settlementDeadline = Some futureDeadline
+    meta = emptyMetadata
+
+mkTransferLeg
+  : SimpleRegistry
+  -> Text
+  -> Account
+  -> Account
+  -> Decimal
+  -> AllocationV2.TransferLeg
+mkTransferLeg registry transferLegId sender receiver amount =
+  AllocationV2.TransferLeg with
+    transferLegId
+    sender
+    receiver
+    amount
+    instrumentId = registry.instrumentId.id
+    meta = emptyMetadata
+
+mkRequestedAllocation
+  : SimpleRegistry
+  -> [AllocationV2.TransferLegSide]
+  -> AllocationRequestV2.RequestedAllocation
+mkRequestedAllocation registry transferLegSides =
+  AllocationRequestV2.RequestedAllocation with
+    admin = registry.admin
+    transferLegSides
+    nextIterationFunding = None
+    committed = False
+    meta = emptyMetadata
+
+mkIteratedRequestedAllocation : SimpleRegistry -> AllocationRequestV2.RequestedAllocation
+mkIteratedRequestedAllocation registry =
+  AllocationRequestV2.RequestedAllocation with
+    admin = registry.admin
+    transferLegSides = []
+    nextIterationFunding = Some (TextMap.fromList [(registry.instrumentId.id, 1.0)])
+    committed = False
+    meta = emptyMetadata
+
+createV2AllocationRequest
+  : Party
+  -> Account
+  -> AllocationV2.SettlementInfo
+  -> [AllocationRequestV2.RequestedAllocation]
+  -> Optional Time
+  -> Script (ContractId AllocationRequestV2.AllocationRequest)
+createV2AllocationRequest executor authorizer settlement allocations settleAt = do
+  cid <- submit executor $ createCmd SimpleAllocationRequestV2 with
+    authorizer
+    settlement
+    allocations
+    requestedAt = demoTime
+    settleAt
+    originalRequestCid = None
+    meta = emptyMetadata
+  pure (toInterfaceContractId @AllocationRequestV2.AllocationRequest cid)
+
+querySingleV2AllocationRequest
+  : Party
+  -> ContractId AllocationRequestV2.AllocationRequest
+  -> Script AllocationRequestV2.AllocationRequestView
+querySingleV2AllocationRequest observer reqCid = do
+  requests <- queryInterface @AllocationRequestV2.AllocationRequest observer
+  let matches = do
+        (cid, Some requestView) <- requests
+        guard (cid == reqCid)
+        pure requestView
+  case matches of
+    [requestView] -> pure requestView
+    _ -> fail $ "Expected exactly one V2 allocation request, found " <> show (length matches)
+
+assertNoV2AllocationRequest
+  : Party
+  -> ContractId AllocationRequestV2.AllocationRequest
+  -> Script ()
+assertNoV2AllocationRequest observer reqCid = do
+  requests <- queryInterface @AllocationRequestV2.AllocationRequest observer
+  let matches = do
+        (cid, Some _requestView) <- requests
+        guard (cid == reqCid)
+        pure cid
+  assert (null matches)
+
+queryV2AllocationRequestDisc
+  : Party
+  -> ContractId AllocationRequestV2.AllocationRequest
+  -> Script Disclosures
+queryV2AllocationRequestDisc observer reqCid =
+  queryDisc @SimpleAllocationRequestV2 observer (coerceContractId reqCid)
+
+exerciseV2AllocationRequestAccept
+  : ContractId AllocationRequestV2.AllocationRequest
+  -> Party
+  -> Commands AllocationRequestV2.AllocationRequest_AcceptResult
+exerciseV2AllocationRequestAccept reqCid actor =
+  exerciseCmd reqCid AllocationRequestV2.AllocationRequest_Accept with
+    actors = [actor]
+    extraArgs = emptyExtraArgs
+
+exerciseV2AllocationRequestReject
+  : ContractId AllocationRequestV2.AllocationRequest
+  -> Party
+  -> Commands AllocationRequestV2.AllocationRequest_RejectResult
+exerciseV2AllocationRequestReject reqCid actor =
+  exerciseCmd reqCid AllocationRequestV2.AllocationRequest_Reject with
+    actors = [actor]
+    extraArgs = emptyExtraArgs
+
+exerciseV2AllocationRequestWithdraw
+  : ContractId AllocationRequestV2.AllocationRequest
+  -> [Party]
+  -> Commands AllocationRequestV2.AllocationRequest_WithdrawResult
+exerciseV2AllocationRequestWithdraw reqCid actors =
+  exerciseCmd reqCid AllocationRequestV2.AllocationRequest_Withdraw with
+    actors
+    extraArgs = emptyExtraArgs
+
+mkAllocateArgsFromRequest
+  : AllocationRequestV2.AllocationRequestView
+  -> AllocationRequestV2.RequestedAllocation
+  -> [ContractId HoldingV2.Holding]
+  -> Party
+  -> AllocationInstructionV2.AllocationFactory_Allocate
+mkAllocateArgsFromRequest requestView requestedAllocation inputHoldingCids actor =
+  AllocationInstructionV2.AllocationFactory_Allocate with
+    allocation =
+      TokenStandard.requestedAllocationToSpecification
+        requestView.settlement
+        requestView.authorizer
+        requestedAllocation
+    requestedAt = requestView.requestedAt
+    inputHoldingCids
+    extraArgs = emptyExtraArgs
+    actors = [actor]
+
+acceptRequestAndCreateAllocationInstruction
+  : SimpleRegistry
+  -> Party
+  -> ContractId AllocationRequestV2.AllocationRequest
+  -> AllocationRequestV2.AllocationRequestView
+  -> AllocationRequestV2.RequestedAllocation
+  -> [ContractId HoldingV2.Holding]
+  -> Script (ContractId AllocationInstructionV2.AllocationInstruction)
+acceptRequestAndCreateAllocationInstruction registry actor reqCid req requestedAllocation inputHoldingCids = do
+  (afCid, rulesDisc) <- V2Allocation.getV2AllocationFactory registry
+  results <- submitWithDisc actor rulesDisc $
+    exerciseCmd
+      (coerceContractId reqCid : ContractId SimpleAllocationRequestV2)
+      SimpleAllocationRequestV2_AcceptAndCreateAllocations
+        with
+          calls =
+            [ AllocationRequestFactoryCall with
+                factoryCid = afCid
+                requestedAllocation
+                inputHoldingCids
+                extraArgs = emptyExtraArgs
+            ]
+  result <- case results of
+    [single] -> pure single
+    _ -> fail $ "Expected one request-driven allocation result, found " <> show (length results)
+  case result.output of
+    AllocationInstructionV2.AllocationInstructionResult_Pending instrCid -> pure instrCid
+    _ -> fail "Expected request-driven V2 allocation factory to create a pending instruction"
+
+acceptRequestAndCreateAllocationInstructionSubmitMulti
+  : SimpleRegistry
+  -> Party
+  -> ContractId AllocationRequestV2.AllocationRequest
+  -> AllocationRequestV2.AllocationRequestView
+  -> AllocationRequestV2.RequestedAllocation
+  -> [ContractId HoldingV2.Holding]
+  -> Script (ContractId AllocationInstructionV2.AllocationInstruction)
+acceptRequestAndCreateAllocationInstructionSubmitMulti registry actor reqCid req requestedAllocation inputHoldingCids = do
+  [(rulesCid, _)] <- query @SimpleTokenRules registry.admin
+  let afCid = toInterfaceContractId @AllocationInstructionV2.AllocationFactory rulesCid
+  results <- submitMulti [registry.admin, actor] [] $
+    exerciseCmd
+      (coerceContractId reqCid : ContractId SimpleAllocationRequestV2)
+      SimpleAllocationRequestV2_AcceptAndCreateAllocations
+        with
+          calls =
+            [ AllocationRequestFactoryCall with
+                factoryCid = afCid
+                requestedAllocation
+                inputHoldingCids
+                extraArgs = emptyExtraArgs
+            ]
+  result <- case results of
+    [single] -> pure single
+    _ -> fail $ "Expected one submitMulti request-driven allocation result, found " <> show (length results)
+  case result.output of
+    AllocationInstructionV2.AllocationInstructionResult_Pending instrCid -> pure instrCid
+    _ -> fail "Expected submitMulti request-driven V2 allocation factory to create a pending instruction"
+
+acceptInstructionToAllocation
+  : Party
+  -> ContractId AllocationInstructionV2.AllocationInstruction
+  -> Script (ContractId AllocationV2.Allocation)
+acceptInstructionToAllocation actor instrCid = do
+  result <- V2Allocation.acceptV2AllocationInstruction actor instrCid
+  case result.output of
+    AllocationInstructionV2.AllocationInstructionResult_Completed allocCid -> pure allocCid
+    _ -> fail "Expected request-driven V2 allocation instruction accept to complete"
+
+createProviderManagedHolding
+  : SimpleRegistry
+  -> Account
+  -> Decimal
+  -> Script (ContractId HoldingV2.Holding)
+createProviderManagedHolding registry account amount = do
+  cid <- submitMulti [registry.admin, fromSomeNote "provider" account.provider] [] $
+    createCmd ProviderManagedSimpleHolding with
+      admin = registry.admin
+      account
+      instrumentId = registry.instrumentId
+      amount
+      meta = emptyMetadata
+  pure (toInterfaceContractId @HoldingV2.Holding cid)
+
+checkV2AccountBalance : Party -> Account -> HoldingV2.InstrumentId -> Decimal -> Script ()
+checkV2AccountBalance observer account instrumentId expected = do
+  holdings <- queryInterface @HoldingV2.Holding observer
+  let total = sum $ do
+        (_cid, Some holdingView) <- holdings
+        guard (holdingView.account == account)
+        guard (holdingView.instrumentId == instrumentId)
+        guard (isNone holdingView.lock)
+        pure holdingView.amount
+  assertMsg
+    ("Expected V2 account balance " <> show expected <> ", got " <> show total)
+    (total == expected)
+
+-- | Creating a V2 request exposes the request and available actions to the
+-- authorizer account parties and executor without expanding visibility to
+-- transfer-leg counterparties.
+test_v2AllocationRequestCreateViewAvailableActionsAndDisclosure : Script ()
+test_v2AllocationRequestCreateViewAvailableActionsAndDisclosure = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      authorizer = TokenStandard.basicAccount alice
+      receiver = TokenStandard.basicAccount bob
+      leg = mkTransferLeg registry "leg-1" authorizer receiver 70.0
+      requested = mkRequestedAllocation registry [TokenStandard.senderSide leg]
+      settlement = mkSettlement executor "allocation-request-view"
+
+  reqCid <- createV2AllocationRequest executor authorizer settlement [requested] (Some futureDeadline)
+  reqView <- querySingleV2AllocationRequest alice reqCid
+  executorView <- querySingleV2AllocationRequest executor reqCid
+  assert (reqView == executorView)
+  assert (reqView.authorizer == authorizer)
+  assert (reqView.allocations == [requested])
+  assert (reqView.availableActions == Map.fromList
+    [ (AllocationRequestV2.ARA_Accept, [[alice]])
+    , (AllocationRequestV2.ARA_Reject, [[alice]])
+    ])
+
+  v1Requests <- queryInterface @AllocationRequestV1.AllocationRequest alice
+  assert (length v1Requests == 1)
+  assertNoV2AllocationRequest bob reqCid
+
+-- | Reject and withdraw consume the request, wrong actors fail with local
+-- markers, and a non-observer cannot exercise the request without disclosure.
+test_v2AllocationRequestRejectWithdrawAndDisclosure : Script ()
+test_v2AllocationRequestRejectWithdrawAndDisclosure = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      charlie = parties.charlie
+      executor = parties.executor
+      authorizer = TokenStandard.basicAccount alice
+      receiver = TokenStandard.basicAccount bob
+      leg = mkTransferLeg registry "leg-1" authorizer receiver 10.0
+      requested = mkRequestedAllocation registry [TokenStandard.senderSide leg]
+      settlement = mkSettlement executor "allocation-request-reject-withdraw"
+
+  reqCid <- createV2AllocationRequest executor authorizer settlement [requested] (Some futureDeadline)
+  reqDisc <- queryV2AllocationRequestDisc executor reqCid
+  missingDiscErr <- submitWithError (actAs charlie) $
+    exerciseV2AllocationRequestReject reqCid charlie
+  assertSubmitErrorContains rulesDisclosureFailureMsg missingDiscErr
+  wrongRejectErr <- V2Allocation.submitWithDiscError charlie reqDisc $
+    exerciseV2AllocationRequestReject reqCid charlie
+  assertSubmitErrorContains v2AllocationRequestRejectActorFailureMsg wrongRejectErr
+  _ <- querySingleV2AllocationRequest alice reqCid
+  _ <- submit alice $ exerciseV2AllocationRequestReject reqCid alice
+  assertNoV2AllocationRequest alice reqCid
+
+  reqCid2 <- createV2AllocationRequest executor authorizer settlement [requested] (Some futureDeadline)
+  reqDisc2 <- queryV2AllocationRequestDisc executor reqCid2
+  wrongWithdrawErr <- V2Allocation.submitWithDiscError charlie reqDisc2 $
+    exerciseV2AllocationRequestWithdraw reqCid2 [charlie]
+  assertSubmitErrorContains v2AllocationRequestWithdrawActorFailureMsg wrongWithdrawErr
+  _ <- submit executor $ exerciseV2AllocationRequestWithdraw reqCid2 [executor]
+  assertNoV2AllocationRequest executor reqCid2
+
+-- | Expired and unsupported request shapes fail before archival, while a
+-- successfully accepted request cannot be replayed.
+test_v2AllocationRequestExpiryUnsupportedShapeAndStaleReplay : Script ()
+test_v2AllocationRequestExpiryUnsupportedShapeAndStaleReplay = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      authorizer = TokenStandard.basicAccount alice
+      receiver = TokenStandard.basicAccount bob
+      leg = mkTransferLeg registry "leg-1" authorizer receiver 10.0
+      requested = mkRequestedAllocation registry [TokenStandard.senderSide leg]
+      settlement = mkSettlement executor "allocation-request-stale"
+
+  expiredReqCid <- createV2AllocationRequest executor authorizer settlement [requested] (Some futureDeadline)
+  setTime futureDeadline
+  expiredErr <- submitWithError (actAs alice) $
+    exerciseV2AllocationRequestAccept expiredReqCid alice
+  assertSubmitErrorContains v2AllocationRequestExpiredFailureMsg expiredErr
+  _ <- querySingleV2AllocationRequest alice expiredReqCid
+
+  setTime demoTime
+  iteratedReqCid <- createV2AllocationRequest
+    executor authorizer settlement [mkIteratedRequestedAllocation registry] (Some futureDeadline)
+  unsupportedErr <- submitWithError (actAs alice) $
+    exerciseV2AllocationRequestAccept iteratedReqCid alice
+  assertSubmitErrorContains v2AllocationRequestUnsupportedShapeFailureMsg unsupportedErr
+  _ <- querySingleV2AllocationRequest alice iteratedReqCid
+
+  replayReqCid <- createV2AllocationRequest executor authorizer settlement [requested] (Some futureDeadline)
+  replayReqView <- querySingleV2AllocationRequest alice replayReqCid
+  [h1] <- fundParty registry alice 100.0
+  _ <- acceptRequestAndCreateAllocationInstruction
+    registry alice replayReqCid replayReqView requested (map TokenStandard.upcast [h1])
+  assertNoV2AllocationRequest alice replayReqCid
+  [h2] <- fundParty registry alice 50.0
+  (afCid, rulesDisc) <- V2Allocation.getV2AllocationFactory registry
+  staleErr <- V2Allocation.submitWithDiscError alice rulesDisc $
+    exerciseCmd
+      (coerceContractId replayReqCid : ContractId SimpleAllocationRequestV2)
+      SimpleAllocationRequestV2_AcceptAndCreateAllocations
+        with
+          calls =
+            [ AllocationRequestFactoryCall with
+                factoryCid = afCid
+                requestedAllocation = requested
+                inputHoldingCids = map TokenStandard.upcast [h2]
+                extraArgs = emptyExtraArgs
+            ]
+  assertSubmitErrorContains staleCidFailureMsg staleErr
+  checkBalance alice registry.instrumentId 150.0
+
+-- | The local accept-and-create helper must consume the request only when the
+-- supplied factory calls cover every requested allocation exactly once.
+test_v2AllocationRequestFactoryCallsMustCoverRequests : Script ()
+test_v2AllocationRequestFactoryCallsMustCoverRequests = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      authorizer = TokenStandard.basicAccount alice
+      receiver = TokenStandard.basicAccount bob
+      leg1 = mkTransferLeg registry "leg-1" authorizer receiver 10.0
+      leg2 = mkTransferLeg registry "leg-2" authorizer receiver 5.0
+      requested1 = mkRequestedAllocation registry [TokenStandard.senderSide leg1]
+      requested2 = mkRequestedAllocation registry [TokenStandard.senderSide leg2]
+      settlement = mkSettlement executor "allocation-request-factory-coverage"
+
+  zeroReqCid <- createV2AllocationRequest executor authorizer settlement [requested1] (Some futureDeadline)
+  zeroErr <- submitWithError (actAs alice) $
+    exerciseCmd
+      (coerceContractId zeroReqCid : ContractId SimpleAllocationRequestV2)
+      SimpleAllocationRequestV2_AcceptAndCreateAllocations
+        with calls = []
+  assertSubmitErrorContains v2AllocationRequestFactoryCoverageFailureMsg zeroErr
+  _ <- querySingleV2AllocationRequest alice zeroReqCid
+
+  (afCid, rulesDisc) <- V2Allocation.getV2AllocationFactory registry
+  [h1] <- fundParty registry alice 20.0
+  duplicateReqCid <- createV2AllocationRequest executor authorizer settlement [requested1] (Some futureDeadline)
+  let call1 = AllocationRequestFactoryCall with
+        factoryCid = afCid
+        requestedAllocation = requested1
+        inputHoldingCids = map TokenStandard.upcast [h1]
+        extraArgs = emptyExtraArgs
+  duplicateErr <- V2Allocation.submitWithDiscError alice rulesDisc $
+    exerciseCmd
+      (coerceContractId duplicateReqCid : ContractId SimpleAllocationRequestV2)
+      SimpleAllocationRequestV2_AcceptAndCreateAllocations
+        with calls = [call1, call1]
+  assertSubmitErrorContains v2AllocationRequestFactoryCoverageFailureMsg duplicateErr
+  _ <- querySingleV2AllocationRequest alice duplicateReqCid
+
+  extraReqCid <- createV2AllocationRequest executor authorizer settlement [requested1] (Some futureDeadline)
+  let extraCall = AllocationRequestFactoryCall with
+        factoryCid = afCid
+        requestedAllocation = requested2
+        inputHoldingCids = []
+        extraArgs = emptyExtraArgs
+  extraErr <- V2Allocation.submitWithDiscError alice rulesDisc $
+    exerciseCmd
+      (coerceContractId extraReqCid : ContractId SimpleAllocationRequestV2)
+      SimpleAllocationRequestV2_AcceptAndCreateAllocations
+        with calls = [call1, extraCall]
+  assertSubmitErrorContains v2AllocationRequestFactoryCoverageFailureMsg extraErr
+  _ <- querySingleV2AllocationRequest alice extraReqCid
+
+  partialReqCid <- createV2AllocationRequest executor authorizer settlement [requested1, requested2] (Some futureDeadline)
+  partialErr <- V2Allocation.submitWithDiscError alice rulesDisc $
+    exerciseCmd
+      (coerceContractId partialReqCid : ContractId SimpleAllocationRequestV2)
+      SimpleAllocationRequestV2_AcceptAndCreateAllocations
+        with calls = [call1]
+  assertSubmitErrorContains v2AllocationRequestFactoryCoverageFailureMsg partialErr
+  _ <- querySingleV2AllocationRequest alice partialReqCid
+  checkBalance alice registry.instrumentId 20.0
+
+-- | Request acceptance can be batched with allocation factory calls and then
+-- settled end to end for a multi-leg basic/provider-managed trade.
+test_v2AllocationRequestToSettlementMultiLegBasicAndProviderManaged : Script ()
+test_v2AllocationRequestToSettlementMultiLegBasicAndProviderManaged = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      provider = parties.charlie
+      executor = parties.executor
+      aliceAccount = TokenStandard.basicAccount alice
+      bobAccount = providerManagedAccount bob provider "bob-managed"
+      instrumentIdV2 = TokenStandard.upcast registry.instrumentId
+      leg1 = mkTransferLeg registry "leg-1" aliceAccount bobAccount 40.0
+      leg2 = mkTransferLeg registry "leg-2" bobAccount aliceAccount 60.0
+      settlement = mkSettlement executor "allocation-request-e2e"
+      aliceRequested =
+        mkRequestedAllocation registry [TokenStandard.senderSide leg1, TokenStandard.receiverSide leg2]
+      bobRequested =
+        mkRequestedAllocation registry [TokenStandard.receiverSide leg1, TokenStandard.senderSide leg2]
+
+  [hAlice] <- fundParty registry alice 100.0
+  hBob <- createProviderManagedHolding registry bobAccount 50.0
+  aliceReqCid <- createV2AllocationRequest
+    executor aliceAccount settlement [aliceRequested] (Some futureDeadline)
+  bobReqCid <- createV2AllocationRequest
+    executor bobAccount settlement [bobRequested] (Some futureDeadline)
+
+  aliceReq <- querySingleV2AllocationRequest alice aliceReqCid
+  bobOwnerReq <- querySingleV2AllocationRequest bob bobReqCid
+  bobProviderReq <- querySingleV2AllocationRequest provider bobReqCid
+  assert (bobOwnerReq == bobProviderReq)
+  assertNoV2AllocationRequest alice bobReqCid
+  assertNoV2AllocationRequest bob aliceReqCid
+
+  aliceInstrCid <- acceptRequestAndCreateAllocationInstruction
+    registry alice aliceReqCid aliceReq aliceRequested []
+  bobInstrCid <- acceptRequestAndCreateAllocationInstruction
+    registry provider bobReqCid bobProviderReq bobRequested [hBob]
+  assertNoV2AllocationRequest alice aliceReqCid
+  assertNoV2AllocationRequest provider bobReqCid
+
+  aliceAllocCid <- acceptInstructionToAllocation alice aliceInstrCid
+  bobAllocCid <- acceptInstructionToAllocation provider bobInstrCid
+  aliceAllocView <- V2Allocation.querySingleV2Allocation alice aliceAllocCid
+  bobAllocView <- V2Allocation.querySingleV2Allocation provider bobAllocCid
+  assert (Map.lookup AllocationV2.AA_Settle aliceAllocView.availableActions == Some [[registry.admin, executor]])
+  assert (Map.lookup AllocationV2.AA_Settle bobAllocView.availableActions == Some [[registry.admin, executor]])
+
+  (sfCid, rulesDisc) <- V2Allocation.getV2SettlementFactory registry
+  settleResult <- submitWithDisc executor rulesDisc $
+    V2Allocation.exerciseV2SettlementFactory
+      sfCid settlement [leg1, leg2] [aliceAllocCid, bobAllocCid] [executor]
+  assert (length settleResult.allocationSettleResults == 2)
+  checkBalance alice registry.instrumentId 120.0
+  checkV2AccountBalance provider bobAccount instrumentIdV2 30.0
+
+  staleSettleErr <- V2Allocation.submitWithDiscError executor rulesDisc $
+    V2Allocation.exerciseV2SettlementFactory
+      sfCid settlement [leg1, leg2] [aliceAllocCid, bobAllocCid] [executor]
+  assertSubmitErrorContains staleCidFailureMsg staleSettleErr
+
+-- | The request-to-settlement path also works through submitMulti when the
+-- private rules contract is authorized by the admin instead of disclosed.
+test_v2AllocationRequestSubmitMultiEndToEnd : Script ()
+test_v2AllocationRequestSubmitMultiEndToEnd = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      aliceAccount = TokenStandard.basicAccount alice
+      bobAccount = TokenStandard.basicAccount bob
+      leg = mkTransferLeg registry "leg-1" aliceAccount bobAccount 25.0
+      settlement = mkSettlement executor "allocation-request-submit-multi"
+      aliceRequested = mkRequestedAllocation registry [TokenStandard.senderSide leg]
+      bobRequested = mkRequestedAllocation registry [TokenStandard.receiverSide leg]
+
+  [hAlice] <- fundParty registry alice 40.0
+  aliceReqCid <- createV2AllocationRequest
+    executor aliceAccount settlement [aliceRequested] (Some futureDeadline)
+  bobReqCid <- createV2AllocationRequest
+    executor bobAccount settlement [bobRequested] (Some futureDeadline)
+  aliceReq <- querySingleV2AllocationRequest alice aliceReqCid
+  bobReq <- querySingleV2AllocationRequest bob bobReqCid
+
+  aliceInstrCid <- acceptRequestAndCreateAllocationInstructionSubmitMulti
+    registry alice aliceReqCid aliceReq aliceRequested (map TokenStandard.upcast [hAlice])
+  bobInstrCid <- acceptRequestAndCreateAllocationInstructionSubmitMulti
+    registry bob bobReqCid bobReq bobRequested []
+  aliceAllocCid <- acceptInstructionToAllocation alice aliceInstrCid
+  bobAllocCid <- acceptInstructionToAllocation bob bobInstrCid
+
+  [(rulesCid, _)] <- query @SimpleTokenRules registry.admin
+  let sfCid = toInterfaceContractId @AllocationV2.SettlementFactory rulesCid
+  settleResult <- submitMulti [registry.admin, executor] [] $
+    V2Allocation.exerciseV2SettlementFactory
+      sfCid settlement [leg] [aliceAllocCid, bobAllocCid] [executor]
+  assert (length settleResult.allocationSettleResults == 2)
+  checkBalance alice registry.instrumentId 15.0
+  checkBalance bob registry.instrumentId 25.0
+
+-- | The request can be visible while the private asset factory still requires
+-- explicit rules disclosure; provider-managed requests also reject owner-only
+-- attempts before factory mutation.
+test_v2AllocationRequestRequiresFactoryDisclosureAndRejectsProviderMismatch : Script ()
+test_v2AllocationRequestRequiresFactoryDisclosureAndRejectsProviderMismatch = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      provider = parties.charlie
+      executor = parties.executor
+      aliceAccount = TokenStandard.basicAccount alice
+      bobAccount = providerManagedAccount bob provider "bob-managed-mismatch"
+      leg = mkTransferLeg registry "leg-1" aliceAccount bobAccount 15.0
+      requested = mkRequestedAllocation registry [TokenStandard.senderSide leg]
+      settlement = mkSettlement executor "allocation-request-disclosure"
+
+  [h1] <- fundParty registry alice 100.0
+  reqCid <- createV2AllocationRequest executor aliceAccount settlement [requested] (Some futureDeadline)
+  reqView <- querySingleV2AllocationRequest alice reqCid
+  [(rulesCid, _)] <- query @SimpleTokenRules registry.admin
+  let afCid = toInterfaceContractId @AllocationInstructionV2.AllocationFactory rulesCid
+  noRulesDisclosureErr <- submitWithError (actAs alice) $
+    exerciseCmd
+      (coerceContractId reqCid : ContractId SimpleAllocationRequestV2)
+      SimpleAllocationRequestV2_AcceptAndCreateAllocations
+        with
+          calls =
+            [ AllocationRequestFactoryCall with
+                factoryCid = afCid
+                requestedAllocation = requested
+                inputHoldingCids = map TokenStandard.upcast [h1]
+                extraArgs = emptyExtraArgs
+            ]
+  assertSubmitErrorContains rulesDisclosureFailureMsg noRulesDisclosureErr
+  _ <- querySingleV2AllocationRequest alice reqCid
+  checkBalance alice registry.instrumentId 100.0
+
+  hBob <- createProviderManagedHolding registry bobAccount 25.0
+  let providerRequested = mkRequestedAllocation registry [TokenStandard.senderSide (leg with sender = bobAccount; receiver = aliceAccount)]
+  providerReqCid <- createV2AllocationRequest
+    executor bobAccount settlement [providerRequested] (Some futureDeadline)
+  providerReqView <- querySingleV2AllocationRequest bob providerReqCid
+  (providerAfCid, rulesDisc) <- V2Allocation.getV2AllocationFactory registry
+  providerReqDisc <- queryV2AllocationRequestDisc provider providerReqCid
+  ownerAcceptErr <- V2Allocation.submitWithDiscError bob providerReqDisc $
+    exerciseV2AllocationRequestAccept providerReqCid bob
+  assertSubmitErrorContains v2AllocationRequestAcceptActorFailureMsg ownerAcceptErr
+
+  factoryMismatchErr <- V2Allocation.submitWithDiscError bob rulesDisc $
+    V2Allocation.exerciseV2AllocationFactory providerAfCid
+      (mkAllocateArgsFromRequest providerReqView providerRequested [hBob] bob)
+  assertSubmitErrorContains v2AllocationFactoryActorFailureMsg factoryMismatchErr
+  _ <- querySingleV2AllocationRequest provider providerReqCid
+  pure ()

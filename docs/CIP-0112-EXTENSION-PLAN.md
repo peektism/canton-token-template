@@ -1,25 +1,33 @@
 # CIP-0112 Extension Plan: canton-token-template
 
 Date: 2026-05-19
-Status: Discovery / experimental implementation; narrow Daml source changes
-are allowed when clearly marked non-release
+Status: Active M1 implementation per
+`/Users/x/canton/docs/decisions/2026-05-19-cip-112-m1-retarget.md` (Status:
+accepted 2026-05-19). Daml source work in `simple-token/` and
+`simple-token-test/` is active M1 scope against the accepted frozen-Draft
+snapshot at `canton-foundation/cips` commit `a07d8db7…` and the accepted
+Splice preview implementation reference at `b91de5d4…`.
 Owner: OpenZeppelin technical lead
-Reviewer: Digital Asset technical contact, CIP-0112 authors
+Reviewer: Digital Asset technical contact, CIP-0112 authors, OpenZeppelin
+security lead for authority/privacy slices
 
 ## Scope
 
-This is the per-tool extension plan for adding CIP-0112 (Token Standard V2)
-V2 interfaces alongside the existing CIP-0056 V1 implementation in
-`tools/canton-token-template/simple-token/`. It is a child of the
-workspace-level plan at
-`/Users/x/canton/docs/architecture/cip-112-extension-plan.md`, which contains
-the cross-cutting tradeoffs and stakeholder-decision packet.
+This is the per-tool extension plan for the comprehensive CIP-0112 (Token
+Standard V2) implementation alongside the existing CIP-0056 V1
+implementation in `tools/canton-token-template/simple-token/`. It is a
+child of the workspace-level plan at
+`/Users/x/canton/docs/architecture/cip-112-extension-plan.md`.
 
-This plan is **discovery plus experimental implementation**. Daml source in
-`simple-token/` or `simple-token-test/` may be modified in small, reversible
-prototype slices to enumerate *what changes*, *what tradeoffs surface*, and
-*what blocks release or conformance*. Prototype code must not be presented as
-CIP-0112-conformant library code.
+Active M1 implementation covers the V2 surface: basic-account and
+provider-managed `Account` semantics, multi-leg `Allocation`,
+`SettlementFactory_SettleBatch`, allocation-request workflows, iterated
+settlement, receipt/reporting and event reconstruction, cross-admin
+coordination, production-shaped disclosure/privacy policy, LocalNet/client
+smoke paths, and compatibility-matrix expansion against CIP-0112 §5.4
+transfer and §5.5 allocation rows. Public API extraction into
+`repos/oz-daml-contracts/` follows the workspace-level slice 18
+RI-backed extraction sequence; it is not part of this per-tool plan.
 
 ## Anchors in the existing codebase
 
@@ -34,10 +42,12 @@ CIP-0112-conformant library code.
 - `Preapproval.daml` — `TransferPreapproval`
 - `ContextUtils.daml` — shared utilities including `archiveAndSumInputs`,
   metadata helpers
-- `AllocationRequest.daml` — `SimpleAllocationRequest`
+- `AllocationRequest.daml` — `SimpleAllocationRequest`,
+  `SimpleAllocationRequestV2`
 
-Tests in `simple-token-test/`: 9 transfer + 5 allocation + 2 defrag + 20
-security = 36 total.
+Historical baseline tests in `simple-token-test/`: 9 transfer + 5 allocation
++ 2 defrag + 20 security = 36 total. The M1 CIP-0112 test impact table below
+records the additional experimental V2 probes now present in this tool.
 
 V1 DARs vendored in `dars/`:
 
@@ -56,6 +66,7 @@ this prototype:
 | Local DAR | Splice preview source | SHA-256 |
 | :--- | :--- | :--- |
 | `dars/splice-api-token-allocation-instruction-v2-1.0.0.dar` | `/Users/x/excanton/CN/splice` `origin/token-standard-v2-daml-preview` commit `b91de5d4b910ded598151981654dce2acc6f84ba`, path `daml/dars/splice-api-token-allocation-instruction-v2-1.0.0.dar` | `e1de9d448bd3c67d68bb50c73e51d4e0bbe53d6e8f5f9662c992f7c609cfd9aa` |
+| `dars/splice-api-token-allocation-request-v2-1.0.0.dar` | `/Users/x/excanton/CN/splice` `origin/token-standard-v2-daml-preview` commit `b91de5d4b910ded598151981654dce2acc6f84ba`, path `daml/dars/splice-api-token-allocation-request-v2-1.0.0.dar` | `e350cc92ddb271c476d22ba54c7009ec14829734878b352a2a09937d13b0a99a` |
 | `dars/splice-api-token-allocation-v2-1.0.0.dar` | `/Users/x/excanton/CN/splice` `origin/token-standard-v2-daml-preview` commit `b91de5d4b910ded598151981654dce2acc6f84ba`, path `daml/dars/splice-api-token-allocation-v2-1.0.0.dar` | `b023bd40cdf0ed9189e6819f94225fa05ed86b4276b647cb450aa6979b65b801` |
 | `dars/splice-api-token-transfer-events-v2-1.0.0.dar` | `/Users/x/excanton/CN/splice` `origin/token-standard-v2-daml-preview` commit `b91de5d4b910ded598151981654dce2acc6f84ba`, path `daml/dars/splice-api-token-transfer-events-v2-1.0.0.dar` | `b865117fc61b1bdb46756dcaa2d2330822e62e7a925c9bec49805e71dd0bddda` |
 
@@ -188,8 +199,8 @@ implementation scope, provided each change remains non-release, locally
 validated, and documented with its authority/privacy assumptions:
 
 1. A V1/V2-compatible allocation path required by CIP-0112 §5.1.
-2. Receipt allocation auto-creation, iterated settlement, and
-   `extraReceiptAuthorizers` once the preview/Draft shape stabilizes.
+2. Receipt allocation auto-creation and `extraReceiptAuthorizers` once the
+   preview/Draft shape stabilizes.
 3. Broader V2 transfer-event reporting and metadata fallback sufficient for
    mixed V1/V2 parsing.
 4. Targeted compatibility tests from CIP-0112 §5.4 and §5.5, starting with the
@@ -430,10 +441,10 @@ New blocker evidence:
   event logging accept-context-driven instead of silently widening rules
   visibility or carrying factory-supplied EventLog context onto pending
   instructions.
-- Iterated settlement remains an explicit blocker, not a partial behavior:
-  `Allocation_Settle` rejects non-empty `extraTransferLegSides` and any
-  `nextIterationFunding` until this tool implements the full iteration and
-  funding semantics.
+- This settlement/event slice originally left iterated settlement as an
+  explicit blocker. The 2026-05-20 iterated-settlement slice below supersedes
+  that status for the simple-token allocation path while preserving this row
+  as historical evidence for the first settlement prototype boundary.
 - The transfer-event regression tests use test-only `EventLog` templates inside
   the Daml Script test package. That is acceptable while the package remains a
   local non-uploadable test harness; if the package becomes uploadable, split
@@ -503,13 +514,14 @@ Remaining matrix gaps after this slice:
   withdraw EventLog reporting and internal-workflow authorization beyond this
   provider-managed authority slice.
 - Full §5.5 allocation matrix coverage for V1/V2-compatible Allocation
-  implementations, V2 allocation requests, receipt allocation auto-creation,
-  V1-wallet-with-dApp-API flows, V1 asset contrast packages, and mixed
-  multi-asset settlement across different admins.
+  implementations, broader V2 allocation-request app/wallet variants,
+  receipt-allocation auto-creation, V1-wallet-with-dApp-API flows, V1 asset
+  contrast packages, and mixed multi-asset settlement across different admins.
 - CIP-0112 §4.1.1 / §4.2 three-trader privacy-preserving batch settlement and
   view-count optimization evidence.
-- Iterated settlement and `nextIterationFunding` support; the current code
-  still rejects those arguments explicitly.
+- Iterated-settlement coverage beyond the current simple-token successor
+  allocation path, including request-originated iteration funding, stablecoin
+  CDP repayment/liquidation use cases, and cross-admin settlement.
 - Jointly controlled, special mint/burn, and explicit account-setup flows.
 - Settlement EventLog reconstruction with a persistent custom log remains a
   harness gap because the current settlement factory supplies the rules
@@ -549,6 +561,12 @@ Implementation summary:
   accounts. Allocation locking, withdraw, cancel, settlement, and credited
   output creation now preserve the authorizer account shape instead of forcing
   basic accounts.
+- Allocation locking has two explicit V2-only view-policy probes. The default
+  policy keeps `Lock.holders = [admin]`; an opt-in choice-context policy
+  `simple-token/cip-112-allocation-lock-view-policy = "account-parties"` uses
+  `Lock.holders = admin + authorizer account parties`. Both policies keep
+  movement authority on allocation choices rather than on a standalone lock
+  choice.
 - `SettlementFactory_SettleBatch` now accepts supported regular transfer-leg
   accounts, while retaining executor-set control on the factory and
   `admin + executors` control on each allocation settlement.
@@ -561,8 +579,15 @@ Authority matrix for this slice:
 | V2 transfer factory | `sender.owner` remains the principal; `sender.provider` acts when present. | `actors == [sender.provider]` for provider-managed senders; `actors == [sender.owner]` for basic senders. | Pending instruction advertises withdraw for sender authority and accept/reject for receiver authority. | Sender account parties observe the factory choice through the private-asset default. The pending instruction observes sender and receiver account parties. |
 | V2 transfer accept/reject/withdraw | Receiver principal is `receiver.owner`; receiver provider acts for accept/reject. Sender provider acts for withdraw. | Accept/reject require `[receiver.provider]` for provider-managed receivers. Withdraw requires `[sender.provider]` for provider-managed senders. | `TIA_Accept -> [[receiver authority]]`, `TIA_Reject -> [[receiver authority]]`, `TIA_Withdraw -> [[sender authority]]`. | The instruction observers are reused as choice observers. Accept-time EventLog context is still explicit; no factory-time EventLog context is persisted. |
 | V2 allocation factory and instruction accept/withdraw | `allocation.authorizer.owner` is the principal; provider acts when present. | Factory, instruction accept, and pending-instruction withdraw require `[authorizer provider]` for provider-managed accounts. | `AIA_Accept -> [[authorizer authority]]`, `AIA_Withdraw -> [[authorizer authority]]`. | Allocation instructions observe authorizer account parties and settlement executors; transfer-leg counterparties do not observe the instruction under the private-asset posture. |
-| V2 allocation withdraw/cancel/settle | Authorizer provider can withdraw its own allocation. Executors cancel. Settlement remains admin/executor co-validated. | Withdraw requires `[authorizer provider]`; cancel requires executor set; settle requires `admin + executors` on each allocation. | `AA_Withdraw -> [[authorizer authority]]`, `AA_Cancel -> [executors]`, `AA_Settle -> [[admin, executors...]]`. | Allocations observe authorizer account parties and executors. Locked holdings keep authorizer account parties and executors only. |
+| V2 allocation withdraw/cancel/settle | Authorizer provider can withdraw its own allocation. Executors cancel. Settlement remains admin/executor co-validated. | Withdraw requires `[authorizer provider]`; cancel requires executor set; settle requires `admin + executors` on each allocation. | `AA_Withdraw -> [[authorizer authority]]`, `AA_Cancel -> [executors]`, `AA_Settle -> [[admin, executors...]]`. | Allocations observe authorizer account parties and executors. Locked holdings observe authorizer account parties and executors. The default lock-holder view is admin-only; the opt-in view includes admin and authorizer account parties. |
 | V2 settlement factory | Trading-account principals are the owners on each transfer leg; providers are visible but do not control batch execution after allocations are authorized. | `SettlementFactory_SettleBatch` still requires actors equal to settlement executors. | Settlement factory has no `availableActions`; allocation views advertise settle. | Factory choice uses the private-asset observer default. Per-allocation settlement creates account-shaped outputs visible to the credited account parties. |
+
+Allocation lock-view policy probes:
+
+| Policy | Signatories and observers | `Lock.holders` view | `availableActions` and disclosed parties | Stale, contention, and archival behavior |
+| :--- | :--- | :--- | :--- | :--- |
+| Admin-only allocation lock | Provider-managed locked holdings are signed by `admin, provider`; authorizer owner/provider and executors observe. | `[admin]`. | Allocation instruction/allocation actions are unchanged: authorizer provider accepts/withdraws, executors cancel, `admin + executors` settle. Daml Script still discloses the rules/factory contract before factory calls. | Accept archives input holdings and creates the lock. Withdraw/cancel archive the lock and return account-shaped holdings. Settlement archives allocations and locks. Stale CIDs fail with `NotActive`; unexpired locks remain rejected as later inputs. |
+| Account-party allocation lock | Same template signatories and observers as admin-only, with authorizer account parties also repeated in the lock extra-observer policy for the probe. | `admin + accountAuthority + accountObservers allocation.authorizer`, de-duplicated. | `availableActions` and disclosed parties are intentionally identical to admin-only; only the lock-holder view changes. Unsupported policy values fail before input consumption. | The account-party tests cover visibility, withdraw, cancel, settlement, stale allocation reuse, post-archival residual visibility, and the same locked-input contention scenario as the admin-only path. |
 
 Security and lifecycle assumptions:
 
@@ -573,7 +598,9 @@ Security and lifecycle assumptions:
 - Observers: account owners and providers observe provider-managed holdings,
   locked holdings, transfer instructions, allocation instructions, and
   allocations relevant to their account. Unrelated parties are excluded by
-  tests.
+  transfer and allocation tests, including pending allocation instructions,
+  accepted allocations, locked allocation holdings, and post-withdraw/cancel/
+  settlement residual queries.
 - Controllers: provider-managed account movement choices use singleton actor
   lists for the provider. Duplicate actors, owner-only actors, wrong providers,
   and spoofed provider/account combinations fail before successful state
@@ -603,19 +630,212 @@ Security and lifecycle assumptions:
   consent, provider revocation, or custody obligations.
 - Failure modes: missing provider, wrong provider, wrong owner, unauthorized
   actor lists, owner-only instruction actions, unintended observer expansion,
-  provider spoofing, stale instructions, and locked-input contention have
-  focused Daml Script coverage with exact local failure markers where the
-  runtime exposes one.
+  provider spoofing, stale instructions and allocations, lock-view policy
+  choice, and locked-input contention have focused Daml Script coverage with
+  exact local failure markers where the runtime exposes one.
 - Upgrade assumptions: the implementation relies on the preview branch's
   current `Account`, `availableActions`, `actors`, `FinalizedAllocation`, and
   EventLog shapes. If CIP-0112 changes provider visibility or
   account-authority conventions, these helpers and tests must be re-baselined.
 - Stablecoin CDP authority remains deferred. This token-template slice proved
   regular provider-managed account transfer/allocation/settlement authority
-  without a CDP-specific vault need. Extending `tools/canton-stablecoin` would
-  require a separate policy decision about whether a vault keeper, admin, or
-  account provider controls CDP close/liquidation authority, so no stablecoin
-  files were changed in this slice.
+  without a CDP-specific vault need. CDP implementation changes would require a
+  separate policy decision about whether a vault keeper, admin, or account
+  provider controls CDP close/liquidation authority. The sibling stablecoin plan
+  records that as a CDP-specific follow-up, not as provider-managed
+  token-template scope.
+
+### 2026-05-20 V2 AllocationRequest workflow slice
+
+Implemented the current experimental allocation-request workflow slice in
+`simple-token/` and `simple-token-test/` against the same Splice preview V2
+source, adding the direct allocation-request DAR this slice imports:
+
+- `splice-api-token-allocation-request-v2-1.0.0.dar`
+
+Implementation summary:
+
+- `SimpleAllocationRequestV2` implements preview
+  `Splice.Api.Token.AllocationRequestV2.AllocationRequest` while preserving
+  the existing V1 `SimpleAllocationRequest` behavior.
+- Requests are created by settlement executors and observed by the authorizer
+  account parties. Transfer-leg counterparties are not observers merely
+  because they are referenced in requested allocation legs.
+- `availableActions` advertises `ARA_Accept` and `ARA_Reject` for the
+  authorizer account authority. `ARA_Withdraw` remains controlled by the
+  settlement executors and is intentionally not advertised as an authorizer
+  action.
+- Accept, reject, and withdraw consume the request. Accept rejects expired
+  `settleAt` values, iterated `nextIterationFunding`, empty transfer-leg
+  shapes, non-positive leg amounts, and unsupported account shapes before
+  archival.
+- A local `SimpleAllocationRequestV2_AcceptAndCreateAllocations` choice lets
+  the Daml Script wallet-style harness consume the request and exercise the
+  existing V2 `AllocationFactory_Allocate` in one transaction. This is an
+  experimental convenience for replay-safe app/wallet testing, not a Token
+  Standard API addition or public API claim. The helper requires the supplied
+  factory calls to cover each requested allocation exactly once, so zero,
+  partial, duplicate, or extra non-requested calls fail before any allocation
+  factory is exercised.
+- Added
+  `simple-token-test/daml/SimpleToken/Test/Cip112AllocationRequest.daml` with
+  seven Daml Script probes covering create/view/disclosure, reject, withdraw,
+  expiry, stale replay, unsupported iterated shape, hidden observer expansion,
+  zero/partial/duplicate/extra accept-and-create factory-call coverage,
+  missing factory disclosure, provider/basic-account mismatches, explicitly
+  disclosed wallet-style submission, submitMulti submission, and
+  request-to-instruction-to-allocation-to-settlement for app-proposed multi-leg
+  requests.
+
+Authority and lifecycle assumptions:
+
+| Surface | Allocation-request slice result |
+| :--- | :--- |
+| Signatories | `SimpleAllocationRequestV2` is signed by `settlement.executors`, matching the app/executor request origin. No admin, provider, or wallet signatory is added by request creation. |
+| Observers | The authorizer account parties observe the request: owner for basic accounts; owner and provider for provider-managed accounts. Executors see the request as signatories. Transfer-leg counterparties do not observe the request unless they are also authorizer account parties. |
+| Controllers and choices | V2 accept/reject require `actors == [accountAuthority authorizer]`. V2 withdraw requires the same party set as `settlement.executors`. The local wallet-style accept-and-create choice is controlled by the same authorizer account authority and delegates actual allocation creation to the existing V2 allocation factory. |
+| Disclosed parties | The private rules/allocation-factory contract must still be disclosed to the authorizer when a request acceptance also creates allocation instructions, unless the flow uses `submitMulti` with the rules admin as an authorizing party. A request alone does not disclose the factory or widen rules visibility. Negative tests assert missing rules disclosure separately from request visibility. |
+| Privacy | Request visibility is limited to executors and authorizer account parties. Provider-managed requests are visible to both owner and provider for that account, but unrelated basic/provider accounts cannot query the request. Hidden observer expansion to transfer-leg counterparties is covered by tests. |
+| Authorization | Basic accounts accept/reject through the owner. Provider-managed accounts accept/reject through the provider. Owner-only attempts against provider-managed requests fail at the local request actor guard before factory mutation. Provider/basic mismatches still fail in the allocation factory when the supplied funding account does not match the requested authorizer. |
+| Archival behavior | Accept, reject, withdraw, and the local accept-and-create choice consume the request. Expired, unsupported, wrong-actor, stale-CID, missing-disclosure, and zero/partial/duplicate/extra factory-call failures leave live state unchanged or fail before any successful allocation creation. |
+| Stale state | Replaying a consumed request CID fails with the ledger `NotActive` marker. Reusing stale allocation CIDs in the downstream settlement path remains covered by the existing V2 settlement rollback tests and the new request-driven end-to-end replay check. |
+| Failure modes | Exact tests cover wrong actors, missing request visibility, missing rules/factory disclosure, expired `settleAt`, unsupported iterated preview shape, stale request CID replay, stale downstream settlement replay, provider-owner mismatch, provider/basic funding mismatch, and hidden observer expansion. |
+| Unsupported paths | Iterated requests with `nextIterationFunding`, empty allocation shapes, non-regular account shapes, V1/V2-compatible allocation-pairing requests, receipt allocation auto-creation, reduced-privacy observer mode, Wallet SDK authority, and ChainSafe claims remain unsupported. |
+| Upgrade assumptions | The implementation follows the preview branch's current `RequestedAllocation.transferLegSides`, `availableActions : Map AllocationRequestAction [[Party]]`, and `AllocationRequest_Accept/Reject/Withdraw` shapes. Any source-of-record change around request fields, iteration funding, or wallet/client authority requires re-baselining. |
+
+New blocker evidence:
+
+- `dpm build` for `simple-token`, `dpm build` for `simple-token-test`, and
+  `dpm test` for `simple-token-test` pass with SDK 3.4.11 / LF 2.1 after
+  adding the preview allocation-request DAR.
+- The preview package is sufficient for request create/view/reject/withdraw
+  and request-driven allocation creation in the local Daml Script harness via
+  both explicit disclosure and `submitMulti`. It is not sufficient to claim
+  CIP-0112 conformance because iterated request funding, V1/V2-compatible
+  request flows, receipt allocation behavior, and wallet authority conventions
+  remain unresolved.
+- The plan asks for `extraSettlementAuthorizers` evidence for wallet/dApp UX.
+  The inspected preview request and settlement packages expose
+  `availableActions` and choice-observer defaults, but no
+  `extraSettlementAuthorizers` field or choice argument on the request-driven
+  path used here. Treat this as preview/Draft drift to re-baseline with the CIP
+  authors before hardening wallet UX.
+- `tools/canton-stablecoin` was not touched. No concrete CDP repayment or
+  liquidation allocation-request flow was needed to prove this token-template
+  request slice, so CDP-specific authority remains deferred to a separate
+  stablecoin design decision.
+
+### 2026-05-20 V2 iterated settlement and partial-progress slice
+
+Implemented the current experimental iterated-settlement slice in
+`simple-token/` and `simple-token-test/` against the same Splice preview V2
+source. External references were refreshed before use:
+
+- `/Users/x/excanton/CF/cips` was fetched and fast-forwarded to `main` commit
+  `67986a1ff820521ffd0dea92e32d8a49da340756`; `cip-0112/cip-0112.md` had no
+  diff from the accepted frozen snapshot
+  `a07d8db7a1b86d6fd1109375263b8c56d82e90a0`.
+- `/Users/x/excanton/CN/splice` was fetched and fast-forwarded on `main` to
+  `5dc3a8aeab28eae09e421332392f1fd11d06f232`; the accepted preview evidence
+  ref remains `origin/token-standard-v2-daml-preview` at
+  `b91de5d4b910ded598151981654dce2acc6f84ba`.
+- Inspected evidence paths:
+  `token-standard/splice-api-token-allocation-v2/daml/Splice/Api/Token/AllocationV2.daml`,
+  `token-standard/splice-token-standard-utils/daml/Splice/TokenStandard/Utils/Internal/Allocations.daml`,
+  `token-standard/splice-token-standard-v2-test/daml/Splice/Tests/TestIteratedSettlement.daml`,
+  `daml/splice-amulet/daml/Splice/AmuletAllocationV2.daml`, and
+  `token-standard/examples/splice-test-token-v2/daml/Splice/Testing/Tokens/TestTokenV2/Allocation.daml`.
+
+Implementation summary:
+
+- `SimpleAllocationInstructionV2` and `SimpleAllocationV2` now carry
+  `supportedInstruments` so next-iteration funding keys are validated against
+  the local rules contract instead of silently minting unsupported instrument
+  ids.
+- `SimpleAllocationV2` now stores `numIterations`. The initial accepted
+  allocation starts at `0`; each settlement that supplies
+  `nextIterationFunding = Some ...` creates a successor allocation with
+  `numIterations + 1`, `originalAllocationCid` pointing at the first
+  allocation, empty base `transferLegSides`, and locked funding for the next
+  iteration.
+- Allocation accept reserves `nextIterationFunding` up front. The locked amount
+  is `max 0 (nextIterationFunding - currentNetCredit)` per instrument; excess
+  input is returned as authorizer change. Non-iterated allocations keep the
+  previous net-debit lock behavior.
+- `Allocation_Settle` now merges the original transfer-leg sides with
+  finalized `extraTransferLegSides`, consumes the current allocation and locked
+  holdings, pays out any amount above the requested next-iteration reserve, and
+  creates the next locked allocation when `nextIterationFunding` is `Some`.
+  `nextIterationFunding = None` finalizes the allocation and returns the
+  remaining locked funding as unlocked authorizer holdings.
+- `SettlementFactory_SettleBatch` now permits an empty `transferLegs` list when
+  the batch still supplies allocations, which enables refresh/finalization of
+  an iterated allocation with no new transfer legs. A fully empty no-op batch
+  remains rejected.
+- Added `simple-token-test/daml/SimpleToken/Test/Cip112IteratedSettlement.daml`
+  and updated the prior allocation test that expected explicit iteration
+  rejection. The focused coverage now exercises partial settlement, repeated
+  settlement, finalization, cancellation after iteration, committed withdrawal
+  recovery after the settlement deadline, receiver-side top-up funding,
+  uncommitted successor withdrawal before deadline, invalid funding rejection,
+  direct `Allocation_Settle` versus `SettlementFactory_SettleBatch` validation
+  boundaries, stale previous-allocation replay, deadline rollback,
+  no-double-settle/conservation checks, and the current receipt-allocation
+  auto-creation blocker.
+- `AllocationFactory_Allocate` now rejects invalid
+  `allocation.nextIterationFunding` with the local funding marker before a
+  pending instruction is created. `Allocation_Settle` now validates only its
+  local settlement-time `extraTransferLegSides` arguments for positive amount,
+  supported instrument id, and supported regular account shape before mutating
+  the allocation. Full batch transfer-leg shape, duplicate leg IDs, and
+  required sender/receiver authorization matching remain factory-owned through
+  `SettlementFactory_SettleBatch` and the preview utility validator.
+- Added two `daml-props` V2 accounting rows in
+  `simple-token-test/daml/SimpleToken/Test/Props`: random iterated settlement
+  sequences now model active allocation ids, consumed allocation ids,
+  successor allocation ids, partial settlement, finalization, cancel, withdraw,
+  and stale/repeated settlement attempts with an explicit target allocation id
+  while checking reserve conservation and no-double-settle invariants.
+  Deterministic model regressions assert that a replay targeting consumed
+  allocation id `1` records a rejected repeat, while a replay targeting the
+  live successor allocation id `2` remains an invalid no-op without changing
+  accounting fields. This is a lightweight model of the local simple-token
+  accounting, not a full V2 account/wallet conformance generator.
+
+Authority, privacy, and lifecycle assumptions:
+
+| Surface | Iterated-settlement slice result |
+| :--- | :--- |
+| Signatories | `SimpleAllocationV2` remains signed by `admin` and the account authority: owner for basic accounts, provider for provider-managed accounts. Successor allocations preserve the same authorizer, account shape, and signatory model. |
+| Observers | Allocation and locked-holding observers remain authorizer account parties plus settlement executors according to the selected allocation lock-view policy. No reduced-privacy/public-asset observer mode is introduced. |
+| Controllers and choices | `SettlementFactory_SettleBatch` remains executor-controlled. Each `Allocation_Settle` remains controlled by `admin + executors`. `Allocation_Cancel` remains executor-controlled and `Allocation_Withdraw` remains authorizer-authority controlled. |
+| Disclosed parties | The private rules/factory contract still needs explicit disclosure or admin authorization in the Daml Script harness. Iteration does not add a new disclosure carrier; successor allocations are visible only to their signatories/observers. |
+| Privacy | Extra transfer-leg sides are visible through the allocation settlement transaction to the same admin/executor/authorizer audiences as existing V2 settlement. The slice does not optimize Canton view counts or implement reduced-privacy observer modes. |
+| Authorization | Iterated settlement is only available when the authorizer enabled it by setting `allocation.nextIterationFunding = Some ...` at allocation creation. Non-iterated allocations still reject `extraTransferLegSides` and settlement-time `nextIterationFunding`. |
+| Archival behavior | Each settlement consumes the current allocation and its locked holdings. A settlement with `nextIterationFunding = Some ...` creates a successor allocation; a settlement with `nextIterationFunding = None` finalizes and creates no successor. Cancellation/withdrawal of a successor allocation archives it and returns remaining locked funding. |
+| Failure modes | Unsupported funding instruments, non-positive funding entries, invalid direct extra transfer-leg-side arguments, unauthorized actors, settlement after deadline, stale allocation CIDs, missing receipt allocations, insufficient reserved funding, and non-iterated settlement arguments fail before successful state mutation. Full batch transfer-leg validation remains factory-owned. |
+| Stale state | Reusing a consumed allocation CID fails with the ledger `NotActive` marker and leaves the successor allocation and locked funding active. This is the local stale-state proxy; cross-DAR rebuild/migration stale-state probes remain a future upgrade-test target. |
+| Conservation | The repeated-settlement script checks a 100-token prefund settling 10 and 15 token partial bills, then finalizing with 75 returned to the authorizer and 25 paid to the receiver. The `daml-props` model adds random V2 iterated reserve conservation plus consumed-allocation replay/no-double-settle rows. These are Script/property regressions, not completed `daml-verify` proofs. |
+| Upgrade assumptions | The implementation relies on the preview branch's current `FinalizedAllocation.extraTransferLegSides`, `FinalizedAllocation.nextIterationFunding`, `AllocationView.originalAllocationCid`, and `AllocationView.numIterations` shapes. Source-of-record changes require re-baselining. |
+| Non-conformance status | This remains experimental and non-conformant. It does not implement V1/V2-compatible allocation pairing, automatic receipt-allocation creation, `extraReceiptAuthorizers`, reduced-privacy observer mode, cross-admin coordination, production reporting, Wallet SDK authority, ChainSafe alignment, production relayers, public APIs, or CIP-112 conformance. |
+
+New blocker evidence:
+
+- The accepted preview `SettlementFactory_SettleBatch` shape has
+  `allocations : [FinalizedAllocation]` but no `extraReceiptAuthorizers` field.
+  The local blocker test therefore proves that a batch missing the receiver
+  allocation still fails with `missing authorizations`; auto-created receipt
+  allocations must be re-baselined with CIP authors or a later preview shape
+  before this tool can implement them.
+- The Splice `TestTokenV2` example still marks iterated settlement as TODO,
+  while the Amulet preview implementation supports the successor-allocation
+  pattern. This token-template slice follows the Amulet-shaped funding and
+  successor-allocation model, simplified to the local no-fee simple-token
+  accounting model.
+- `tools/canton-stablecoin` was not touched. Partial repayment, partial
+  liquidation, bad-debt, change-output, and vault archival timing implications
+  remain a stablecoin-specific design slice because this token-template work
+  only proves regular account settlement semantics.
 
 ## Module-by-module V2 mapping
 
@@ -690,16 +910,31 @@ Implementation status:
 - The current V2 factory creates a pending instruction, and instruction accept
   creates a locked allocation. This is intentionally less optimized than the
   Splice preview state machine, but it proves the instruction surface directly.
+- `SimpleAllocationInstructionV2` carries an internal
+  `AllocationLockViewPolicy` field selected from the factory choice context.
+  Missing context defaults to the admin-only policy, so existing V2 allocation
+  behavior is preserved. The account-party policy is opt-in and V2-only.
 - `SimpleAllocationV2.Allocation_Settle` now supports the narrow
   SettlementFactory-driven regular-account path: it archives the allocation
-  and locked holdings, verifies locked debit amounts against net transfer-leg
-  debits, creates credited holdings in the authorizer account shape, and logs
-  a V2 allocation-settlement event when the settlement factory supplies the
-  rules EventLog context.
+  and locked holdings, verifies available locked funding against net
+  transfer-leg debits and requested next-iteration reserves, creates credited
+  holdings in the authorizer account shape, and logs a V2
+  allocation-settlement event when the settlement factory supplies the rules
+  EventLog context.
+- Iterated settlement is implemented for `SimpleAllocationV2`: allocations
+  that carry `nextIterationFunding = Some ...` may settle additional
+  `extraTransferLegSides`, create successor allocations with incremented
+  `numIterations`, cancel or withdraw successor allocations, and finalize with
+  `nextIterationFunding = None`.
+- `SimpleAllocationRequestV2` now implements the preview V2
+  `AllocationRequest` interface as the app/wallet-facing request entry point
+  alongside the direct authorizer-side V2 allocation factory path. It preserves
+  V1 request behavior through the existing `SimpleAllocationRequest` template
+  and a V1 downcast view on the V2 request template.
 - V1 `SimpleAllocation` and the existing V1 allocation tests are unchanged.
-- `SimpleAllocationV1Compat`, V2 `AllocationRequest`, receipt allocations,
-  iterated settlement, extra receipt authorizers, and reduced-privacy
-  settlement observer modes remain later slices.
+- `SimpleAllocationV1Compat`, automatic receipt allocations,
+  `extraReceiptAuthorizers`, and reduced-privacy settlement observer modes
+  remain later slices.
 
 ### Rules.daml (factory)
 
@@ -734,6 +969,10 @@ Implementation actions:
   preview utility private-asset default. The default for the OZ token template
   remains the §4.3.5.1 baseline (privacy preserved across traders) unless
   §4.3.5.3 (reduced privacy) is explicitly opted in by an asset variant.
+- `SettlementFactory_SettleBatch` accepts empty `transferLegs` only when
+  allocations are supplied, so iterated allocations can be refreshed or
+  finalized without a new transfer leg while a no-op empty batch remains
+  rejected.
 
 ### Preapproval.daml
 
@@ -767,9 +1006,9 @@ Implementation actions:
 
 | Existing test class | Count | V2 impact |
 | :--- | :--- | :--- |
-| Experimental CIP-112 probe | 49 | The first 3 tests cover basic-account Holding projection. The V2 transfer/compatibility probes cover basic-account initiation, pending action visibility, V1/V2 cross-choice accept, accept/reject/withdraw execution, instruction archival, explicit EventLog-context reporting with locked-holding input semantics, factory EventLog-context non-persistence, non-participant EventLog privacy, wrong or duplicate V2 actors, missing rules disclosure, and provider-managed receiver support. The V2 allocation/settlement/compatibility probes cover basic-account instruction creation, accept-to-allocation locking, multi-leg net-debit funding, pending withdraw CID recovery for live and stale inputs, private allocation-instruction observers, allocation withdraw/cancel unlocks, wrong actors, non-basic accounts, malformed allocation rejection, committed-withdraw deadline behavior, unexpired locked-input rejection, order-insensitive multi-executor cancel, matching batch settlement, admin/executor overlap, explicit iterated-settlement rejection, wrong settlement actors, non-basic settlement transfer-leg accounts, missing receiver allocation rollback, V1 allocation artifact rejection by V2 settlement, stale allocation CID rollback, and settlement-deadline rollback. The 9 provider-managed probes cover transfer authority matrix, allocation settlement, allocation withdraw/cancel, missing provider, wrong provider, wrong owner, unauthorized actor lists, observer minimization, provider spoofing, stale instruction, and locked-input contention. These are not V2 conformance tests. |
+| Experimental CIP-112 probe | 67 | The first 3 tests cover basic-account Holding projection. The V2 transfer/compatibility probes cover basic-account initiation, pending action visibility, V1/V2 cross-choice accept, accept/reject/withdraw execution, instruction archival, explicit EventLog-context reporting with locked-holding input semantics, factory EventLog-context non-persistence, non-participant EventLog privacy, wrong or duplicate V2 actors, missing rules disclosure, and provider-managed receiver support. The V2 allocation/settlement/compatibility probes cover basic-account instruction creation, accept-to-allocation locking, multi-leg net-debit funding, pending withdraw CID recovery for live and stale inputs, private allocation-instruction observers, allocation withdraw/cancel unlocks, wrong actors, non-basic accounts, malformed allocation rejection, committed-withdraw deadline behavior, unexpired locked-input rejection, order-insensitive multi-executor cancel, matching batch settlement, admin/executor overlap, iterated settlement with successor allocations, wrong settlement actors, non-basic settlement transfer-leg accounts, missing receiver allocation rollback, V1 allocation artifact rejection by V2 settlement, stale allocation CID rollback, and settlement-deadline rollback. The 12 provider-managed probes cover transfer authority matrix, allocation settlement, allocation withdraw/cancel, admin-only and account-party allocation lock-view policies, unsupported lock-view policy rejection, missing provider, wrong provider, wrong owner, unauthorized actor lists, allocation observer minimization, provider spoofing, stale instruction/allocation behavior, and locked-input contention under both allocation lock policies. The 7 allocation-request probes cover request create/view/disclosure, reject, withdraw, expiry, stale replay, unsupported iterated shape, hidden observer expansion, zero/partial/duplicate/extra factory-call coverage, missing factory disclosure, provider/basic-account mismatches, explicit-disclosure and submitMulti request-driven paths, and request-driven multi-leg settlement. The 8 iterated-settlement probes cover partial repeated settlement, receiver-side top-up, finalization, cancellation after iteration, uncommitted and committed withdrawal recovery, invalid funding, direct-allocation versus factory validation boundaries, stale replay/no-double-settle, deadline rollback, conservation checks, and the `extraReceiptAuthorizers`/receipt-allocation preview blocker. These are not V2 conformance tests. |
 | Transfer tests | 9 | Existing V1 transfer tests remain unchanged and passing. The V2 tests cover the smallest basic-account transfer/factory paths plus targeted cross-version, disclosure, observer, actor, provider-managed receiver, and non-basic unsupported account cases. Wrong V2 actors are asserted to fail before V1 delegation or V2-only provider-managed mutation. Explicit accept-time EventLog-context reporting is covered for the basic path; provider-managed transfer EventLog remains accept-context driven and not a production reporting claim. Direct/self transfer EventLog reporting and reject/withdraw holding-change events remain unimplemented. Full §5.4 coverage still requires more sender×receiver×asset rows and account-configuration variants. |
-| Allocation tests | 5 | Existing V1 allocation tests remain unchanged and passing. The V2 allocation probes cover the smallest basic-account instruction/allocation path, provider-managed allocation/settlement/withdraw/cancel paths, targeted negative cases, matching sender/receiver `SettlementFactory_SettleBatch`, multi-leg net funding, private observer checks, stale-state and deadline rollback, admin/executor overlap, and explicit rejection of iterated-settlement arguments. V1/V2-compatible Allocation implementations, V2 allocation requests, receipt allocation auto-creation, implemented iterated settlement, reduced-privacy observer mode, V1 asset contrast packages, and full §5.5 app×settlement×wallet×asset variants remain required. |
+| Allocation tests | 5 | Existing V1 allocation tests remain unchanged and passing. The V2 allocation probes cover the smallest basic-account instruction/allocation path, provider-managed allocation/settlement/withdraw/cancel paths, targeted negative cases, matching sender/receiver `SettlementFactory_SettleBatch`, multi-leg net funding, private observer checks, stale-state and deadline rollback, admin/executor overlap, and iterated-settlement successor allocations. The allocation-request probes now cover a request-driven path into the existing V2 allocation factory and settlement flow. Iterated-settlement probes add partial repeated settlement, receiver-side top-up, finalization, cancellation, uncommitted and committed withdrawal recovery, invalid funding, direct/factory validation-boundary coverage, stale replay/no-double-settle, and receipt-auto-creation blocker coverage. V1/V2-compatible Allocation implementations, automatic receipt allocations, reduced-privacy observer mode, V1 asset contrast packages, and full §5.5 app×settlement×wallet×asset variants remain required. |
 | Defragmentation tests | 2 | Likely unchanged; defrag is a sender-only self-transfer that does not interact with V2 settlement. Verify. |
 | Security tests | 20 | Invariants tied to `owner : Party` (notably #17 per-input instrumentId check, and authority invariants from `docs/PLAN.md` §9) need V2-equivalent restatements over `Account`. |
 
@@ -793,11 +1032,18 @@ today. Discovery findings:
 - `daml-lint`: no V1-only assumptions. Confirm during the implementation
   slice; add a CIP-112 dual-implementation detector if surfacing is
   desirable.
-- `daml-props`: generators must learn `Account`. The two
-  ownership-by-party invariants need restatement. Property catalog
-  re-baselined to V2 shapes.
-- `daml-verify`: conservation symbolic model becomes per-account; add a
-  `cip-112-authorization` proof class for `actors` validation.
+- `daml-props`: the property catalog now includes two V2 iterated-settlement
+  rows: reserve conservation across random partial/finalize/cancel/withdraw
+  sequences, and consumed-allocation replay/no-double-settle conservation
+  across longer sequences. The model tracks allocation lifecycle ids, explicit
+  stale-replay target ids, and a rejected repeated-settlement counter rather
+  than treating stale replay as a bare no-op. Full generators still need to
+  learn the preview `Account` shape; the ownership-by-party invariants need
+  restatement before this becomes a V2 conformance property suite.
+- `daml-verify`: conservation symbolic model becomes per-account; add
+  `cip-112-conservation` for iterated funding and `cip-112-authorization` for
+  `actors` validation. Those proof rows are re-baselining targets, not
+  completed proof claims from this slice.
 
 ## Open questions for the stakeholder packet
 
@@ -826,12 +1072,16 @@ this repo does not by itself bind any future license decision.
 
 ## Non-goals
 
-- No promotion of prototype Daml into `repos/oz-daml-contracts/`.
-- No release packaging; the V2 DAR source-of-record is unresolved.
-- No broad preview DAR vendoring. Re-add V2 AllocationRequest or other preview
-  DARs only in the slice that directly imports and validates them. The current
-  experimental direct V2 DAR footprint is Holding, TransferInstruction,
-  Allocation, AllocationInstruction, TransferEvents, and Utils.
-- No new SDK/Canton/Splice pins unless the prototype proves the exact need and
-  an ADR records it.
-- No claim of CIP-0112 conformance.
+- No public API hardening in `repos/oz-daml-contracts/` ahead of the
+  workspace slice 18 RI-backed extraction sequence and the M1-PF-004
+  license-boundary gate.
+- No broad preview DAR vendoring. Add a preview DAR (e.g.
+  `splice-api-token-allocation-request-v2`) only in the slice that
+  directly imports and validates it; record provenance and SHA-256 in the
+  prototype evidence section. The current direct V2 DAR footprint is
+  Holding, TransferInstruction, Allocation, AllocationInstruction,
+  AllocationRequest, TransferEvents, and Utils.
+- No new SDK/Canton/Splice pins unless an active slice proves the exact
+  need; observations feed back into M1-PF-001 rather than landing a pin
+  here.
+- No hosted CI; local manual workflow remains the evidence path.

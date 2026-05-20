@@ -11,6 +11,9 @@ import SimpleToken.Test.Props.Model
 testInitialState : TokenState
 testInitialState = mkInitialState 1000.0 1
 
+testV2IteratedInitialState : IteratedSettlementState
+testV2IteratedInitialState = mkIteratedSettlementState 100.0
+
 -- | Runner config for simple-token properties.
 stConfig : Text -> RunnerConfig
 stConfig name = (defaultRunnerConfig name) with
@@ -70,7 +73,77 @@ test_simpleTokenSelfTransferExact = script do
                 executeTokenAction checkSingleOutput testInitialState
   assertResult "self-transfer-exact" result
 
+-- | Property 6: V2 iterated settlement conserves supply while partial
+-- settlement, finalization, cancel, withdraw, and stale replay interleave.
+test_v2IteratedSettlementConservation : Script ()
+test_v2IteratedSettlementConservation = script do
+  let result = runProp (stConfig "v2-iterated-conservation") genIteratedSettlementAction
+                executeIteratedSettlementAction checkIteratedSettlementInvariants
+                testV2IteratedInitialState
+  assertResult "v2-iterated-conservation" result
+
+-- | Property 7: Repeated stale replay attempts do not double-settle or alter
+-- the modeled allocation reserve.
+test_v2IteratedSettlementNoDoubleSettle : Script ()
+test_v2IteratedSettlementNoDoubleSettle = script do
+  let config = (stConfig "v2-iterated-no-double-settle") with maxSequenceLength = 25
+  let result = runProp config genIteratedSettlementAction
+                executeIteratedSettlementAction checkIteratedSettlementInvariants
+                testV2IteratedInitialState
+  assertResult "v2-iterated-no-double-settle" result
+
+-- | The stale/repeated settlement branch targets a consumed allocation id and
+-- records a rejected repeat without changing any accounting field.
+test_v2IteratedSettlementStaleReplayModelTracksRejectedRepeat : Script ()
+test_v2IteratedSettlementStaleReplayModelTracksRejectedRepeat = script do
+  let firstState = expectRight "first iterated settlement" $
+        executeIteratedSettlementAction
+          testV2IteratedInitialState
+          (IteratedPartialSettlement 10.0 90.0)
+      replayState = expectRight "stale iterated replay" $
+        executeIteratedSettlementAction
+          firstState
+          (IteratedStaleReplay with
+            isrTargetAllocationId = 1
+            isrAmount = 10.0
+            isrNextFunding = 90.0)
+  assert (replayState.rejectedRepeatedSettlements == firstState.rejectedRepeatedSettlements + 1)
+  assert (replayState.authorizerUnlocked == firstState.authorizerUnlocked)
+  assert (replayState.authorizerLocked == firstState.authorizerLocked)
+  assert (replayState.receiverUnlocked == firstState.receiverUnlocked)
+  assert (replayState.activeAllocationId == firstState.activeAllocationId)
+  assert (replayState.consumedAllocationIds == firstState.consumedAllocationIds)
+  assert (checkIteratedSettlementInvariants replayState == Right ())
+
+-- | Stale/repeated settlement attempts that target the current live allocation
+-- id are invalid no-ops, not rejected repeats against consumed history.
+test_v2IteratedSettlementStaleReplayModelIgnoresLiveTarget : Script ()
+test_v2IteratedSettlementStaleReplayModelIgnoresLiveTarget = script do
+  let firstState = expectRight "first iterated settlement" $
+        executeIteratedSettlementAction
+          testV2IteratedInitialState
+          (IteratedPartialSettlement 10.0 90.0)
+      replayState = expectRight "live-target iterated replay" $
+        executeIteratedSettlementAction
+          firstState
+          (IteratedStaleReplay with
+            isrTargetAllocationId = 2
+            isrAmount = 10.0
+            isrNextFunding = 90.0)
+  assert (firstState.activeAllocationId == Some 2)
+  assert (replayState.rejectedRepeatedSettlements == firstState.rejectedRepeatedSettlements)
+  assert (replayState.authorizerUnlocked == firstState.authorizerUnlocked)
+  assert (replayState.authorizerLocked == firstState.authorizerLocked)
+  assert (replayState.receiverUnlocked == firstState.receiverUnlocked)
+  assert (replayState.activeAllocationId == firstState.activeAllocationId)
+  assert (replayState.consumedAllocationIds == firstState.consumedAllocationIds)
+  assert (checkIteratedSettlementInvariants replayState == Right ())
+
 -- | Helper: assert a RunResult is AllPassed, error otherwise.
-assertResult : Text -> RunResult TokenState TokenAction -> Script ()
+assertResult : (Show s, Show a) => Text -> RunResult s a -> Script ()
 assertResult name (AllPassed _ _) = debug (name <> ": PASSED")
 assertResult name (FoundFailure d) = error (formatDetail d)
+
+expectRight : Text -> Either Text a -> a
+expectRight _ (Right value) = value
+expectRight label (Left err) = error (label <> ": " <> err)

@@ -12,7 +12,10 @@ import Splice.Api.Token.AllocationV2 qualified as AllocationV2
 import Splice.Api.Token.AllocationInstructionV2 qualified as AllocationInstructionV2
 
 import SimpleToken.Allocation
-  ( v2AllocationCancelActorFailureMsg
+  ( allocationLockAccountPartiesValue
+  , allocationLockViewPolicyFailureMsg
+  , allocationLockViewPolicyContextKey
+  , v2AllocationCancelActorFailureMsg
   , v2AllocationInstructionAcceptActorFailureMsg
   , v2AllocationWithdrawActorFailureMsg
   )
@@ -147,6 +150,50 @@ checkProviderManagedBalance observer account expected = do
     ("Expected provider-managed balance " <> show expected <> ", got " <> show actual)
     (actual == expected)
 
+samePartySet : [Party] -> [Party] -> Bool
+samePartySet expected actual =
+  let
+    expectedSet = dedupParties expected
+    actualSet = dedupParties actual
+  in
+    length expectedSet == length actualSet &&
+    all (\party -> party `elem` actualSet) expectedSet &&
+    all (\party -> party `elem` expectedSet) actualSet
+
+dedupParties : [Party] -> [Party]
+dedupParties parties = case parties of
+  [] -> []
+  party :: rest ->
+    if party `elem` rest
+      then dedupParties rest
+      else party :: dedupParties rest
+
+assertNoProviderManagedHoldingsVisible : Party -> Account -> Script ()
+assertNoProviderManagedHoldingsVisible observer account = do
+  holdings <- queryV2HoldingsForAccount observer account
+  assert (null holdings)
+
+assertNoProviderManagedLockedHoldingsVisible : Party -> Account -> Script ()
+assertNoProviderManagedLockedHoldingsVisible observer account = do
+  holdings <- queryLockedV2Holdings observer account
+  assert (null holdings)
+
+assertProviderManagedAllocationLockHolders
+  : Party -> Account -> [Party] -> Script ()
+assertProviderManagedAllocationLockHolders observer account expectedHolders = do
+  locked <- queryLockedV2Holdings observer account
+  case locked of
+    [(_, holdingView)] -> case holdingView.lock of
+      Some lock ->
+        assertMsg
+          ("Expected allocation lock holders "
+            <> show expectedHolders
+            <> ", got "
+            <> show lock.holders)
+          (samePartySet expectedHolders lock.holders)
+      None -> fail "Expected provider-managed allocation holding to be locked"
+    _ -> fail $ "Expected one provider-managed locked allocation holding, found " <> show (length locked)
+
 assertNoProviderManagedInstructionVisible
   : Party
   -> ContractId TransferV2.TransferInstruction
@@ -196,6 +243,13 @@ mkManagedAllocationArgsForSide registry authorizer otherSide executor side amoun
     extraArgs = emptyExtraArgs
     actors = [regularAccountProvider authorizer]
 
+allocationLockPolicyExtraArgs : Text -> ExtraArgs
+allocationLockPolicyExtraArgs policyValue =
+  emptyExtraArgs with
+    context = ChoiceContext with
+      values = TextMap.fromList
+        [(allocationLockViewPolicyContextKey, AV_Text policyValue)]
+
 mkManagedTransferLeg
   : SimpleRegistry
   -> Account
@@ -222,14 +276,54 @@ createPendingManagedAllocation
   -> Bool
   -> Script (ContractId AllocationInstructionV2.AllocationInstruction)
 createPendingManagedAllocation registry authorizer otherSide executor side amount inputCids committed = do
+  createPendingManagedAllocationWithExtraArgs
+    registry authorizer otherSide executor side amount inputCids committed emptyExtraArgs
+
+createPendingManagedAllocationWithExtraArgs
+  : SimpleRegistry
+  -> Account
+  -> Account
+  -> Party
+  -> AllocationV2.TransferSide
+  -> Decimal
+  -> [ContractId HoldingV2.Holding]
+  -> Bool
+  -> ExtraArgs
+  -> Script (ContractId AllocationInstructionV2.AllocationInstruction)
+createPendingManagedAllocationWithExtraArgs registry authorizer otherSide executor side amount inputCids committed extraArgs = do
   (afCid, rulesDisc) <- V2Allocation.getV2AllocationFactory registry
-  let args = mkManagedAllocationArgsForSide
-        registry authorizer otherSide executor side amount inputCids committed
+  let args =
+        (mkManagedAllocationArgsForSide
+          registry authorizer otherSide executor side amount inputCids committed)
+          with extraArgs = extraArgs
   result <- submitWithDisc (regularAccountProvider authorizer) rulesDisc $
     V2Allocation.exerciseV2AllocationFactory afCid args
   case result.output of
     AllocationInstructionV2.AllocationInstructionResult_Pending instrCid -> pure instrCid
     _ -> fail "Expected provider-managed allocation factory to create a pending instruction"
+
+createPendingManagedAllocationWithLockPolicy
+  : SimpleRegistry
+  -> Account
+  -> Account
+  -> Party
+  -> AllocationV2.TransferSide
+  -> Decimal
+  -> [ContractId HoldingV2.Holding]
+  -> Bool
+  -> Text
+  -> Script (ContractId AllocationInstructionV2.AllocationInstruction)
+createPendingManagedAllocationWithLockPolicy registry authorizer otherSide executor side amount inputCids committed policyValue =
+  createPendingManagedAllocationWithExtraArgs
+    registry
+    authorizer
+    otherSide
+    executor
+    side
+    amount
+    inputCids
+    committed
+    (allocationLockPolicyExtraArgs policyValue)
 
 acceptManagedAllocation
   : Account
@@ -258,6 +352,65 @@ createAcceptedManagedAllocation registry authorizer otherSide executor side amou
   case result.output of
     AllocationInstructionV2.AllocationInstructionResult_Completed allocCid -> pure allocCid
     _ -> fail "Expected provider-managed allocation instruction accept to complete"
+
+createAcceptedManagedAllocationWithLockPolicy
+  : SimpleRegistry
+  -> Account
+  -> Account
+  -> Party
+  -> AllocationV2.TransferSide
+  -> Decimal
+  -> [ContractId HoldingV2.Holding]
+  -> Bool
+  -> Text
+  -> Script (ContractId AllocationV2.Allocation)
+createAcceptedManagedAllocationWithLockPolicy registry authorizer otherSide executor side amount inputCids committed policyValue = do
+  instrCid <- createPendingManagedAllocationWithLockPolicy
+    registry authorizer otherSide executor side amount inputCids committed policyValue
+  result <- acceptManagedAllocation authorizer instrCid
+  case result.output of
+    AllocationInstructionV2.AllocationInstructionResult_Completed allocCid -> pure allocCid
+    _ -> fail "Expected provider-managed allocation instruction accept to complete"
+
+createPendingManagedAllocationForPolicy
+  : SimpleRegistry
+  -> Account
+  -> Account
+  -> Party
+  -> AllocationV2.TransferSide
+  -> Decimal
+  -> [ContractId HoldingV2.Holding]
+  -> Bool
+  -> Optional Text
+  -> Script (ContractId AllocationInstructionV2.AllocationInstruction)
+createPendingManagedAllocationForPolicy registry authorizer otherSide executor side amount inputCids committed lockPolicy =
+  case lockPolicy of
+    None ->
+      createPendingManagedAllocation
+        registry authorizer otherSide executor side amount inputCids committed
+    Some policyValue ->
+      createPendingManagedAllocationWithLockPolicy
+        registry authorizer otherSide executor side amount inputCids committed policyValue
+
+createAcceptedManagedAllocationForPolicy
+  : SimpleRegistry
+  -> Account
+  -> Account
+  -> Party
+  -> AllocationV2.TransferSide
+  -> Decimal
+  -> [ContractId HoldingV2.Holding]
+  -> Bool
+  -> Optional Text
+  -> Script (ContractId AllocationV2.Allocation)
+createAcceptedManagedAllocationForPolicy registry authorizer otherSide executor side amount inputCids committed lockPolicy =
+  case lockPolicy of
+    None ->
+      createAcceptedManagedAllocation
+        registry authorizer otherSide executor side amount inputCids committed
+    Some policyValue ->
+      createAcceptedManagedAllocationWithLockPolicy
+        registry authorizer otherSide executor side amount inputCids committed policyValue
 
 -- | Provider-managed transfers use provider actors and expose owner/provider
 -- account parties without expanding to unrelated observers.
@@ -309,6 +462,7 @@ test_providerManagedTransferAuthorityMatrix = do
 test_providerManagedAllocationSettlement : Script ()
 test_providerManagedAllocationSettlement = do
   TestEnv{..} <- setupTestEnv
+  mallory <- allocatePartyByHint (PartyIdHint "mallory-provider-allocation")
   let sender = senderAccount parties
       receiver = receiverAccount parties
       amount = 70.0
@@ -320,6 +474,7 @@ test_providerManagedAllocationSettlement = do
   senderInstrCid <- createPendingManagedAllocation
     registry sender receiver parties.executor AllocationV2.SenderSide amount [h1] False
   senderInstrView <- V2Allocation.querySingleV2AllocationInstruction parties.charlie senderInstrCid
+  V2Allocation.assertNoV2AllocationInstruction mallory senderInstrCid
   assert (senderInstrView.availableActions == Map.fromList
     [ (AllocationInstructionV2.AIA_Accept, [[parties.charlie]])
     , (AllocationInstructionV2.AIA_Withdraw, [[parties.charlie]])
@@ -332,6 +487,13 @@ test_providerManagedAllocationSettlement = do
   receiverAllocCid <- createAcceptedManagedAllocation
     registry receiver sender parties.executor AllocationV2.ReceiverSide amount [] False
   senderAllocView <- V2Allocation.querySingleV2Allocation parties.charlie senderAllocCid
+  _ <- V2Allocation.querySingleV2Allocation parties.alice senderAllocCid
+  _ <- V2Allocation.querySingleV2Allocation parties.executor senderAllocCid
+  V2Allocation.assertNoV2Allocation mallory senderAllocCid
+  assertProviderManagedAllocationLockHolders parties.charlie sender [registry.admin]
+  assertProviderManagedAllocationLockHolders parties.alice sender [registry.admin]
+  assertProviderManagedAllocationLockHolders parties.executor sender [registry.admin]
+  assertNoProviderManagedLockedHoldingsVisible mallory sender
   assert (senderAllocView.availableActions == Map.fromList
     [ (AllocationV2.AA_Withdraw, [[parties.charlie]])
     , (AllocationV2.AA_Cancel, [[parties.executor]])
@@ -346,6 +508,10 @@ test_providerManagedAllocationSettlement = do
   assert (length settleResult.allocationSettleResults == 2)
   V2Allocation.assertNoV2Allocation parties.charlie senderAllocCid
   V2Allocation.assertNoV2Allocation parties.executor receiverAllocCid
+  V2Allocation.assertNoV2Allocation mallory senderAllocCid
+  V2Allocation.assertNoV2Allocation mallory receiverAllocCid
+  assertNoProviderManagedHoldingsVisible mallory sender
+  assertNoProviderManagedHoldingsVisible mallory receiver
   checkProviderManagedBalance parties.alice sender 30.0
   checkProviderManagedBalance parties.bob receiver 70.0
 
@@ -373,6 +539,7 @@ test_providerManagedAllocationWithdrawAndCancel = do
   h2 <- createProviderManagedHolding registry sender 60.0
   withdrawAllocCid <- createAcceptedManagedAllocation
     registry sender receiver parties.executor AllocationV2.SenderSide amount [h2] False
+  assertProviderManagedAllocationLockHolders parties.charlie sender [registry.admin]
   withdrawResult <- submit parties.charlie $
     exerciseCmd withdrawAllocCid AllocationV2.Allocation_Withdraw with
       actors = [parties.charlie]
@@ -381,10 +548,12 @@ test_providerManagedAllocationWithdrawAndCancel = do
     AllocationV2.AllocationResult_Withdrawn -> pure ()
     _ -> fail "Expected provider-managed allocation withdraw"
   V2Allocation.assertNoV2Allocation parties.charlie withdrawAllocCid
+  assertNoProviderManagedLockedHoldingsVisible parties.charlie sender
 
   h3 <- createProviderManagedHolding registry sender 50.0
   cancelAllocCid <- createAcceptedManagedAllocation
     registry sender receiver parties.executor AllocationV2.SenderSide amount [h3] False
+  assertProviderManagedAllocationLockHolders parties.charlie sender [registry.admin]
   wrongCancelErr <- submitError parties.charlie mempty $
     exerciseCmd cancelAllocCid AllocationV2.Allocation_Cancel with
       actors = [parties.charlie]
@@ -398,6 +567,116 @@ test_providerManagedAllocationWithdrawAndCancel = do
     AllocationV2.AllocationResult_Cancelled -> pure ()
     _ -> fail "Expected provider-managed allocation cancel"
   V2Allocation.assertNoV2Allocation parties.executor cancelAllocCid
+  assertNoProviderManagedLockedHoldingsVisible parties.charlie sender
+
+-- | The opt-in provider/account-party allocation lock view keeps the same
+-- provider-controlled choices while making the lock-holder view include the
+-- account parties. Withdraw, cancel, settlement, and stale CID reuse all
+-- archive or preserve state through the same V2-only allocation path.
+test_providerManagedAllocationAccountPartyLockViewPolicy : Script ()
+test_providerManagedAllocationAccountPartyLockViewPolicy = do
+  TestEnv{..} <- setupTestEnv
+  mallory <- allocatePartyByHint (PartyIdHint "mallory-provider-allocation-lock")
+  let sender = senderAccount parties
+      receiver = receiverAccount parties
+      amount = 30.0
+      expectedLockHolders = [registry.admin, parties.alice, parties.charlie]
+
+  h1 <- createProviderManagedHolding registry sender 100.0
+  withdrawAllocCid <- createAcceptedManagedAllocationWithLockPolicy
+    registry
+    sender
+    receiver
+    parties.executor
+    AllocationV2.SenderSide
+    amount
+    [h1]
+    False
+    allocationLockAccountPartiesValue
+  _ <- V2Allocation.querySingleV2Allocation parties.alice withdrawAllocCid
+  _ <- V2Allocation.querySingleV2Allocation parties.charlie withdrawAllocCid
+  _ <- V2Allocation.querySingleV2Allocation parties.executor withdrawAllocCid
+  V2Allocation.assertNoV2Allocation mallory withdrawAllocCid
+  assertProviderManagedAllocationLockHolders parties.alice sender expectedLockHolders
+  assertProviderManagedAllocationLockHolders parties.charlie sender expectedLockHolders
+  assertProviderManagedAllocationLockHolders parties.executor sender expectedLockHolders
+  assertNoProviderManagedLockedHoldingsVisible mallory sender
+
+  withdrawResult <- submit parties.charlie $
+    exerciseCmd withdrawAllocCid AllocationV2.Allocation_Withdraw with
+      actors = [parties.charlie]
+      extraArgs = emptyExtraArgs
+  case withdrawResult.output of
+    AllocationV2.AllocationResult_Withdrawn -> pure ()
+    _ -> fail "Expected account-party lock allocation withdraw"
+  V2Allocation.assertNoV2Allocation parties.charlie withdrawAllocCid
+  assertNoProviderManagedLockedHoldingsVisible parties.charlie sender
+  assertNoProviderManagedLockedHoldingsVisible mallory sender
+  staleWithdrawErr <- submitWithError (actAs parties.charlie) $
+    exerciseCmd withdrawAllocCid AllocationV2.Allocation_Withdraw with
+      actors = [parties.charlie]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains staleInstructionFailureMsg staleWithdrawErr
+
+  h2 <- createProviderManagedHolding registry sender 50.0
+  cancelAllocCid <- createAcceptedManagedAllocationWithLockPolicy
+    registry
+    sender
+    receiver
+    parties.executor
+    AllocationV2.SenderSide
+    amount
+    [h2]
+    False
+    allocationLockAccountPartiesValue
+  assertProviderManagedAllocationLockHolders parties.charlie sender expectedLockHolders
+  cancelResult <- submit parties.executor $
+    exerciseCmd cancelAllocCid AllocationV2.Allocation_Cancel with
+      actors = [parties.executor]
+      extraArgs = emptyExtraArgs
+  case cancelResult.output of
+    AllocationV2.AllocationResult_Cancelled -> pure ()
+    _ -> fail "Expected account-party lock allocation cancel"
+  V2Allocation.assertNoV2Allocation parties.executor cancelAllocCid
+  assertNoProviderManagedLockedHoldingsVisible parties.charlie sender
+  assertNoProviderManagedLockedHoldingsVisible mallory sender
+
+  h3 <- createProviderManagedHolding registry sender 80.0
+  let
+    transferLeg = mkManagedTransferLeg registry sender receiver amount
+    settlement = (mkManagedAllocationArgsForSide
+      registry sender receiver parties.executor AllocationV2.SenderSide amount [] False).allocation.settlement
+  senderAllocCid <- createAcceptedManagedAllocationWithLockPolicy
+    registry
+    sender
+    receiver
+    parties.executor
+    AllocationV2.SenderSide
+    amount
+    [h3]
+    False
+    allocationLockAccountPartiesValue
+  receiverAllocCid <- createAcceptedManagedAllocationWithLockPolicy
+    registry
+    receiver
+    sender
+    parties.executor
+    AllocationV2.ReceiverSide
+    amount
+    []
+    False
+    allocationLockAccountPartiesValue
+  assertProviderManagedAllocationLockHolders parties.charlie sender expectedLockHolders
+  (sfCid, rulesDisc) <- V2Allocation.getV2SettlementFactory registry
+  settleResult <- submitWithDisc parties.executor rulesDisc $
+    V2Allocation.exerciseV2SettlementFactory
+      sfCid settlement [transferLeg] [senderAllocCid, receiverAllocCid] [parties.executor]
+  assert (length settleResult.allocationSettleResults == 2)
+  V2Allocation.assertNoV2Allocation parties.charlie senderAllocCid
+  V2Allocation.assertNoV2Allocation parties.executor receiverAllocCid
+  assertNoProviderManagedLockedHoldingsVisible parties.charlie sender
+  assertNoProviderManagedHoldingsVisible mallory sender
+  assertNoProviderManagedHoldingsVisible mallory receiver
 
 -- | Missing providers and unauthorized actor lists are rejected before input
 -- consumption.
@@ -524,22 +803,23 @@ test_providerManagedRejectsLockedInputContention = do
   assert (length lockedAfter == 1)
 
 -- | Allocation acceptance has the same locked-input contention guard for
--- provider-managed accounts.
-test_providerManagedAllocationRejectsLockedInputContention : Script ()
-test_providerManagedAllocationRejectsLockedInputContention = do
+-- provider-managed accounts under each experimental allocation lock view.
+assertProviderManagedAllocationRejectsLockedInputContention
+  : Optional Text -> Script ()
+assertProviderManagedAllocationRejectsLockedInputContention lockPolicy = do
   TestEnv{..} <- setupTestEnv
   let sender = senderAccount parties
       receiver = receiverAccount parties
       amount = 70.0
   h1 <- createProviderManagedHolding registry sender 100.0
-  allocCid <- createAcceptedManagedAllocation
-    registry sender receiver parties.executor AllocationV2.SenderSide amount [h1] False
+  allocCid <- createAcceptedManagedAllocationForPolicy
+    registry sender receiver parties.executor AllocationV2.SenderSide amount [h1] False lockPolicy
   locked <- queryLockedV2Holdings parties.charlie sender
   lockedCid <- case locked of
     [(cid, _holdingView)] -> pure cid
     _ -> fail $ "Expected one provider-managed locked allocation holding, found " <> show (length locked)
-  pendingCid <- createPendingManagedAllocation
-    registry sender receiver parties.executor AllocationV2.SenderSide 10.0 [lockedCid] False
+  pendingCid <- createPendingManagedAllocationForPolicy
+    registry sender receiver parties.executor AllocationV2.SenderSide 10.0 [lockedCid] False lockPolicy
   acceptErr <- submitWithError (actAs parties.charlie) $
     exerciseCmd pendingCid AllocationInstructionV2.AllocationInstruction_Accept with
       actors = [parties.charlie]
@@ -548,6 +828,33 @@ test_providerManagedAllocationRejectsLockedInputContention = do
   _ <- V2Allocation.querySingleV2Allocation parties.charlie allocCid
   _ <- V2Allocation.querySingleV2AllocationInstruction parties.charlie pendingCid
   pure ()
+
+test_providerManagedAllocationRejectsLockedInputContention : Script ()
+test_providerManagedAllocationRejectsLockedInputContention =
+  assertProviderManagedAllocationRejectsLockedInputContention None
+
+test_providerManagedAllocationRejectsAccountPartyLockedInputContention : Script ()
+test_providerManagedAllocationRejectsAccountPartyLockedInputContention =
+  assertProviderManagedAllocationRejectsLockedInputContention (Some allocationLockAccountPartiesValue)
+
+-- | Unsupported allocation lock-view policy values fail before input
+-- consumption.
+test_providerManagedAllocationRejectsUnsupportedLockViewPolicy : Script ()
+test_providerManagedAllocationRejectsUnsupportedLockViewPolicy = do
+  TestEnv{..} <- setupTestEnv
+  let sender = senderAccount parties
+      receiver = receiverAccount parties
+      amount = 25.0
+  h1 <- createProviderManagedHolding registry sender 100.0
+  (afCid, rulesDisc) <- V2Allocation.getV2AllocationFactory registry
+  let args =
+        (mkManagedAllocationArgsForSide
+          registry sender receiver parties.executor AllocationV2.SenderSide amount [h1] False)
+          with extraArgs = allocationLockPolicyExtraArgs "bogus-policy"
+  bogusPolicyErr <- submitError parties.charlie rulesDisc $
+    V2Allocation.exerciseV2AllocationFactory afCid args
+  assertSubmitErrorContains allocationLockViewPolicyFailureMsg bogusPolicyErr
+  checkProviderManagedBalance parties.alice sender 100.0
 
 -- | Owner-only attempts against provider-managed actions fail with the local
 -- actor markers.

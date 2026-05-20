@@ -48,6 +48,36 @@ v2AllocationSettleIteratedUnsupportedFailureMsg : Text
 v2AllocationSettleIteratedUnsupportedFailureMsg =
   "SimpleToken V2 Allocation_Settle: iterated settlement arguments are not supported"
 
+v2AllocationNextIterationFundingFailureMsg : Text
+v2AllocationNextIterationFundingFailureMsg =
+  "SimpleToken V2 nextIterationFunding must be positive and use supported instruments"
+
+v2AllocationExtraTransferLegSidesFailureMsg : Text
+v2AllocationExtraTransferLegSidesFailureMsg =
+  "SimpleToken V2 Allocation_Settle: extra transfer-leg sides must be positive supported regular accounts"
+
+allocationLockViewPolicyContextKey : Text
+allocationLockViewPolicyContextKey =
+  "simple-token/cip-112-allocation-lock-view-policy"
+
+allocationLockAdminOnlyValue : Text
+allocationLockAdminOnlyValue = "admin-only"
+
+allocationLockAccountPartiesValue : Text
+allocationLockAccountPartiesValue = "account-parties"
+
+allocationLockViewPolicyFailureMsg : Text
+allocationLockViewPolicyFailureMsg =
+  "SimpleToken V2 allocation lock view policy must be admin-only or account-parties"
+
+-- | Experimental V2 allocation lock view policy. This is not a release
+-- decision; it exists to compare the current minimal lock view with an
+-- account-party-visible lock-holder shape.
+data AllocationLockViewPolicy
+  = AllocationLockAdminOnly
+  | AllocationLockAccountParties
+  deriving (Eq, Show)
+
 -- | A funded allocation of holdings to a settlement leg.
 template SimpleAllocation
   with
@@ -157,13 +187,15 @@ releaseAllocatedFunds admin allocation lockedHoldingCid extraArgs = do
 template SimpleAllocationInstructionV2
   with
     admin : Party
+    supportedInstruments : [Text]
     allocation : AllocationV2.AllocationSpecification
     requestedAt : Time
     inputHoldingCids : [ContractId HoldingV2.Holding]
     inputHoldingCidMap : TextMap.TextMap [ContractId HoldingV2.Holding]
     originalInstructionCid : Optional (ContractId AllocationInstructionV2.AllocationInstruction)
+    allocationLockViewPolicy : AllocationLockViewPolicy
   where
-    ensure isSupportedV2Allocation allocation
+    ensure isSupportedV2Allocation supportedInstruments allocation
     signatory admin, v2AllocationAuthorizer admin allocation
     observer accountObservers allocation.authorizer
     observer allocation.settlement.executors
@@ -187,13 +219,17 @@ template SimpleAllocationInstructionV2
         assertV2AllocationNotExpired allocation
         archive selfCid
         (lockedHoldingCids, authorizerChangeCids) <-
-          archiveAndLockV2AllocationInputs admin allocation inputHoldingCids
+          archiveAndLockV2AllocationInputs
+            admin supportedInstruments allocation allocationLockViewPolicy inputHoldingCids
         allocationCid <- create SimpleAllocationV2 with
           admin
+          supportedInstruments
           allocation
           lockedHoldingCids
           createdAt = requestedAt
           originalAllocationCid = None
+          allocationLockViewPolicy
+          numIterations = 0
         pure AllocationInstructionV2.AllocationInstructionResult with
           output = AllocationInstructionV2.AllocationInstructionResult_Completed with
             allocationCid = toInterfaceContractId @AllocationV2.Allocation allocationCid
@@ -214,12 +250,15 @@ template SimpleAllocationInstructionV2
 template SimpleAllocationV2
   with
     admin : Party
+    supportedInstruments : [Text]
     allocation : AllocationV2.AllocationSpecification
     lockedHoldingCids : TextMap.TextMap [ContractId HoldingV2.Holding]
     createdAt : Time
     originalAllocationCid : Optional (ContractId AllocationV2.Allocation)
+    allocationLockViewPolicy : AllocationLockViewPolicy
+    numIterations : Int
   where
-    ensure isSupportedV2Allocation allocation
+    ensure isSupportedV2Allocation supportedInstruments allocation
     signatory admin, v2AllocationAuthorizer admin allocation
     observer accountObservers allocation.authorizer
     observer allocation.settlement.executors
@@ -230,7 +269,7 @@ template SimpleAllocationV2
         allocation
         holdingCids = flattenTextMap lockedHoldingCids
         createdAt
-        numIterations = 0
+        numIterations
         expiresAt = allocation.settlement.settlementDeadline
         availableActions = v2AllocationActions admin allocation
         meta = emptyMetadata
@@ -242,15 +281,31 @@ template SimpleAllocationV2
       allocation_settleImpl selfCid arg = do
         assertMsg v2AllocationSettleActorFailureMsg
           (samePartySet (dedupParties (admin :: allocation.settlement.executors)) arg.actors)
-        let noNextIterationFunding = case arg.nextIterationFunding of
-              None -> True
-              Some _ -> False
-        assertMsg v2AllocationSettleIteratedUnsupportedFailureMsg
-          (null arg.extraTransferLegSides && noNextIterationFunding)
+        case allocation.nextIterationFunding of
+          None -> do
+            let noNextIterationFunding = case arg.nextIterationFunding of
+                  None -> True
+                  Some _ -> False
+            assertMsg v2AllocationSettleIteratedUnsupportedFailureMsg
+              (null arg.extraTransferLegSides && noNextIterationFunding)
+          Some _ -> pure ()
+        assertV2TransferLegSides supportedInstruments arg.extraTransferLegSides
+        assertV2NextIterationFunding supportedInstruments arg.nextIterationFunding
         assertV2AllocationSettlementOpen allocation
         archive selfCid
-        (inputHoldingCids, authorizerHoldingCids) <-
-          settleV2AllocationFunds admin allocation lockedHoldingCids
+        (inputHoldingCids, authorizerHoldingCids, nextIterationAllocationCid, settledAllocation) <-
+          settleV2AllocationFunds
+            admin
+            supportedInstruments
+            allocation
+            lockedHoldingCids
+            arg.extraTransferLegSides
+            arg.nextIterationFunding
+            allocationLockViewPolicy
+            createdAt
+            originalAllocationCid
+            selfCid
+            numIterations
         eventLogCid <- lookupFromContextU @(ContractId TransferEventsV2.EventLog)
           arg.extraArgs.context
           eventLogContextKey
@@ -260,11 +315,11 @@ template SimpleAllocationV2
             TokenStandard.logAllocationSettlement
               logCid
               inputHoldingCids
-              allocation
+              settledAllocation
               (flattenTextMap authorizerHoldingCids)
         pure AllocationV2.AllocationResult with
           output = AllocationV2.AllocationResult_Settled with
-            nextIterationAllocationCid = None
+            nextIterationAllocationCid
           authorizerHoldingCids
           meta = emptyMetadata
 
@@ -290,10 +345,46 @@ template SimpleAllocationV2
           meta = emptyMetadata
 
 
-isSupportedV2Allocation : AllocationV2.AllocationSpecification -> Bool
-isSupportedV2Allocation allocation =
+isSupportedV2Allocation : [Text] -> AllocationV2.AllocationSpecification -> Bool
+isSupportedV2Allocation supportedInstruments allocation =
+  TokenStandard.isValidAllocationSpecificationV2
+    (\instrumentId -> instrumentId `elem` supportedInstruments)
+    allocation &&
   isSupportedRegularAccount allocation.authorizer &&
-  all (\leg -> isSupportedRegularAccount leg.otherside) allocation.transferLegSides
+  all (\leg -> isSupportedRegularAccount leg.otherside) allocation.transferLegSides &&
+  isValidNextIterationFunding supportedInstruments allocation.nextIterationFunding
+
+isValidNextIterationFunding : [Text] -> Optional (TextMap.TextMap Decimal) -> Bool
+isValidNextIterationFunding supportedInstruments funding = case funding of
+  None -> True
+  Some amounts ->
+    all
+      (\(instrumentId, amount) ->
+        instrumentId `elem` supportedInstruments && amount > 0.0)
+      (TextMap.toList amounts)
+
+assertV2NextIterationFunding
+  : [Text] -> Optional (TextMap.TextMap Decimal) -> Update ()
+assertV2NextIterationFunding supportedInstruments funding =
+  assertMsg v2AllocationNextIterationFundingFailureMsg
+    (isValidNextIterationFunding supportedInstruments funding)
+
+assertV2TransferLegSides
+  : [Text] -> [AllocationV2.TransferLegSide] -> Update ()
+assertV2TransferLegSides supportedInstruments transferLegSides =
+  assertMsg v2AllocationExtraTransferLegSidesFailureMsg
+    (all isValid transferLegSides)
+  where
+    isValid leg =
+      leg.amount > 0.0 &&
+      leg.instrumentId `elem` supportedInstruments &&
+      isSupportedRegularAccount leg.otherside
+
+nextIterationFundingAmounts
+  : Optional (TextMap.TextMap Decimal) -> TextMap.TextMap Decimal
+nextIterationFundingAmounts funding = case funding of
+  None -> TextMap.empty
+  Some amounts -> amounts
 
 v2AllocationAuthorizer : Party -> AllocationV2.AllocationSpecification -> Party
 v2AllocationAuthorizer admin allocation =
@@ -319,6 +410,30 @@ v2AllocationActions admin allocation =
     , (AllocationV2.AA_Cancel, [allocation.settlement.executors])
     , (AllocationV2.AA_Settle, [dedupParties (admin :: allocation.settlement.executors)])
     ]
+
+allocationLockViewPolicyFromContext : ChoiceContext -> Update AllocationLockViewPolicy
+allocationLockViewPolicyFromContext context = do
+  policyValue <- lookupFromContextU @Text context allocationLockViewPolicyContextKey
+  case policyValue of
+    None -> pure AllocationLockAdminOnly
+    Some value
+      | value == allocationLockAdminOnlyValue -> pure AllocationLockAdminOnly
+      | value == allocationLockAccountPartiesValue -> pure AllocationLockAccountParties
+      | otherwise -> fail $ allocationLockViewPolicyFailureMsg <> ": " <> value
+
+allocationLockHolders
+  : Party -> AllocationV2.AllocationSpecification -> AllocationLockViewPolicy -> [Party]
+allocationLockHolders admin allocation policy = case policy of
+  AllocationLockAdminOnly -> [admin]
+  AllocationLockAccountParties ->
+    dedupParties (admin :: accountAuthority admin allocation.authorizer :: accountObservers allocation.authorizer)
+
+allocationLockExtraObservers
+  : AllocationV2.AllocationSpecification -> AllocationLockViewPolicy -> [Party]
+allocationLockExtraObservers allocation policy = case policy of
+  AllocationLockAdminOnly -> allocation.settlement.executors
+  AllocationLockAccountParties ->
+    dedupParties (allocation.settlement.executors <> accountObservers allocation.authorizer)
 
 samePartySet : [Party] -> [Party] -> Bool
 samePartySet expected actual =
@@ -356,14 +471,17 @@ assertV2AllocationSettlementOpen allocation = do
 
 archiveAndLockV2AllocationInputs
   : Party
+  -> [Text]
   -> AllocationV2.AllocationSpecification
+  -> AllocationLockViewPolicy
   -> [ContractId HoldingV2.Holding]
   -> Update
        ( TextMap.TextMap [ContractId HoldingV2.Holding]
        , TextMap.TextMap [ContractId HoldingV2.Holding]
        )
-archiveAndLockV2AllocationInputs admin allocation inputHoldingCids = do
+archiveAndLockV2AllocationInputs admin supportedInstruments allocation allocationLockViewPolicy inputHoldingCids = do
   assertSupportedRegularAccount "allocation.authorizer" allocation.authorizer
+  assertV2NextIterationFunding supportedInstruments allocation.nextIterationFunding
   now <- getTime
   inputEntries <- forA inputHoldingCids $ \holdingCid -> do
     holdingI <- fetch holdingCid
@@ -387,30 +505,33 @@ archiveAndLockV2AllocationInputs admin allocation inputHoldingCids = do
     inputAmounts = TextMap.fromListWithR (+) inputEntries
     creditAmounts =
       TokenStandard.netAllocationCreditAmounts admin allocation.authorizer allocation.transferLegSides
-    combinedAmounts = TokenStandard.textMapZipWithDefault 0.0 inputAmounts creditAmounts
+    fundingAmounts = nextIterationFundingAmounts allocation.nextIterationFunding
 
-  outputs <- forA (TextMap.toList combinedAmounts) $ \(instrumentId, (inputAmount, creditAmount)) -> do
+  outputs <- forA (amountKeys3 inputAmounts creditAmounts fundingAmounts) $ \instrumentId -> do
     let
-      requiredDebit = negate (min 0.0 creditAmount)
-      changeAmount = inputAmount - requiredDebit
+      inputAmount = amountFor inputAmounts instrumentId
+      creditAmount = amountFor creditAmounts instrumentId
+      fundingAmount = amountFor fundingAmounts instrumentId
+      requiredFunding = max 0.0 (fundingAmount - creditAmount)
+      changeAmount = inputAmount - requiredFunding
     assertMsg
       ("Insufficient V2 allocation funds for " <> instrumentId <> ": have "
-        <> show inputAmount <> " but need " <> show requiredDebit)
+        <> show inputAmount <> " but need " <> show requiredFunding)
       (changeAmount >= 0.0)
 
-    locked <- if requiredDebit > 0.0
+    locked <- if requiredFunding > 0.0
       then do
         lockedCid <- createSupportedV2LockedHolding
           admin
           allocation.authorizer
           (HoldingV2.InstrumentId with admin; id = instrumentId)
-          requiredDebit
+          requiredFunding
           (Lock with
-            holders = [admin]
+            holders = allocationLockHolders admin allocation allocationLockViewPolicy
             expiresAt = allocation.settlement.settlementDeadline
             expiresAfter = None
             context = Some ("v2-allocation:" <> allocation.settlement.settlementRef.id))
-          allocation.settlement.executors
+          (allocationLockExtraObservers allocation allocationLockViewPolicy)
           emptyMetadata
         pure [(instrumentId, [lockedCid])]
       else pure []
@@ -435,13 +556,37 @@ archiveAndLockV2AllocationInputs admin allocation inputHoldingCids = do
 
 settleV2AllocationFunds
   : Party
+  -> [Text]
   -> AllocationV2.AllocationSpecification
   -> TextMap.TextMap [ContractId HoldingV2.Holding]
+  -> [AllocationV2.TransferLegSide]
+  -> Optional (TextMap.TextMap Decimal)
+  -> AllocationLockViewPolicy
+  -> Time
+  -> Optional (ContractId AllocationV2.Allocation)
+  -> ContractId AllocationV2.Allocation
+  -> Int
   -> Update
        ( [ContractId HoldingV2.Holding]
        , TextMap.TextMap [ContractId HoldingV2.Holding]
+       , Optional (ContractId AllocationV2.Allocation)
+       , AllocationV2.AllocationSpecification
        )
-settleV2AllocationFunds admin allocation lockedHoldingCids = do
+settleV2AllocationFunds
+    admin
+    supportedInstruments
+    allocation
+    lockedHoldingCids
+    extraTransferLegSides
+    nextIterationFunding
+    allocationLockViewPolicy
+    createdAt
+    originalAllocationCid
+    selfCid
+    numIterations = do
+  assertV2NextIterationFunding supportedInstruments nextIterationFunding
+  let actualAllocation = allocation with
+        transferLegSides = allocation.transferLegSides <> extraTransferLegSides
   debitEntries <- forA (flattenTextMap lockedHoldingCids) $ \lockedCid -> do
     lockedI <- fetch lockedCid
     let locked = view lockedI
@@ -455,29 +600,75 @@ settleV2AllocationFunds admin allocation lockedHoldingCids = do
   let
     debitAmounts = TextMap.fromListWithR (+) debitEntries
     creditAmounts =
-      TokenStandard.netAllocationCreditAmounts admin allocation.authorizer allocation.transferLegSides
-    combinedAmounts = TokenStandard.textMapZipWithDefault 0.0 debitAmounts creditAmounts
+      TokenStandard.netAllocationCreditAmounts admin allocation.authorizer actualAllocation.transferLegSides
+    fundingAmounts = nextIterationFundingAmounts nextIterationFunding
 
-  outputEntries <- forA (TextMap.toList combinedAmounts) $ \(instrumentId, (debitAmount, creditAmount)) -> do
-    let requiredDebit = negate (min 0.0 creditAmount)
+  outputEntries <- forA (amountKeys3 debitAmounts creditAmounts fundingAmounts) $ \instrumentId -> do
+    let
+      debitAmount = amountFor debitAmounts instrumentId
+      creditAmount = amountFor creditAmounts instrumentId
+      fundingAmount = amountFor fundingAmounts instrumentId
+      availableAmount = debitAmount + creditAmount
     assertMsg
-      ("V2 settlement locked debit mismatch for " <> instrumentId <> ": locked "
-        <> show debitAmount <> " but expected " <> show requiredDebit)
-      (debitAmount == requiredDebit)
-    if creditAmount > 0.0
+      ("V2 settlement insufficient iterated funds for " <> instrumentId <> ": locked "
+        <> show debitAmount <> " but expected " <> show fundingAmount
+        <> " after credit " <> show creditAmount)
+      (availableAmount >= fundingAmount)
+    payout <- if availableAmount > fundingAmount
       then do
         outputCid <- createSupportedV2Holding
           admin
           allocation.authorizer
           (HoldingV2.InstrumentId with admin; id = instrumentId)
-          creditAmount
+          (availableAmount - fundingAmount)
           emptyMetadata
         pure [(instrumentId, [outputCid])]
       else pure []
+    nextLocked <- if fundingAmount > 0.0
+      then do
+        lockedCid <- createSupportedV2LockedHolding
+          admin
+          allocation.authorizer
+          (HoldingV2.InstrumentId with admin; id = instrumentId)
+          fundingAmount
+          (Lock with
+            holders = allocationLockHolders admin allocation allocationLockViewPolicy
+            expiresAt = allocation.settlement.settlementDeadline
+            expiresAfter = None
+            context = Some ("v2-allocation-next-iteration:" <> allocation.settlement.settlementRef.id))
+          (allocationLockExtraObservers allocation allocationLockViewPolicy)
+          emptyMetadata
+        pure [(instrumentId, [lockedCid])]
+      else pure []
+    pure (payout <> nextLocked, nextLocked)
+
+  let
+    authorizerHoldingCids = TextMap.fromListWithR (++) (concatMap fst outputEntries)
+    nextLockedHoldingCids = TextMap.fromListWithR (++) (concatMap snd outputEntries)
+
+  nextAllocationCid <- case nextIterationFunding of
+    None -> pure None
+    Some _ -> do
+      nextCid <- create SimpleAllocationV2 with
+        admin
+        supportedInstruments
+        allocation = allocation with
+          transferLegSides = []
+          nextIterationFunding
+        lockedHoldingCids = nextLockedHoldingCids
+        createdAt
+        originalAllocationCid = case originalAllocationCid of
+          None -> Some selfCid
+          Some cid -> Some cid
+        allocationLockViewPolicy
+        numIterations = numIterations + 1
+      pure (Some (toInterfaceContractId @AllocationV2.Allocation nextCid))
 
   pure
     ( flattenTextMap lockedHoldingCids
-    , TextMap.fromListWithR (++) (concat outputEntries)
+    , authorizerHoldingCids
+    , nextAllocationCid
+    , actualAllocation
     )
 
 v2AllocationInputCidMap
@@ -515,3 +706,27 @@ unlockV2AllocationFunds admin allocation lockedHoldingCids = do
 
 flattenTextMap : TextMap.TextMap [a] -> [a]
 flattenTextMap values = concatMap snd (TextMap.toList values)
+
+amountFor : TextMap.TextMap Decimal -> Text -> Decimal
+amountFor amounts instrumentId = case TextMap.lookup instrumentId amounts of
+  None -> 0.0
+  Some amount -> amount
+
+amountKeys3
+  : TextMap.TextMap Decimal
+  -> TextMap.TextMap Decimal
+  -> TextMap.TextMap Decimal
+  -> [Text]
+amountKeys3 left middle right =
+  dedupTexts
+    (map fst (TextMap.toList left)
+      <> map fst (TextMap.toList middle)
+      <> map fst (TextMap.toList right))
+
+dedupTexts : [Text] -> [Text]
+dedupTexts values = case values of
+  [] -> []
+  value :: rest ->
+    if value `elem` rest
+      then dedupTexts rest
+      else value :: dedupTexts rest
