@@ -11,13 +11,47 @@ module SimpleToken.Admin.Roles where
 --
 -- `Admin` is the root governance role — the OpenZeppelin `DEFAULT_ADMIN_ROLE` /
 -- `Ownable` owner analogue. A holder of an `Admin` capability may issue and
--- revoke other capabilities (delegated governance), which is how operational
--- "ownership" is handed to a new party without reassigning the immutable
--- instrument admin party. See docs/ADMIN-LAYER-PLAN.md §5.
+-- revoke other (non-`Admin`) capabilities (delegated governance), which is how
+-- operational "ownership" is handed to a new party without reassigning the
+-- immutable instrument admin party. See docs/ADMIN-LAYER-PLAN.md §5.
+--
+-- Enforcement status (what currently gates on each role):
+--   * `Pauser` — enforced by `Rules_SetPaused`.
+--   * `Admin`  — enforced by the `TokenAdministrator` delegated choices.
+--   * `Minter` / `Burner` / `BatchProcessor` — RESERVED: defined so capabilities
+--     are mintable ahead of the slices that consume them (AL-5/6 mint/burn,
+--     V2-10 delegated settlement). No choice gates on them yet, so granting one
+--     authorizes nothing today. Do not treat them as live access control until
+--     their slice lands.
 data Role
-  = Minter          -- ^ May create holdings out of band (future mint slice).
-  | Burner          -- ^ May archive holdings out of band (future burn slice).
-  | Pauser          -- ^ May flip the registry pause flag (see SimpleToken.Rules).
-  | BatchProcessor  -- ^ May drive SettlementFactory_SettleBatch on behalf of executors.
-  | Admin           -- ^ Root governance: may issue/revoke capabilities (owner analogue).
+  = Minter          -- ^ (reserved) May create holdings out of band — future mint slice (AL-5).
+  | Burner          -- ^ (reserved) May archive holdings out of band — future burn slice (AL-6).
+  | Pauser          -- ^ May flip the registry pause flag (see SimpleToken.Rules). Enforced.
+  | BatchProcessor  -- ^ (reserved) Delegated SettlementFactory_SettleBatch — future slice (V2-10).
+  | Admin           -- ^ Root governance: may issue/revoke capabilities (owner analogue). Enforced.
   deriving (Eq, Show)
+
+-- | Single source of truth for the delegation policy: whether a holder of an
+-- `Admin` capability (a governance delegate) may issue or revoke this role.
+--
+-- The genesis root may manage every role; delegates may manage only roles for
+-- which this returns `True`. This caps the governance hierarchy at one level —
+--   root → Admin delegates → delegable operational roles —
+-- and is used by BOTH the delegated-issue and delegated-revoke paths so the
+-- policy cannot drift between them (see SimpleToken.Admin.Authority).
+--
+--   * `Admin` is root-only: no re-delegation, no delegate-vs-delegate or
+--     delegate-vs-root governance changes.
+--   * Reserved roles are root-only until their enforcing slice lands, so a
+--     delegate cannot pre-mint one and retroactively gain power when that slice
+--     starts gating on it. A reserved role graduates by flipping its case to
+--     `True` in the same change that adds its enforcement.
+--
+-- The explicit per-constructor cases are deliberate: adding a new `Role` forces
+-- a deliberate delegation decision here (non-exhaustive-match warning).
+delegableRole : Role -> Bool
+delegableRole Pauser = True
+delegableRole Admin = False
+delegableRole Minter = False          -- reserved (AL-5)
+delegableRole Burner = False          -- reserved (AL-6)
+delegableRole BatchProcessor = False  -- reserved (V2-10)

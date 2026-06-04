@@ -11,10 +11,13 @@
 -- Ownable and Pausable are not separate mechanisms: the `Admin` role is the
 -- owner / `DEFAULT_ADMIN_ROLE`, and pause is gated on a `Pauser` capability.
 --
--- Keyless by necessity — Daml LF 2.1 dropped contract keys. Capabilities are
--- referenced by `ContractId`, delivered to gated choices through the existing
--- `ChoiceContext` plumbing (`ContextUtils.roleCapabilityContextKey`) or as an
--- explicit choice argument.
+-- Keyless by necessity — Daml LF 2.1 dropped contract keys. The caller presents
+-- their own capability by `ContractId` as an **explicit choice argument** (the
+-- caller is the controller, so it supplies its own credential), with the contract
+-- disclosed where the caller is not already a stakeholder. (A `ChoiceContext`
+-- channel like `transferPreapprovalContextKey` is unnecessary here: that pattern
+-- is for contracts the off-ledger service injects that the caller does not
+-- directly hold; a capability is always held by its assignee.)
 module SimpleToken.Admin.Capability where
 
 import Splice.Api.Token.HoldingV1 (InstrumentId)

@@ -10,8 +10,9 @@ Status:
   (slices AL-0..AL-3) under `SimpleToken/Admin/` plus the Pausable chokepoints on
   `SimpleTokenRules`. Uses the hybrid **AccessControl-as-substrate** model: the
   `Admin` role is the Ownable owner; Pausable is `Pauser`-gated origination
-  control. 12 tests in `Test/Admin.daml`; full suite **125/125 passing** and
-  `scripts/verify.sh` **3/3** on SDK 3.4.11 / Java 21. Design:
+  control, with the `Admin` role root-managed (one-level delegation). 15 tests in
+  `Test/Admin.daml`; full suite **128/128 passing** and `scripts/verify.sh`
+  **3/3** on SDK 3.4.11 / Java 21. Design:
   [ADMIN-LAYER-PLAN.md](ADMIN-LAYER-PLAN.md); slices:
   [§17](#17-active-and-future-slices-admin-layer--cip-112).
 
@@ -871,15 +872,15 @@ See [ADMIN-LAYER-PLAN.md §0](ADMIN-LAYER-PLAN.md).
 
 | Slice | Title | Status | Depends on | Deliverables (as built) |
 |---|---|---|---|---|
-| **AL-0** | Module skeleton | ✅ | — | `SimpleToken/Admin/Roles.daml` (closed `Role` sum type incl. `Admin`), `SimpleToken/Admin/Errors.daml`, `roleCapabilityContextKey` in `ContextUtils.daml`. |
+| **AL-0** | Module skeleton | ✅ | — | `SimpleToken/Admin/Roles.daml` (closed `Role` sum type incl. `Admin`; `Minter`/`Burner`/`BatchProcessor` reserved for later slices), `SimpleToken/Admin/Errors.daml`. Capabilities are passed as explicit choice args (no `ChoiceContext` key needed). |
 | **AL-1** | Pausable chokepoint | ✅ | AL-0 | `paused : Bool` on `SimpleTokenRules`; `assertNotPaused` injected at the five **origination** impls (transfer V1/V2, allocation V1/V2, settlement-via-factory); `Rules_SetPaused` (registry-wide `Pauser`-gated) + `Rules_GetPaused`. Pause is origination control — committed settlement/completion and recovery stay open ([ADMIN-LAYER-PLAN.md §4](ADMIN-LAYER-PLAN.md#4-pausable--origination-control-simpletokenrules)). Tests: `test_pauseBlocksTransfer`, `test_pauseBlocksAllocation`, `test_unpauseRestores`, `test_publicFetchWhilePaused`, `test_pauseAllowsRecoveryBlocksOrigination` (inv #33), `test_scopedCapabilityCannotPauseRegistry` (inv #30). |
 | **AL-2** | AccessControl capabilities | ✅ | AL-0 | `SimpleToken/Admin/Capability.daml`: `RoleCapability` (with `scope : Optional InstrumentId` for least privilege) + `requireRole` (proof-by-fetch, scope-aware). Tests: `test_capabilityImpersonationFails`, `test_revokeRole`, `test_pauseRequiresPauserCap`. |
-| **AL-3** | Ownable-as-Admin-role + delegated governance | ✅ | AL-2 | `SimpleToken/Admin/Authority.daml`: `TokenAdministrator` (fixed genesis root) with `Admin_IssueRole`/`Admin_RevokeRole` (root) and `Admin_DelegatedIssueRole`/`Admin_DelegatedRevokeRole` (any `Admin`-capability holder). Ownership handoff = grant/revoke the `Admin` role; **no party reassignment, no `OwnershipOffer`** (resolves the desync, C9). Tests: `test_delegatedAdminGovernance`, `test_revokedAdminCannotDelegate`, `test_nonAdminCannotDelegateIssue`. |
+| **AL-3** | Ownable-as-Admin-role + delegated governance | ✅ | AL-2 | `SimpleToken/Admin/Authority.daml`: `TokenAdministrator` (fixed genesis root) with `Admin_IssueRole`/`Admin_RevokeRole` (root) and `Admin_DelegatedIssueRole`/`Admin_DelegatedRevokeRole` (any `Admin`-capability holder). The **`Admin` role is root-managed** — delegates issue/revoke only roles for which the single-source `delegableRole` policy is `True` (today just `Pauser`; `Admin` and reserved roles are root-only — no re-delegation, no reserved-role pre-minting), via single-sourced `mkRoleCapability`/`revokeIssuedCapability` helpers. Ownership handoff = grant/revoke the `Admin` role; **no party reassignment, no `OwnershipOffer`** (resolves the desync, C9). Tests: `test_delegatedAdminGovernance`, `test_revokedAdminCannotDelegate`, `test_nonAdminCannotDelegateIssue`, `test_delegatedRevoke`, `test_delegatedCannotRevokeAdmin`. |
 | **AL-4** | Off-ledger + verification wiring | 🎯 | AL-1..AL-3 | ✅ `ChoiceContext`/pause off-ledger semantics in [SCOPE.md §8](SCOPE.md#8-off-ledger-compatibility); ✅ `scripts/verify.sh` runs green (lint/props/verify). 🎯 Remaining: add `daml-props` paused/role rows and a `daml-verify` `admin-authorization` + `scopeAuthorizes` proof model ([AUDIT.md](AUDIT.md)). |
 
 > **Build/verify status:** validated on SDK 3.4.11 / DPM 1.0.17 / OpenJDK 21.
 > `cd simple-token && dpm build` then `cd ../simple-token-test && dpm test` →
-> **125/125 passing** (12 in `Test/Admin.daml`). `scripts/verify.sh` → **3/3**
+> **128/128 passing** (15 in `Test/Admin.daml`). `scripts/verify.sh` → **3/3**
 > (daml-lint clean on `Admin/*`; daml-props; daml-verify 14/14). The
 > `simple-token-test` package consumes the rebuilt `simple-token` DAR, so build
 > the source package first. Standalone tools install via `scripts/setup.sh`.

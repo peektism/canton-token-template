@@ -1,6 +1,14 @@
 -- | Admin layer tests: AccessControl (capabilities + Admin role = owner) and
 -- Pausable. Covers PLAN.md §17 slices AL-1..AL-3 and invariants #25–#34
 -- (ADMIN-LAYER-PLAN.md §7).
+--
+-- Note on the negative tests: Daml Script's `submitMustFail` passes on ANY
+-- failure, so a must-fail can pass for the wrong reason (e.g. a contract not
+-- visible) rather than the guard under test. These tests deliberately DISCLOSE
+-- the contracts the failing choice must fetch (the factory, the genesis anchor,
+-- the target capability) so the failure lands on the intended `assertMsg` guard,
+-- not on visibility. The explicit disclosures are therefore load-bearing — do
+-- not remove them when editing a negative test.
 module SimpleToken.Test.Admin where
 
 import Splice.Api.Token.TransferInstructionV1
@@ -68,6 +76,21 @@ test_unpauseRestores = do
     TransferInstructionResult_Completed _ -> pure ()
     _ -> fail "Expected Completed after unpause"
   checkBalance alice registry.instrumentId 100.0
+
+-- | INV-26: pausing is non-idempotent (OpenZeppelin Pausable semantics) — setting
+-- the flag to its current value is rejected, so a no-op call cannot churn the
+-- factory contract id.
+test_redundantPauseRejected : Script ()
+test_redundantPauseRejected = do
+  TestEnv{..} <- setupTestEnv
+  adminCid <- createTokenAdministrator registry
+  pauserCap <- issueRole registry adminCid registry.admin Pauser
+  _ <- setPaused registry registry.admin pauserCap True
+  -- pausing again while already paused is rejected (eRedundantPauseChange)
+  (rulesCid, disc) <- currentRules registry
+  submitWithDiscMustFail registry.admin disc $
+    exerciseCmd rulesCid Rules_SetPaused with
+      actor = registry.admin; pauserCap; newPaused = True
 
 -- | INV-26: pausing requires a registry-wide Pauser capability. A holder of a
 -- different role (Minter) cannot pause; a genuine, non-admin Pauser delegate can.
@@ -138,6 +161,8 @@ test_pauseAllowsRecoveryBlocksOrigination = do
   case result.output of
     TransferInstructionResult_Pending instrCid -> do
       _ <- setPaused registry registry.admin pauserCap True
+      -- Before recovery, only h2 (10.0) is spendable; the 100.0 is locked.
+      checkUnlockedBalance alice registry.instrumentId 10.0
       -- ORIGINATION blocked: a new transfer fails while paused.
       let t2 = mkTransfer registry alice alice 10.0 [h2]
       e2 <- getTransferFactory registry t2 emptyExtraArgs
@@ -149,7 +174,9 @@ test_pauseAllowsRecoveryBlocksOrigination = do
       case withdrawResult.output of
         TransferInstructionResult_Failed -> pure ()
         _ -> fail "Expected Failed after withdraw"
-      checkBalance alice registry.instrumentId 110.0
+      -- The 100.0 is now unlocked back to alice: unlocked balance proves recovery
+      -- (checkBalance alone would not, since it counts locked holdings).
+      checkUnlockedBalance alice registry.instrumentId 110.0
     _ -> fail "Expected Pending"
 
 -- AccessControl (AL-2) — capabilities
@@ -205,6 +232,13 @@ test_delegatedAdminGovernance = do
   adminCap <- issueRole registry adminCid alice Admin
   -- alice (a delegate, not the root) mints a Pauser capability for bob.
   pauserCap <- delegatedIssueRole registry adminCid alice adminCap bob Pauser
+  -- The Admin role is root-only: alice (a delegate) cannot re-delegate Admin.
+  -- This makes the delegation gate load-bearing — the success above is not
+  -- merely "any issuance works".
+  adminDisc <- queryDisc @TokenAdministrator registry.admin adminCid
+  submitWithDiscMustFail alice adminDisc $
+    exerciseCmd adminCid Admin_DelegatedIssueRole with
+      caller = alice; adminCap; assignee = charlie; role = Admin; scope = None
   -- bob pauses with the delegate-issued capability; a transfer is then blocked.
   _ <- setPaused registry bob pauserCap True
   [h1] <- fundParty registry charlie 50.0
@@ -249,3 +283,42 @@ test_nonAdminCannotDelegateIssue = do
   submitWithDiscMustFail bob adminDisc $
     exerciseCmd adminCid Admin_DelegatedIssueRole with
       caller = bob; adminCap = bobPauser; assignee = charlie; role = Pauser; scope = None
+
+-- | INV-31/#32: an `Admin` delegate can revoke an operational (non-Admin)
+-- capability it manages; the revoked capability then no longer authorizes.
+test_delegatedRevoke : Script ()
+test_delegatedRevoke = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  adminCap <- issueRole registry adminCid alice Admin
+  pauserCap <- delegatedIssueRole registry adminCid alice adminCap bob Pauser
+  -- the delegate-issued Pauser works
+  _ <- setPaused registry bob pauserCap True
+  _ <- setPaused registry bob pauserCap False
+  -- alice (Admin delegate) revokes bob's Pauser capability
+  delegatedRevokeRole registry adminCid alice adminCap pauserCap
+  -- bob can no longer pause with the revoked capability
+  (rulesCid, disc) <- currentRules registry
+  submitWithDiscMustFail bob disc $
+    exerciseCmd rulesCid Rules_SetPaused with
+      actor = bob; pauserCap; newPaused = True
+
+-- | INV-31: the Admin role is root-managed — an `Admin` delegate cannot revoke
+-- another party's `Admin` capability (no delegate-vs-delegate de-governance).
+-- The target Admin cap is disclosed so the failure proves the role guard, not
+-- visibility.
+test_delegatedCannotRevokeAdmin : Script ()
+test_delegatedCannotRevokeAdmin = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      charlie = parties.charlie
+  adminCid <- createTokenAdministrator registry
+  aliceAdmin <- issueRole registry adminCid alice Admin
+  charlieAdmin <- issueRole registry adminCid charlie Admin
+  adminDisc <- queryDisc @TokenAdministrator registry.admin adminCid
+  charlieAdminDisc <- queryDisc @RoleCapability registry.admin charlieAdmin
+  submitWithDiscMustFail alice (adminDisc <> charlieAdminDisc) $
+    exerciseCmd adminCid Admin_DelegatedRevokeRole with
+      caller = alice; adminCap = aliceAdmin; capCid = charlieAdmin

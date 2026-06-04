@@ -188,7 +188,7 @@ capability relation.
 | INV-28 | Capability honored only if `cap.assignee == caller` (anti-impersonation) | Script: `test_capabilityImpersonationFails` |
 | INV-29 | Capability honored only if `cap.role == required role` | Script: `test_pauseRequiresPauserCap`, `test_nonAdminCannotDelegateIssue` |
 | INV-30 | Capability scope must authorize the operation (instrument-scoped cap ≠ registry-wide op) | Script: `test_scopedCapabilityCannotPauseRegistry` |
-| INV-31 | Capabilities issued/revoked only by the root `admin` or an `Admin`-capability holder | Script: `test_delegatedAdminGovernance`, `test_nonAdminCannotDelegateIssue` |
+| INV-31 | Capabilities issued/revoked only by the root `admin` or an `Admin`-capability holder; the **`Admin` role is root-managed** (delegates cannot issue/revoke `Admin`) | Script: `test_delegatedAdminGovernance`, `test_nonAdminCannotDelegateIssue`, `test_delegatedRevoke`, `test_delegatedCannotRevokeAdmin` |
 | INV-32 | A revoked capability can no longer authorize | Script: `test_revokeRole`, `test_revokedAdminCannotDelegate` |
 | INV-33 | Pause is origination control, not a fund freeze: recovery + committed-settlement completion stay open | Script: `test_pauseAllowsRecoveryBlocksOrigination` |
 | INV-34 | Read-only `Rules_GetPaused` succeeds while paused | Script: `test_publicFetchWhilePaused` |
@@ -204,7 +204,7 @@ capability relation.
   `SimpleTokenRules` choices/`paused` field. The 7 `unbounded-fields` MEDIUMs are
   all pre-existing on other templates (`extraObservers`, `supportedInstruments`,
   `senders`, `allocations`, `inputHoldingCids`) — admin-only creation mitigates.
-- `daml-props` (`dpm test`): PASS — **125/125** (incl. 12 `Test/Admin.daml` rows).
+- `daml-props` (`dpm test`): PASS — **128/128** (incl. 15 `Test/Admin.daml` rows).
 - `daml-verify`: PASS — 14/14 properties. The 9 C/D/T rows model this repo's
   transfer/allocation logic; the V1–V5 rows are the tool's own stablecoin models.
   The AccessControl/Pausable proof rows (`admin-authorization`, a `scopeAuthorizes`

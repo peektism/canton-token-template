@@ -22,7 +22,27 @@ import Splice.Api.Token.HoldingV1 (InstrumentId)
 
 import SimpleToken.Admin.Capability (RoleCapability(..), requireRole)
 import SimpleToken.Admin.Errors
-import SimpleToken.Admin.Roles (Role(..))
+import SimpleToken.Admin.Roles (Role(..), delegableRole)
+
+-- | Mint a capability anchored to this registry. Shared by root and delegated
+-- issuance so the create site is single-sourced.
+mkRoleCapability : Party -> Party -> Role -> Optional InstrumentId -> Update (ContractId RoleCapability)
+mkRoleCapability admin assignee role scope =
+  create RoleCapability with admin; assignee; role; scope
+
+-- | Archive a capability issued by this registry. Shared by root and delegated
+-- revocation. `mayRevokeRole` decides which roles the caller is allowed to
+-- revoke: the root passes `const True` (any role); a delegate passes
+-- `delegableRole` so it can revoke only delegable roles (see
+-- `SimpleToken.Admin.Roles.delegableRole`). Single-sourcing the fetch +
+-- admin-match + role-policy + archive keeps both revoke paths from drifting, and
+-- routes the policy through the same `delegableRole` predicate as issuance.
+revokeIssuedCapability : Party -> (Role -> Bool) -> ContractId RoleCapability -> Update ()
+revokeIssuedCapability admin mayRevokeRole capCid = do
+  cap <- fetch capCid
+  assertMsg eCapabilityNotIssuedByThisAdmin (cap.admin == admin)
+  assertMsg eRoleNotDelegable (mayRevokeRole cap.role)
+  archive capCid
 
 -- | The genesis governance anchor for a registry. `admin` is the immutable
 -- instrument root party (equals `SimpleTokenRules.admin`). One instance per
@@ -42,57 +62,63 @@ template TokenAdministrator
     nonconsuming choice Admin_IssueRole : ContractId RoleCapability
       with
         assignee : Party                -- ^ Party to receive the role.
-        role : Role                     -- ^ Role to grant.
+        role : Role                     -- ^ Role to grant (the root may grant any role, incl. Admin).
         scope : Optional InstrumentId   -- ^ None = registry-wide; Some = single instrument.
       controller admin
-      do create RoleCapability with admin; assignee; role; scope
+      do mkRoleCapability admin assignee role scope
 
-    -- | Root revokes a capability by archiving it.
+    -- | Root revokes a capability by archiving it (any role, including Admin).
     --
     -- # Invariants enforced:
     -- - INV-32: a revoked capability is inactive; later `requireRole` fails (NotActive)
     nonconsuming choice Admin_RevokeRole : ()
       with capCid : ContractId RoleCapability  -- ^ Capability to revoke.
       controller admin
-      do
-        cap <- fetch capCid
-        assertMsg eCapabilityNotIssuedByThisAdmin (cap.admin == admin)
-        archive capCid
+      do revokeIssuedCapability admin (const True) capCid
 
-    -- | Delegated issuance: a holder of a registry-wide `Admin` capability mints
-    -- a further capability. This is the ownership-handoff mechanism — grant a
-    -- governance party an `Admin` capability and it can administer the registry
-    -- immediately; revoke it to hand control back. The new capability is
-    -- admin-signed because the choice runs with this contract's admin authority.
+    -- | Delegated issuance: a holder of a registry-wide `Admin` capability mints a
+    -- further capability for a **delegable** role. This is the ownership-handoff
+    -- mechanism — grant a governance party an `Admin` capability and it can
+    -- administer the registry's delegable operational roles immediately; revoke
+    -- it to hand control back. The new capability is admin-signed because the
+    -- choice runs with this contract's admin authority.
+    --
+    -- Which roles a delegate may manage is decided solely by `delegableRole`
+    -- (`Admin` and reserved roles are root-only), so governance cannot be
+    -- re-delegated past one level. See docs/ADMIN-LAYER-PLAN.md §5.
     --
     -- # Invariants enforced:
-    -- - INV-31: caller must hold a registry-wide `Admin` capability
+    -- - INV-31: caller must hold a registry-wide `Admin` capability, and the granted role must be delegable
     nonconsuming choice Admin_DelegatedIssueRole : ContractId RoleCapability
       with
         caller : Party                       -- ^ The delegate exercising the choice.
         adminCap : ContractId RoleCapability  -- ^ The caller's Admin capability.
         assignee : Party                      -- ^ Party to receive the role.
-        role : Role                           -- ^ Role to grant.
+        role : Role                           -- ^ Role to grant (must be delegable).
         scope : Optional InstrumentId         -- ^ None = registry-wide; Some = single instrument.
       controller caller
       do
         requireRole caller Admin admin None adminCap
-        create RoleCapability with admin; assignee; role; scope
+        assertMsg eRoleNotDelegable (delegableRole role)
+        mkRoleCapability admin assignee role scope
 
     -- | Delegated revocation: a registry-wide `Admin` capability holder revokes a
-    -- capability issued by this registry.
+    -- capability for a **delegable** role. Delegates manage only delegable roles
+    -- (so they cannot revoke `Admin` or reserved-role capabilities held by the
+    -- root or peers). They CAN revoke delegable operational capabilities issued by
+    -- the root or other delegates — that is shared operational-role management;
+    -- the genesis root remains the sole governance authority and always recovers
+    -- via the un-revocable `TokenAdministrator`.
     --
     -- # Invariants enforced:
-    -- - INV-31: caller must hold a registry-wide `Admin` capability
+    -- - INV-31: caller must hold a registry-wide `Admin` capability, and the revoked role must be delegable
     -- - INV-32: revoked capability becomes inactive
     nonconsuming choice Admin_DelegatedRevokeRole : ()
       with
         caller : Party                        -- ^ The delegate exercising the choice.
         adminCap : ContractId RoleCapability  -- ^ The caller's Admin capability.
-        capCid : ContractId RoleCapability    -- ^ Capability to revoke.
+        capCid : ContractId RoleCapability    -- ^ Delegable-role capability to revoke.
       controller caller
       do
         requireRole caller Admin admin None adminCap
-        cap <- fetch capCid
-        assertMsg eCapabilityNotIssuedByThisAdmin (cap.admin == admin)
-        archive capCid
+        revokeIssuedCapability admin delegableRole capCid

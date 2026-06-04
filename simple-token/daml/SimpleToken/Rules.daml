@@ -31,7 +31,7 @@ import SimpleToken.Experimental.Cip112.Account
   , isSupportedRegularAccount
   )
 import SimpleToken.Admin.Capability (RoleCapability, requireRole)
-import SimpleToken.Admin.Errors (eRegistryPaused)
+import SimpleToken.Admin.Errors (eRegistryPaused, eRedundantPauseChange)
 import SimpleToken.Admin.Roles (Role(..))
 
 -- | Pausable guard: the OpenZeppelin `whenNotPaused` analogue. Fails the
@@ -101,10 +101,12 @@ template SimpleTokenRules
         -- Pausing is registry-wide, so it requires a registry-wide (scope None)
         -- Pauser capability; an instrument-scoped Pauser cannot halt the registry.
         requireRole actor Pauser admin None pauserCap
+        -- INV-26: must change state (OZ Pausable semantics), avoiding no-op churn.
+        assertMsg eRedundantPauseChange (newPaused /= paused)
         create this with paused = newPaused
 
     -- | Read the pause flag without archiving. Read-only and ungated so wallets
-    -- can display registry state even while paused (INV-31). The actor must have
+    -- can display registry state even while paused (INV-34). The actor must have
     -- the factory disclosed to exercise it (the off-ledger service provides this).
     nonconsuming choice Rules_GetPaused : Bool
       with actor : Party  -- ^ The querying party.

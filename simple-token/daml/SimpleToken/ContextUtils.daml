@@ -20,14 +20,6 @@ expireLockContextKey = "expire-lock"
 eventLogContextKey : Text
 eventLogContextKey = "simple-token/cip-112-event-log"
 
--- | Context key under which the off-ledger service injects the caller's
--- RoleCapability contract id (and discloses the contract) for capability-gated
--- choices. See docs/ADMIN-LAYER-PLAN.md §3.3. The keyless admin layer references
--- authority contracts by id through this channel — the same pattern as
--- `transferPreapprovalContextKey`.
-roleCapabilityContextKey : Text
-roleCapabilityContextKey = "simple-token/role-capability"
-
 -- tx-kind metadata (Splice convention for wallet interop)
 txKindMetaKey : Text
 txKindMetaKey = "splice.lfdecentralizedtrust.org/tx-kind"

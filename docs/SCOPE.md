@@ -221,13 +221,17 @@ Specifically:
 
 The off-ledger service provides `ChoiceContext` (with contract IDs like preapprovals) and `disclosedContracts` (for contracts the wallet cannot see but needs to reference) via OpenAPI-aligned endpoints. Our factory reads preapproval contract IDs from `ChoiceContext` under key `"transfer-preapproval"` following the same convention.
 
-The admin layer ([ADMIN-LAYER-PLAN.md](ADMIN-LAYER-PLAN.md)) reuses this exact
-mechanism for keyless authority references (since LF 2.1 has no contract keys):
+The admin layer ([ADMIN-LAYER-PLAN.md](ADMIN-LAYER-PLAN.md)) uses keyless authority
+references (since LF 2.1 has no contract keys):
 
-- `"simple-token/role-capability"` — the caller's `RoleCapability` CID, disclosed
-  for capability-gated choices (future mint/burn, `BatchProcessor` settlement).
+- Capabilities are passed to gated choices as **explicit choice arguments** (the
+  caller is the controller and holds its own `RoleCapability`), with the contract
+  disclosed where the caller is not already a stakeholder (e.g. an `Admin`
+  delegate revoking a capability issued to another party). There is no
+  capability `ChoiceContext` key — that pattern is only needed for contracts the
+  off-ledger service injects that the caller does not hold.
 - Pause state is **not** a context key — it is a field on the factory contract
-  itself (non-spoofable), read via `Rules_PublicFetchPaused`.
+  itself (non-spoofable), read via `Rules_GetPaused`.
 - Because the registry API returns the current factory CID + `ChoiceContext` on
   every transfer-factory request, pausing (which rotates the factory CID) is
   transparent to compliant wallets. This supersedes the older Q11 "pause = archive

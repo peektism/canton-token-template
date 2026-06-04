@@ -18,6 +18,7 @@ import SimpleToken.Admin.Authority
   , Admin_IssueRole(..)
   , Admin_RevokeRole(..)
   , Admin_DelegatedIssueRole(..)
+  , Admin_DelegatedRevokeRole(..)
   )
 import SimpleToken.Admin.Capability (RoleCapability)
 import SimpleToken.Admin.Roles (Role)
@@ -207,6 +208,19 @@ delegatedIssueRole registry adminCid caller adminCap assignee role = do
   submitWithDisc caller adminDisc $
     exerciseCmd adminCid Admin_DelegatedIssueRole with
       caller; adminCap; assignee; role; scope = None
+
+-- | Delegated revocation: `caller` (holding a registry-wide Admin capability)
+-- revokes a non-Admin capability. Both the anchor and the target capability are
+-- disclosed to the delegate (the delegate is not a stakeholder of capabilities
+-- issued to other parties; the off-ledger service provides these disclosures in
+-- production).
+delegatedRevokeRole : SimpleRegistry -> ContractId TokenAdministrator -> Party -> ContractId RoleCapability -> ContractId RoleCapability -> Script ()
+delegatedRevokeRole registry adminCid caller adminCap capCid = do
+  adminDisc <- queryDisc @TokenAdministrator registry.admin adminCid
+  capDisc <- queryDisc @RoleCapability registry.admin capCid
+  submitWithDisc caller (adminDisc <> capDisc) $
+    exerciseCmd adminCid Admin_DelegatedRevokeRole with
+      caller; adminCap; capCid
 
 -- | The current factory contract id together with a disclosure for it.
 currentRules : SimpleRegistry -> Script (ContractId SimpleTokenRules, Disclosures)

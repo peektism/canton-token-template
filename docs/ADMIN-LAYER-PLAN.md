@@ -4,7 +4,7 @@ Status: Implemented and tested. Source under
 `simple-token/daml/SimpleToken/Admin/` (`Roles`, `Errors`, `Capability`,
 `Authority`) plus the Pausable chokepoints on `SimpleTokenRules`; tests in
 `simple-token-test/daml/SimpleToken/Test/Admin.daml`. Validated on SDK 3.4.11 /
-DPM 1.0.17 / OpenJDK 21: full suite **125/125 passing**, `scripts/verify.sh`
+DPM 1.0.17 / OpenJDK 21: full suite **128/128 passing**, `scripts/verify.sh`
 **3/3** (daml-lint clean on `Admin/*`, daml-props, daml-verify).
 
 Scope owner: OpenZeppelin technical lead.
@@ -40,7 +40,7 @@ The source research's *pattern* (registry + capabilities) is right; its
 
 | # | Research claim | Why it fails here | What the implementation does instead |
 |---|----------------|-------------------|---------------------------------------|
-| C1 | `TokenAdministrator … key (owner, instrumentId); maintainer …` | **Daml LF 2.1 dropped contract keys** ([AUDIT.md G4](AUDIT.md), [SCOPE.md §9](SCOPE.md#9-post-mvp)). No `key`/`lookupByKey`. | Reference admin/capability contracts **by `ContractId`** via `ChoiceContext` + explicit disclosure (`ContextUtils.roleCapabilityContextKey`), the established preapproval idiom. |
+| C1 | `TokenAdministrator … key (owner, instrumentId); maintainer …` | **Daml LF 2.1 dropped contract keys** ([AUDIT.md G4](AUDIT.md), [SCOPE.md §9](SCOPE.md#9-post-mvp)). No `key`/`lookupByKey`. | Reference admin/capability contracts **by `ContractId`** — capabilities are passed as explicit choice arguments (the caller holds its own), with explicit disclosure where needed. |
 | C2 | `GlobalPause … lookupByKey` for "O(1) pause" | Keys again; and a caller-supplied pause lookup is **spoofable** (the settler controls their own context). | Pause is a **non-spoofable `paused : Bool` field on `SimpleTokenRules`** — the contract being exercised — checked at the factory chokepoints. See §4. |
 | C3 | `RoleCapability … key (assignee, instrumentId, roleType)` | Keys; and `roleType : Text` is unbounded/typo-prone. | Keyless `RoleCapability` template + closed `Role` sum type, validated by `requireRole` (proof-by-`fetch`). See §3. |
 | C4 | `roleType : Text` (`"MINTER_ROLE"`) | Trips `daml-lint unbounded-fields`; admits typos. | Closed `data Role = Minter \| Burner \| Pauser \| BatchProcessor \| Admin`. |
@@ -118,8 +118,9 @@ whole registry). This is the least-privilege primitive (resolves the prior
 **Soundness without keys:** capabilities are admin-signed (unforgeable) and name a
 specific `assignee`; the worst an adversary can do is present a capability they
 don't hold and fail their own authorization. The caller passes their capability
-CID via the `roleCapabilityContextKey` ChoiceContext entry (+ disclosure), exactly
-as preapprovals are passed today.
+CID as an **explicit choice argument** (the caller is the controller and holds its
+own capability), with explicit disclosure where the caller is not already a
+stakeholder — no `ChoiceContext` key is needed.
 
 ---
 
@@ -167,19 +168,43 @@ template TokenAdministrator with admin : Party where
   signatory admin
   nonconsuming choice Admin_IssueRole   ... controller admin            -- root issues
   nonconsuming choice Admin_RevokeRole  ... controller admin            -- root revokes
-  nonconsuming choice Admin_DelegatedIssueRole  with caller, adminCap, … -- delegate issues
-    controller caller do requireRole caller Admin admin None adminCap; create RoleCapability …
-  nonconsuming choice Admin_DelegatedRevokeRole with caller, adminCap, … -- delegate revokes
-    controller caller do requireRole caller Admin admin None adminCap; …
+  nonconsuming choice Admin_DelegatedIssueRole  with caller, adminCap, role, … -- delegate issues
+    controller caller do requireRole caller Admin admin None adminCap
+                          assertMsg eRoleNotDelegable (delegableRole role); mkRoleCapability …
+  nonconsuming choice Admin_DelegatedRevokeRole with caller, adminCap, capCid  -- delegate revokes
+    controller caller do requireRole caller Admin admin None adminCap
+                          revokeIssuedCapability admin delegableRole capCid   -- delegate: delegable roles only
 ```
 
+Direct (root) and delegated paths share single-sourced helpers (`mkRoleCapability`,
+`revokeIssuedCapability admin mayRevokeRole capCid`) so the create/revoke logic
+cannot drift — the root passes `const True`, a delegate passes `delegableRole`.
+
+**The delegation policy is a single function** — `Roles.delegableRole : Role -> Bool`
+— used by *both* the delegated issue and revoke paths (not two ad-hoc checks), so
+it cannot drift. A delegate may issue/revoke a role only when `delegableRole role`;
+the genesis root (`Admin_IssueRole`/`Admin_RevokeRole`) may manage any role. Today
+only `Pauser` is delegable; `Admin` is root-only, and the reserved roles
+(`Minter`/`Burner`/`BatchProcessor`) are root-only **until their enforcing slice
+lands** — so a delegate cannot pre-mint a reserved capability and retroactively
+gain power when that slice starts gating on it. A reserved role graduates by
+flipping its `delegableRole` case in the same change that adds its enforcement.
+
+This caps the hierarchy at **root → Admin delegates → delegable roles** and closes
+the escalation paths a flat model opens: re-delegation (a delegate minting `Admin`),
+delegate-vs-delegate / delegate-vs-root `Admin` revocation, and reserved-role
+pre-minting. A delegate may still manage *delegable operational* capabilities —
+including ones the root issued (shared operational-role management) — and the
+genesis root remains the sole governance authority, always recoverable via the
+un-revocable `TokenAdministrator`.
+
 **Ownership handoff** = the root grants an `Admin` capability to a new governance
-party. That party can then administer the registry via the `Admin_Delegated*`
-choices, which run with the anchor's admin authority and so mint/archive
-admin-signed capabilities **without holding the root key**. To hand control back,
-revoke the delegate's `Admin` capability. Because every capability is anchored to
-the same fixed `admin`, a delegate's capabilities work immediately — there is no
-factory rebind and no desync (the failure mode of the earlier two-step sketch, C9).
+party. That party administers operational roles via the `Admin_Delegated*` choices,
+which run with the anchor's admin authority and so mint/archive admin-signed
+capabilities **without holding the root key**. To hand control back, revoke the
+delegate's `Admin` capability. Because every capability is anchored to the same
+fixed `admin`, a delegate's capabilities work immediately — no factory rebind, no
+desync (the failure mode of the earlier two-step sketch, C9).
 
 This composes with the standard institutional pattern at zero extra code: a cold
 root party (the genesis `admin`, backed by an offline multisig via Canton
@@ -220,7 +245,7 @@ whenNotPaused`.
 | 28 | Capability honored only if `cap.assignee == caller` | `requireRole` | `test_capabilityImpersonationFails` |
 | 29 | Capability honored only if `cap.role == required role` | `requireRole` | `test_pauseRequiresPauserCap`, `test_nonAdminCannotDelegateIssue` |
 | 30 | Capability scope must authorize the operation (instrument cap ≠ registry-wide op) | `scopeAuthorizes` | `test_scopedCapabilityCannotPauseRegistry` |
-| 31 | Capabilities issued/revoked only by the root `admin` or an `Admin`-capability holder | `TokenAdministrator` choices | `test_delegatedAdminGovernance`, `test_nonAdminCannotDelegateIssue` |
+| 31 | Capabilities issued/revoked only by the root `admin` or an `Admin`-capability holder; the **`Admin` role is root-managed** (delegates cannot issue/revoke `Admin`) | `TokenAdministrator` choices + `delegableRole` policy (`eRoleNotDelegable`) | `test_delegatedAdminGovernance`, `test_nonAdminCannotDelegateIssue`, `test_delegatedRevoke`, `test_delegatedCannotRevokeAdmin` |
 | 32 | A revoked capability can no longer authorize | archival + `requireRole` `NotActive` | `test_revokeRole`, `test_revokedAdminCannotDelegate` |
 | 33 | Pause does not freeze funds: recovery and committed-settlement completion stay open | recovery/settlement choices ungated | `test_pauseAllowsRecoveryBlocksOrigination` |
 | 34 | Read-only `Rules_GetPaused` succeeds while paused | no guard on the read | `test_publicFetchWhilePaused` |
@@ -234,7 +259,7 @@ whenNotPaused`.
 - **daml-lint:** clean on `Admin/*` — `Role` is a closed sum type and no admin
   template has unbounded list fields (`scope` is `Optional`, not a list). The 7
   acknowledged `unbounded-fields` MEDIUMs are all pre-existing on other templates.
-- **daml-props / dpm test:** 125/125, incl. 12 `Test/Admin.daml` rows.
+- **daml-props / dpm test:** 128/128, incl. 15 `Test/Admin.daml` rows.
 - **daml-verify:** 14/14 proved (transfer/allocation conservation + temporal). The
   `admin-authorization` capability relation and a `scopeAuthorizes` lemma remain
   Z3 proof *targets* (the symbolic model has no capability relation yet); today
@@ -242,17 +267,20 @@ whenNotPaused`.
 
 ---
 
-## 9. Test plan (`Test/Admin.daml`, 12 tests)
+## 9. Test plan (`Test/Admin.daml`, 14 tests)
 
 Pausable: `test_pauseBlocksTransfer`, `test_pauseBlocksAllocation`,
 `test_unpauseRestores`, `test_pauseRequiresPauserCap`,
 `test_scopedCapabilityCannotPauseRegistry`, `test_publicFetchWhilePaused`,
 `test_pauseAllowsRecoveryBlocksOrigination` (origination-blocked vs
-recovery-allowed under one paused state).
+recovery-allowed under one paused state; asserts the **unlocked** balance so the
+recovery is load-bearing).
 AccessControl: `test_capabilityImpersonationFails`, `test_revokeRole`.
-Ownable-as-Admin-role: `test_delegatedAdminGovernance` (handoff),
-`test_revokedAdminCannotDelegate`, `test_nonAdminCannotDelegateIssue`
-(visible-but-unauthorized → fails the role check, not visibility).
+Ownable-as-Admin-role: `test_delegatedAdminGovernance` (handoff; also asserts a
+delegate cannot re-delegate `Admin`), `test_revokedAdminCannotDelegate`,
+`test_nonAdminCannotDelegateIssue` (visible-but-unauthorized → fails the role
+check, not visibility), `test_delegatedRevoke` (delegate revokes an operational
+cap), `test_delegatedCannotRevokeAdmin` (delegate cannot revoke an `Admin` cap).
 
 ---
 
