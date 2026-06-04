@@ -4,6 +4,13 @@ version: 0.1.0
 source: daml
 build-options:
   - --target=2.1
+  # Enforce exhaustive pattern matching package-wide (all of simple-token, incl. the
+  # experimental Cip112/V2 modules): a non-exhaustive `case`/function is a build error, not
+  # a runtime pattern-match crash. Motivating case: a closed sum like
+  # SimpleToken.Admin.Roles.Role gaining a constructor without a corresponding `delegableRole`
+  # clause fails the build, so the delegation policy cannot silently regress.
+  - --ghc-option=-Wincomplete-patterns
+  - --ghc-option=-Werror=incomplete-patterns
 dependencies:
   - daml-prim
   - daml-stdlib

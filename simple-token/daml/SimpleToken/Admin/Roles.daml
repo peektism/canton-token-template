@@ -47,8 +47,10 @@ data Role
 --     starts gating on it. A reserved role graduates by flipping its case to
 --     `True` in the same change that adds its enforcement.
 --
--- The explicit per-constructor cases are deliberate: adding a new `Role` forces
--- a deliberate delegation decision here (non-exhaustive-match warning).
+-- The explicit per-constructor cases are deliberate (no wildcard): adding a new
+-- `Role` forces a deliberate delegation decision here. The package builds with
+-- `-Werror=incomplete-patterns` (see simple-token/daml.yaml), so a missing clause
+-- is a compile error, not a runtime pattern-match crash.
 delegableRole : Role -> Bool
 delegableRole Pauser = True
 delegableRole Admin = False

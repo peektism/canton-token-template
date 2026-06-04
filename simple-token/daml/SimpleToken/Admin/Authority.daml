@@ -44,6 +44,12 @@ revokeIssuedCapability admin mayRevokeRole capCid = do
   assertMsg eRoleNotDelegable (mayRevokeRole cap.role)
   archive capCid
 
+-- | Assert `caller` is a governance delegate of this registry: holds a
+-- registry-wide `Admin` capability. Single-sources the precondition shared by
+-- the delegated issue and revoke choices.
+requireAdminDelegate : Party -> Party -> ContractId RoleCapability -> Update ()
+requireAdminDelegate caller admin adminCap = requireRole caller Admin admin None adminCap
+
 -- | The genesis governance anchor for a registry. `admin` is the immutable
 -- instrument root party (equals `SimpleTokenRules.admin`). One instance per
 -- registry by convention; nothing depends on uniqueness, because every consumer
@@ -98,7 +104,7 @@ template TokenAdministrator
         scope : Optional InstrumentId         -- ^ None = registry-wide; Some = single instrument.
       controller caller
       do
-        requireRole caller Admin admin None adminCap
+        requireAdminDelegate caller admin adminCap
         assertMsg eRoleNotDelegable (delegableRole role)
         mkRoleCapability admin assignee role scope
 
@@ -120,5 +126,5 @@ template TokenAdministrator
         capCid : ContractId RoleCapability    -- ^ Delegable-role capability to revoke.
       controller caller
       do
-        requireRole caller Admin admin None adminCap
+        requireAdminDelegate caller admin adminCap
         revokeIssuedCapability admin delegableRole capCid

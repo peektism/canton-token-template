@@ -169,10 +169,10 @@ template TokenAdministrator with admin : Party where
   nonconsuming choice Admin_IssueRole   ... controller admin            -- root issues
   nonconsuming choice Admin_RevokeRole  ... controller admin            -- root revokes
   nonconsuming choice Admin_DelegatedIssueRole  with caller, adminCap, role, … -- delegate issues
-    controller caller do requireRole caller Admin admin None adminCap
+    controller caller do requireAdminDelegate caller admin adminCap
                           assertMsg eRoleNotDelegable (delegableRole role); mkRoleCapability …
   nonconsuming choice Admin_DelegatedRevokeRole with caller, adminCap, capCid  -- delegate revokes
-    controller caller do requireRole caller Admin admin None adminCap
+    controller caller do requireAdminDelegate caller admin adminCap
                           revokeIssuedCapability admin delegableRole capCid   -- delegate: delegable roles only
 ```
 
@@ -259,6 +259,10 @@ whenNotPaused`.
 - **daml-lint:** clean on `Admin/*` — `Role` is a closed sum type and no admin
   template has unbounded list fields (`scope` is `Optional`, not a list). The 7
   acknowledged `unbounded-fields` MEDIUMs are all pre-existing on other templates.
+- **compiler-enforced policy:** `simple-token` builds with
+  `--ghc-option=-Werror=incomplete-patterns`, so adding a `Role` constructor
+  without a `delegableRole` clause is a **compile error**, not a runtime
+  pattern-match crash — the delegation policy cannot silently regress.
 - **daml-props / dpm test:** 128/128, incl. 15 `Test/Admin.daml` rows.
 - **daml-verify:** 14/14 proved (transfer/allocation conservation + temporal). The
   `admin-authorization` capability relation and a `scopeAuthorizes` lemma remain

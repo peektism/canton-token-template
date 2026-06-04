@@ -4,11 +4,18 @@
 --
 -- Note on the negative tests: Daml Script's `submitMustFail` passes on ANY
 -- failure, so a must-fail can pass for the wrong reason (e.g. a contract not
--- visible) rather than the guard under test. These tests deliberately DISCLOSE
--- the contracts the failing choice must fetch (the factory, the genesis anchor,
--- the target capability) so the failure lands on the intended `assertMsg` guard,
--- not on visibility. The explicit disclosures are therefore load-bearing — do
--- not remove them when editing a negative test.
+-- visible) rather than the guard under test. To make each must-fail land on the
+-- intended failure, these tests disclose exactly the contracts the failing
+-- choice must fetch that the caller cannot already see (the factory, the genesis
+-- anchor, and a capability the caller is not the assignee of). These disclosures
+-- are load-bearing — do not remove them when editing a negative test.
+--
+-- The intended failure is one of two kinds, depending on the test:
+--   * an `assertMsg` guard — e.g. `eRegistryPaused`, `eCapability*`,
+--     `eRoleNotDelegable`, `eRedundantPauseChange`; or
+--   * a structural ledger failure — `NotActive` when the gated contract or a
+--     capability was already archived (e.g. `test_revokeRole`,
+--     `test_revokedAdminCannotDelegate`).
 module SimpleToken.Test.Admin where
 
 import Splice.Api.Token.TransferInstructionV1
