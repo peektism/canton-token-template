@@ -1,0 +1,88 @@
+-- | Supply management primitives for the mint/burn slices (AL-5/AL-6).
+--
+-- Two independent concerns, deliberately separated (see docs/ADMIN-LAYER-PLAN.md §11):
+--   * D3 (enforced cap) lives on the `Minter` capability's `mintAllowance` — see
+--     `SimpleToken.Admin.Capability.consumeMintAllowance`. That is the real bound.
+--   * D2 (advisory observability) is `TotalSupply` here: an on-ledger, auditable
+--     running total, anchored to one `(admin, instrumentId)`. It is reconciled by
+--     the registry's off-ledger service from mint/burn events via
+--     `TotalSupply_AdjustMinted`; mint/burn choices do NOT update it inline. This
+--     keeps the supply contract off the hot path (no per-op contention) at the
+--     cost of being eventually-consistent — the intended trade for a keyless,
+--     UTXO-native registry where a unique singleton cannot be enforced anyway.
+--
+-- `MintProposal` is the cold-recipient half of the A3 mint dispatch: when a
+-- recipient has no `TransferPreapproval`, `Rules_Mint` emits a proposal the
+-- recipient accepts to receive the minted holding (Canton requires the
+-- recipient's authority to create their holding).
+module SimpleToken.Supply where
+
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.MetadataV1
+
+import SimpleToken.Holding
+import SimpleToken.Admin.Errors
+
+-- | Advisory, auditable circulating-supply total for one instrument. Anchored to
+-- `(admin, instrumentId)` by convention (no contract keys on LF 2.1, so
+-- uniqueness is not enforced — this is observability, not a hard cap; the hard
+-- cap is the per-minter `mintAllowance`).
+template TotalSupply
+  with
+    admin : Party
+    instrumentId : InstrumentId
+    minted : Decimal          -- ^ Advisory circulating supply (service-reconciled).
+  where
+    signatory admin
+    ensure minted >= 0.0
+
+    -- | Reconcile the advisory total by `delta` (positive for mints, negative for
+    -- burns). Controlled by `admin`: the registry's off-ledger service applies
+    -- this from the mint/burn event stream.
+    --
+    -- # Invariants enforced:
+    -- - INV-37: the running total never goes negative
+    choice TotalSupply_AdjustMinted : ContractId TotalSupply
+      with delta : Decimal
+      controller admin
+      do
+        assertMsg eSupplyWouldGoNegative (minted + delta >= 0.0)
+        create this with minted = minted + delta
+
+    -- | Read the advisory total without archiving (any party with it disclosed).
+    nonconsuming choice TotalSupply_Read : Decimal
+      with actor : Party
+      controller actor
+      do pure minted
+
+-- | A pending mint to a recipient who has no `TransferPreapproval`. The recipient
+-- must accept to create their holding (Canton recipient-consent for minting).
+template MintProposal
+  with
+    admin : Party
+    recipient : Party
+    instrumentId : InstrumentId
+    amount : Decimal
+    meta : Metadata
+  where
+    signatory admin
+    observer recipient
+    ensure amount > 0.0
+
+    -- | Recipient accepts; their holding is created (admin authority from the
+    -- proposal signatory, recipient authority from the controller).
+    choice MintProposal_Accept : ContractId Holding
+      controller recipient
+      do
+        cid <- create SimpleHolding with admin; owner = recipient; instrumentId; amount; meta
+        pure (toInterfaceContractId @Holding cid)
+
+    -- | Recipient declines the mint.
+    choice MintProposal_Reject : ()
+      controller recipient
+      do pure ()
+
+    -- | Issuer withdraws an unaccepted mint proposal.
+    choice MintProposal_Withdraw : ()
+      controller admin
+      do pure ()

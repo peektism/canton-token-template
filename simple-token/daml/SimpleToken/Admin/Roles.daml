@@ -18,14 +18,15 @@ module SimpleToken.Admin.Roles where
 -- Enforcement status (what currently gates on each role):
 --   * `Pauser` — enforced by `Rules_SetPaused`.
 --   * `Admin`  — enforced by the `TokenAdministrator` delegated choices.
---   * `Minter` / `Burner` / `BatchProcessor` — RESERVED: defined so capabilities
---     are mintable ahead of the slices that consume them (AL-5/6 mint/burn,
---     V2-10 delegated settlement). No choice gates on them yet, so granting one
---     authorizes nothing today. Do not treat them as live access control until
---     their slice lands.
+--   * `Minter` — enforced by `Rules_Mint` (AL-5); carries an optional D3 allowance.
+--   * `Burner` — enforced by `SimpleHolding_ForcedBurn` (AL-6, clawback).
+--   * `BatchProcessor` — RESERVED: defined so capabilities are mintable ahead of
+--     the slice that consumes it (V2-10 delegated settlement). No choice gates on
+--     it yet, so granting it authorizes nothing today. Do not treat it as live
+--     access control until its slice lands.
 data Role
-  = Minter          -- ^ (reserved) May create holdings out of band — future mint slice (AL-5).
-  | Burner          -- ^ (reserved) May archive holdings out of band — future burn slice (AL-6).
+  = Minter          -- ^ May create holdings via `Rules_Mint` (AL-5). Enforced; instrument-scopable.
+  | Burner          -- ^ May force-burn holdings via `SimpleHolding_ForcedBurn` (AL-6). Enforced.
   | Pauser          -- ^ May flip the registry pause flag (see SimpleToken.Rules). Enforced.
   | BatchProcessor  -- ^ (reserved) Delegated SettlementFactory_SettleBatch — future slice (V2-10).
   | Admin           -- ^ Root governance: may issue/revoke capabilities (owner analogue). Enforced.
@@ -42,10 +43,13 @@ data Role
 --
 --   * `Admin` is root-only: no re-delegation, no delegate-vs-delegate or
 --     delegate-vs-root governance changes.
---   * Reserved roles are root-only until their enforcing slice lands, so a
---     delegate cannot pre-mint one and retroactively gain power when that slice
---     starts gating on it. A reserved role graduates by flipping its case to
---     `True` in the same change that adds its enforcement.
+--   * `Minter` / `Burner` are enforced (AL-5/6) but kept root-only by deliberate
+--     governance policy: appointing who may create or force-burn supply is a
+--     root-level decision, not something an `Admin` delegate can hand out. Flip a
+--     case to `True` to make that role delegable.
+--   * A *reserved* role (no enforcement yet) is root-only so a delegate cannot
+--     pre-mint one and retroactively gain power when its slice starts gating on
+--     it.
 --
 -- The explicit per-constructor cases are deliberate (no wildcard): adding a new
 -- `Role` forces a deliberate delegation decision here. The package builds with
@@ -54,6 +58,6 @@ data Role
 delegableRole : Role -> Bool
 delegableRole Pauser = True
 delegableRole Admin = False
-delegableRole Minter = False          -- reserved (AL-5)
-delegableRole Burner = False          -- reserved (AL-6)
+delegableRole Minter = False          -- enforced (AL-5), root-managed by policy
+delegableRole Burner = False          -- enforced (AL-6), root-managed by policy
 delegableRole BatchProcessor = False  -- reserved (V2-10)

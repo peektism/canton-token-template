@@ -192,7 +192,12 @@ capability relation.
 | INV-32 | A revoked capability can no longer authorize | Script: `test_revokeRole`, `test_revokedAdminCannotDelegate` |
 | INV-33 | Pause is origination control, not a fund freeze: recovery + committed-settlement completion stay open | Script: `test_pauseAllowsRecoveryBlocksOrigination` |
 | INV-34 | Read-only `Rules_GetPaused` succeeds while paused | Script: `test_publicFetchWhilePaused` |
-| admin-authorization | `requireRole` rejects every `(caller, role, admin, scope)` tuple not matching a co-signed capability; `assertNotPaused` is a total guard on the origination set | `daml-verify` TARGET |
+| INV-35 | Mint requires a `Minter` cap, positive amount, supported instrument; blocked while paused | Script: `test_mintRequiresMinterCapability`, `test_mintBlockedWhilePaused`, `test_mintDirectViaPreapproval`, `test_mintProposalWhenNoPreapproval` |
+| INV-36 | A capped `Minter` cannot exceed its `mintAllowance` (D3); each mint decrements it | Script: `test_cappedMinterAllowance` |
+| INV-37 | Advisory `TotalSupply` (D2) reconciles up/down, never negative | Script: `test_totalSupplyObservability` |
+| INV-38 | Forced burn (incl. in-flight/locked funds) requires an in-scope `Burner` cap; owner redemption needs none | Script: `test_forcedBurnRequiresBurnerCap`, `test_forcedBurnScopedToInstrument`, `test_forcedBurnLockedHolding`, `test_ownerRedemptionBurn` |
+| INV-39 | Every `SimpleHolding`/`LockedSimpleHolding` has `instrumentId.admin == admin` | template `ensure` clauses |
+| admin-authorization | `requireRole` rejects every `(caller, role, admin, scope)` tuple not matching a co-signed capability; `assertNotPaused` is a total guard on the origination set; capped mint is conserved | `daml-verify` TARGET |
 
 > daml-lint note: `Role` is a closed sum type and no admin template has unbounded
 > list fields (`RoleCapability.scope` is `Optional`, not a list) — no new
@@ -200,11 +205,13 @@ capability relation.
 
 **Verification run (2026-06-04, SDK 3.4.11 / DPM 1.0.17 / OpenJDK 21.0.11):**
 `scripts/verify.sh` → **3 passed, 0 failed**.
-- `daml-lint`: PASS. **No findings in `SimpleToken/Admin/*`** or the new
-  `SimpleTokenRules` choices/`paused` field. The 7 `unbounded-fields` MEDIUMs are
-  all pre-existing on other templates (`extraObservers`, `supportedInstruments`,
-  `senders`, `allocations`, `inputHoldingCids`) — admin-only creation mitigates.
-- `daml-props` (`dpm test`): PASS — **128/128** (incl. 15 `Test/Admin.daml` rows).
+- `daml-lint`: PASS. **No findings in `SimpleToken/Admin/*`, `Supply.daml`,** or the
+  new `SimpleTokenRules`/`SimpleHolding`/`Preapproval` choices. The 7
+  `unbounded-fields` MEDIUMs are all pre-existing on other templates
+  (`extraObservers`, `supportedInstruments`, `senders`, `allocations`,
+  `inputHoldingCids`) — admin-only creation mitigates.
+- `daml-props` (`dpm test`): PASS — **141/141** (incl. 15 `Test/Admin.daml` + 10
+  `Test/MintBurn.daml` rows).
 - `daml-verify`: PASS — 14/14 properties. The 9 C/D/T rows model this repo's
   transfer/allocation logic; the V1–V5 rows are the tool's own stablecoin models.
   The AccessControl/Pausable proof rows (`admin-authorization`, a `scopeAuthorizes`

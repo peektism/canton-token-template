@@ -23,7 +23,7 @@ module SimpleToken.Admin.Capability where
 import Splice.Api.Token.HoldingV1 (InstrumentId)
 
 import SimpleToken.Admin.Errors
-import SimpleToken.Admin.Roles (Role)
+import SimpleToken.Admin.Roles (Role(..))
 
 -- | A capability granting `assignee` a single `role` over the registry governed
 -- by `admin`, optionally narrowed to one instrument via `scope`.
@@ -40,12 +40,15 @@ template RoleCapability
     assignee : Party                -- ^ The party granted the role.
     role : Role                     -- ^ The single role granted.
     scope : Optional InstrumentId   -- ^ None = registry-wide; Some = limited to that instrument.
+    mintAllowance : Optional Decimal -- ^ D3 quota for `Minter` caps: None = unlimited; Some = remaining.
   where
     -- INV-31: only the registry root (or its delegate, via TokenAdministrator)
     -- can mint a capability; it is admin-signed and therefore unforgeable.
     signatory admin
     -- The assignee can see (and present) their own capability, nothing more.
     observer assignee
+    -- INV-36: a capped allowance is non-negative (only meaningful for Minter caps).
+    ensure optional True (>= 0.0) mintAllowance
 
 -- | Does a capability's scope authorize an operation requiring `requiredScope`?
 --
@@ -75,10 +78,36 @@ scopeAuthorizes capScope requiredScope = case capScope of
 -- Soundness without keys: the capability is admin-signed (unforgeable) and
 -- names a specific assignee, so the worst an adversary can do is present a
 -- capability they do not hold and fail their own authorization.
-requireRole : Party -> Role -> Party -> Optional InstrumentId -> ContractId RoleCapability -> Update ()
+-- Returns the validated capability so callers that need its fields (e.g. the
+-- D3 allowance) don't have to fetch it a second time.
+requireRole : Party -> Role -> Party -> Optional InstrumentId -> ContractId RoleCapability -> Update RoleCapability
 requireRole caller role expectedAdmin requiredScope capCid = do
   cap <- fetch capCid
   assertMsg eCapabilityAdminMismatch (cap.admin == expectedAdmin)
   assertMsg eCapabilityAssigneeMismatch (cap.assignee == caller)
   assertMsg eCapabilityRoleMismatch (cap.role == role)
   assertMsg eCapabilityScopeMismatch (scopeAuthorizes cap.scope requiredScope)
+  pure cap
+
+-- | Authorize a mint of `amount` for `requiredScope` by `caller`'s `Minter`
+-- capability, and consume its D3 allowance. Validates the capability as a
+-- `Minter` (admin/assignee/role/scope via `requireRole`), then:
+--   * `mintAllowance = None`  → unlimited: the capability is unchanged, its CID returned.
+--   * `mintAllowance = Some r` → enforced: requires `amount <= r`, then archives and
+--     re-creates the capability with `r - amount` remaining, returning the NEW CID.
+--
+-- Recreation rotates the capability CID (per-minter contention is the intended
+-- D3 cost). The caller (a `Minter`) drives this via a choice on an admin-signed
+-- contract, so the archive/create carry the registry admin's authority.
+--
+-- # Invariants enforced:
+-- - INV-36: a capped minter cannot mint beyond its remaining allowance
+consumeMintAllowance : Party -> Party -> Optional InstrumentId -> Decimal -> ContractId RoleCapability -> Update (ContractId RoleCapability)
+consumeMintAllowance caller expectedAdmin requiredScope amount capCid = do
+  cap <- requireRole caller Minter expectedAdmin requiredScope capCid
+  case cap.mintAllowance of
+    None -> pure capCid
+    Some remaining -> do
+      assertMsg eMintAllowanceExceeded (amount <= remaining)
+      archive capCid
+      create cap with mintAllowance = Some (remaining - amount)

@@ -6,15 +6,26 @@ Status:
   Holding, Transfer, Allocation, Settlement, AllocationRequest, iterated
   settlement, and provider-managed accounts — see
   [CIP-0112-EXTENSION-PLAN.md](CIP-0112-EXTENSION-PLAN.md).
-- **Admin layer (AccessControl / Ownable / Pausable):** implemented and green
-  (slices AL-0..AL-3) under `SimpleToken/Admin/` plus the Pausable chokepoints on
-  `SimpleTokenRules`. Uses the hybrid **AccessControl-as-substrate** model: the
-  `Admin` role is the Ownable owner; Pausable is `Pauser`-gated origination
-  control, with the `Admin` role root-managed (one-level delegation). 15 tests in
-  `Test/Admin.daml`; full suite **128/128 passing** and `scripts/verify.sh`
-  **3/3** on SDK 3.4.11 / Java 21. Design:
-  [ADMIN-LAYER-PLAN.md](ADMIN-LAYER-PLAN.md); slices:
-  [§17](#17-active-and-future-slices-admin-layer--cip-112).
+- **Admin layer (AccessControl / Ownable / Pausable):** implemented, green, and
+  **converged** (slices AL-0..AL-3) under `SimpleToken/Admin/` plus the Pausable
+  chokepoints on `SimpleTokenRules`. Uses the hybrid **AccessControl-as-substrate**
+  model: the `Admin` role is the Ownable owner; Pausable is `Pauser`-gated
+  origination control; the `Admin` role is root-managed (one-level delegation) via
+  the single-source `delegableRole` policy, which `simple-token` enforces at
+  **compile time** (`-Werror=incomplete-patterns`). Hardened across five
+  `/code-review` → fix rounds (0 correctness defects). Design:
+  [ADMIN-LAYER-PLAN.md](ADMIN-LAYER-PLAN.md).
+- **Supply management (Mint / Burn — AL-5/AL-6):** implemented, green, and
+  **converged** — capability-gated mint and burn on top of the admin layer. Mint =
+  A3 dispatch (preapproval-direct or `MintProposal`); Burn = B3 (owner redemption +
+  `Burner`-gated forced clawback, incl. in-flight/locked funds); supply = D3
+  enforced per-`Minter` allowance + D2 advisory `TotalSupply`. 13 tests in
+  `Test/MintBurn.daml`; hardened across two `/code-review` → fix rounds. See
+  [ADMIN-LAYER-PLAN.md §11](ADMIN-LAYER-PLAN.md#11-supply-management--mint--burn-al-5--al-6).
+- **Test status:** full suite **141/141 passing** and `scripts/verify.sh` **3/3**
+  (daml-lint clean on new source, daml-props, daml-verify 14/14) on SDK 3.4.11 /
+  Java 21. Both AL-0..AL-3 and AL-5/AL-6 have reached a clean `/code-review` pass.
+  Active/next work and sequencing: [§17](#17-active-and-future-slices-admin-layer--cip-112).
 
 Scope: see [SCOPE.md](SCOPE.md) for authoritative scope boundaries, out-of-scope items, and post-MVP backlog.
 
@@ -810,7 +821,7 @@ All post-MVP hardening items (SCOPE.md §9, items 1-7) are now resolved:
 
 Items below are superseded where they now appear as active slices in [§17](#17-active-and-future-slices-admin-layer--cip-112).
 
-- Burn/mint extension APIs → now active as **AL-5/AL-6** (capability-gated)
+- Burn/mint extension APIs → ✅ **done** as AL-5/AL-6 (capability-gated; [§17](#17-active-and-future-slices-admin-layer--cip-112))
 - Delegation/operator model → partially active via provider-managed accounts (V2) + `BatchProcessor` role (**AL-3**)
 - Multi-step allocation instructions (`AllocationInstruction` with `Update` workflow)
 - Compliance policy contracts and richer settlement orchestration
@@ -860,30 +871,35 @@ layer is [ADMIN-LAYER-PLAN.md](ADMIN-LAYER-PLAN.md); for V2 it is
 > `RoleCapability` / `GlobalPause` designs are **not** implementable as written —
 > see [ADMIN-LAYER-PLAN.md §1](ADMIN-LAYER-PLAN.md#1-corrections-to-the-source-research-read-first).
 
-### 17.1 Admin layer slices (priority — land first)
+### 17.1 Admin layer + supply slices (priority — landed first)
 
-Status legend: ✅ implemented and tested · 🎯 active/next · 📋 planned.
+Status legend: ✅ implemented, tested & converged · 🎯 active/next · 📋 planned.
 
-| Slice | Title | Status | Depends on | Deliverables (as built) |
-|---|---|---|---|---|
 Architecture: the hybrid **AccessControl-as-substrate** model — `Admin` role = the
-Ownable owner (`DEFAULT_ADMIN_ROLE`); Pausable = `Pauser`-gated origination control.
-See [ADMIN-LAYER-PLAN.md §0](ADMIN-LAYER-PLAN.md).
+Ownable owner (`DEFAULT_ADMIN_ROLE`); Pausable = `Pauser`-gated origination control;
+Mint/Burn (AL-5/AL-6) are the first capability-gated consumers.
+See [ADMIN-LAYER-PLAN.md §0](ADMIN-LAYER-PLAN.md). **AL-0..AL-3 and AL-5/AL-6 are
+converged** — each reached a clean `/code-review` pass (0 correctness defects),
+across five fix rounds for the admin layer and two for mint/burn. **AL-4**
+(formal-verification model) is the one remaining admin-layer item (🎯).
 
 | Slice | Title | Status | Depends on | Deliverables (as built) |
 |---|---|---|---|---|
 | **AL-0** | Module skeleton | ✅ | — | `SimpleToken/Admin/Roles.daml` (closed `Role` sum type incl. `Admin`; `Minter`/`Burner`/`BatchProcessor` reserved for later slices), `SimpleToken/Admin/Errors.daml`. Capabilities are passed as explicit choice args (no `ChoiceContext` key needed). |
 | **AL-1** | Pausable chokepoint | ✅ | AL-0 | `paused : Bool` on `SimpleTokenRules`; `assertNotPaused` injected at the five **origination** impls (transfer V1/V2, allocation V1/V2, settlement-via-factory); `Rules_SetPaused` (registry-wide `Pauser`-gated) + `Rules_GetPaused`. Pause is origination control — committed settlement/completion and recovery stay open ([ADMIN-LAYER-PLAN.md §4](ADMIN-LAYER-PLAN.md#4-pausable--origination-control-simpletokenrules)). Tests: `test_pauseBlocksTransfer`, `test_pauseBlocksAllocation`, `test_unpauseRestores`, `test_publicFetchWhilePaused`, `test_pauseAllowsRecoveryBlocksOrigination` (inv #33), `test_scopedCapabilityCannotPauseRegistry` (inv #30). |
 | **AL-2** | AccessControl capabilities | ✅ | AL-0 | `SimpleToken/Admin/Capability.daml`: `RoleCapability` (with `scope : Optional InstrumentId` for least privilege) + `requireRole` (proof-by-fetch, scope-aware). Tests: `test_capabilityImpersonationFails`, `test_revokeRole`, `test_pauseRequiresPauserCap`. |
-| **AL-3** | Ownable-as-Admin-role + delegated governance | ✅ | AL-2 | `SimpleToken/Admin/Authority.daml`: `TokenAdministrator` (fixed genesis root) with `Admin_IssueRole`/`Admin_RevokeRole` (root) and `Admin_DelegatedIssueRole`/`Admin_DelegatedRevokeRole` (any `Admin`-capability holder). The **`Admin` role is root-managed** — delegates issue/revoke only roles for which the single-source `delegableRole` policy is `True` (today just `Pauser`; `Admin` and reserved roles are root-only — no re-delegation, no reserved-role pre-minting), via single-sourced `mkRoleCapability`/`revokeIssuedCapability` helpers. Ownership handoff = grant/revoke the `Admin` role; **no party reassignment, no `OwnershipOffer`** (resolves the desync, C9). Tests: `test_delegatedAdminGovernance`, `test_revokedAdminCannotDelegate`, `test_nonAdminCannotDelegateIssue`, `test_delegatedRevoke`, `test_delegatedCannotRevokeAdmin`. |
-| **AL-4** | Off-ledger + verification wiring | 🎯 | AL-1..AL-3 | ✅ `ChoiceContext`/pause off-ledger semantics in [SCOPE.md §8](SCOPE.md#8-off-ledger-compatibility); ✅ `scripts/verify.sh` runs green (lint/props/verify). 🎯 Remaining: add `daml-props` paused/role rows and a `daml-verify` `admin-authorization` + `scopeAuthorizes` proof model ([AUDIT.md](AUDIT.md)). |
+| **AL-3** | Ownable-as-Admin-role + delegated governance | ✅ | AL-2 | `SimpleToken/Admin/Authority.daml`: `TokenAdministrator` (fixed genesis root) with `Admin_IssueRole`/`Admin_RevokeRole` (root) and `Admin_DelegatedIssueRole`/`Admin_DelegatedRevokeRole` (any `Admin`-capability holder). The **`Admin` role is root-managed** — delegates issue/revoke only roles for which the single-source `delegableRole` policy is `True` (today just `Pauser`; `Admin` and reserved roles are root-only — no re-delegation, no reserved-role pre-minting), via single-sourced `mkRoleCapability`/`revokeIssuedCapability` helpers. Ownership handoff = grant/revoke the `Admin` role; **no party reassignment, no `OwnershipOffer`** (resolves the desync, C9). The `delegableRole` policy is enforced at **compile time** (`-Werror=incomplete-patterns` in `simple-token/daml.yaml`): a new `Role` without a delegation decision fails the build. Tests: `test_delegatedAdminGovernance`, `test_revokedAdminCannotDelegate`, `test_nonAdminCannotDelegateIssue`, `test_delegatedRevoke`, `test_delegatedCannotRevokeAdmin`. |
+| **AL-4** | Verification model for the admin/supply layer | 🎯 | AL-1..AL-3, AL-5/6 | ✅ `ChoiceContext`/pause off-ledger semantics in [SCOPE.md §8](SCOPE.md#8-off-ledger-compatibility); ✅ `scripts/verify.sh` runs green (lint/props/verify). 🎯 **Remaining (the next admin-layer task):** grow `daml-props` rows (pause / role-authorization / mint-allowance conservation) and a `daml-verify` symbolic model with a capability relation (`admin-authorization`, `scopeAuthorizes`, capped-mint conservation) so invariants #25–#39 move from Daml-Script-covered to Z3-proved ([AUDIT.md](AUDIT.md)). |
+| **AL-5** | Capability-gated Mint | ✅ | AL-2 | `Rules_Mint` (instrument-scoped `Minter`, `whenNotPaused`) with **A3 dispatch**: direct via the recipient's `TransferPreapproval` (`TransferPreapproval_MintInto`) or a `MintProposal` (`SimpleToken/Supply.daml`) the recipient accepts. **D3** enforced cap: `RoleCapability.mintAllowance` checked + decremented (`consumeMintAllowance`, atomic on the direct path; the proposal path is unlimited-minters-only — `eCappedMinterRequiresPreapproval`); `Admin_IssueCappedMinter` for bounded minters. **D2** advisory `TotalSupply`, `(admin,instrumentId)`-anchored, service-reconciled via `TotalSupply_AdjustMinted` (not on the hot path). Tests: `test_mint*`, `test_cappedMinterAllowance`, `test_cappedMinterRequiresPreapproval`, `test_totalSupplyObservability`. See [ADMIN-LAYER-PLAN.md §11](ADMIN-LAYER-PLAN.md#11-supply-management--mint--burn-al-5--al-6). |
+| **AL-6** | Capability-gated Burn | ✅ | AL-2 | **B3**: `SimpleHolding_Burn` (owner redemption, no cap, not pause-gated) + `SimpleHolding_ForcedBurn` and `LockedSimpleHolding_ForcedBurn` (instrument-scoped `Burner`-gated clawback, incl. **in-flight/locked** funds — the seized wrapper self-cleans after its deadline). `Minter`/`Burner` are enforced but root-managed (`delegableRole = False`). Tests: `test_ownerRedemptionBurn`, `test_forcedBurn*`, `test_forcedBurnSeizesInFlightTransfer`. |
 
 > **Build/verify status:** validated on SDK 3.4.11 / DPM 1.0.17 / OpenJDK 21.
 > `cd simple-token && dpm build` then `cd ../simple-token-test && dpm test` →
-> **128/128 passing** (15 in `Test/Admin.daml`). `scripts/verify.sh` → **3/3**
-> (daml-lint clean on `Admin/*`; daml-props; daml-verify 14/14). The
-> `simple-token-test` package consumes the rebuilt `simple-token` DAR, so build
-> the source package first. Standalone tools install via `scripts/setup.sh`.
+> **141/141 passing** (15 in `Test/Admin.daml` + 13 in `Test/MintBurn.daml`).
+> `scripts/verify.sh` → **3/3** (daml-lint clean on the admin/supply source;
+> daml-props; daml-verify 14/14). The `simple-token-test` package consumes the
+> rebuilt `simple-token` DAR, so build the source package first. Standalone tools
+> install via `scripts/setup.sh`.
 
 ### 17.2 CIP-112 V2 slices (gated by the admin layer where applicable)
 
@@ -941,3 +957,30 @@ and the research corrections:
 - **`V2OmnibusAccount`, Memo Pledge, CDP/`SecuritiesIntermediaryRole`/`LiquidatorRole`, `BridgeEscrowRole`** — stablecoin/custody/bridge use-cases; consume the `Role` primitive from sibling repos, not built here (correction C7).
 - **Spoofable pause guards on committed-settlement choices** — pause is origination control; a per-asset emergency *freeze* is a separate future capability (correction: see [ADMIN-LAYER-PLAN.md §4](ADMIN-LAYER-PLAN.md#4-pausable--origination-control-simpletokenrules)).
 - **Per-role admin hierarchy (`getRoleAdmin`) / two-step / timelocked issuance / on-ledger multisig** — named extension seams; the `Admin` role + Canton topology cover the MVP (see [ADMIN-LAYER-PLAN.md §5](ADMIN-LAYER-PLAN.md#5-ownable-as-admin-role-adminauthoritydaml)).
+
+### 17.5 Current status & next steps (roadmap)
+
+**Done & converged** (clean `/code-review`, 141/141, `verify.sh` 3/3): the full
+admin layer **AL-0..AL-3**, the supply layer **AL-5/AL-6**, and V2 pause coverage
+**V2-9**. The remaining `Minter`/`Burner` roles are enforced; only
+`BatchProcessor` is still reserved.
+
+Planned next steps, in recommended order — each is one self-contained slice that
+keeps the suite green and is independently reviewable:
+
+| Order | Slice | Why next / scope | Gating |
+|---|---|---|---|
+| 1 | **AL-4** — formal-verification model | Closes the only open admin-layer item: lift invariants #25–#39 from Daml-Script-covered to Z3-proved by giving `daml-verify` a capability relation + `daml-props` rows (pause / role-auth / capped-mint conservation). Pure verification depth, no new on-ledger surface — lowest risk, highest assurance-per-effort. | none |
+| 2 | **V2-10** — `BatchProcessor`-gated `SettlementFactory_SettleBatch` | Graduates the last reserved role: a delegated matching engine drives batch settlement on behalf of executors via a `BatchProcessor` capability (the real CIP-112 surface, replacing the research's invented `V2BatchTransferFactory`). Decide whether `BatchProcessor` becomes `delegableRole`. | AL-2 |
+| 3 | **V2 provider-managed clawback** (V2 hardening) | The documented V1-only gap: add forced-burn to `ProviderManagedSimpleHolding`/`ProviderManagedLockedHolding` for parity with AL-6, or keep deferred. | V2 source-of-record |
+| 4 | **V2-11 … V2-16** — CIP-112 conformance | V1/V2-compatible allocations, receipt allocations, reduced-privacy observer mode, view-count baselines, broader transfer events, and the full §5.4/§5.5 conformance matrix (per [CIP-0112-EXTENSION-PLAN.md](CIP-0112-EXTENSION-PLAN.md)). | preview→accepted DAR gate |
+
+**Release gates (unchanged, block conformance/public-API claims, not the slices
+above):** the preview DAR source-of-record (M1-PF-001 / CIP-112-D-002) and the
+AGPL→MIT extraction boundary (M1-PF-004) must be resolved before any CIP-112
+conformance or public-API claim.
+
+**Not yet committed:** AL-0..AL-6 + the supply layer live in the working tree
+(2 new files: `SimpleToken/Supply.daml`, `Test/MintBurn.daml`; plus the new
+`SimpleToken/Admin/` modules and `Test/Admin.daml`). A branch + commit is the
+natural checkpoint before starting AL-4.

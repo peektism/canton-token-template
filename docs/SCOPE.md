@@ -109,8 +109,8 @@ Every omitted feature is Splice-specific infrastructure, not CIP-056 requirement
 
 ## 3b. Administrative Layer (Ownable / AccessControl / Pausable)
 
-Design-complete, implementation pending. Authoritative design:
-[ADMIN-LAYER-PLAN.md](ADMIN-LAYER-PLAN.md); slice backlog:
+Implemented and converged (AL-0..AL-6); full suite 141/141, `scripts/verify.sh`
+3/3. Authoritative design: [ADMIN-LAYER-PLAN.md](ADMIN-LAYER-PLAN.md); slices:
 [PLAN.md §17](PLAN.md#17-active-and-future-slices-admin-layer--cip-112).
 
 Architecture: **AccessControl is the substrate; Ownable and Pausable are its
@@ -135,6 +135,12 @@ specializations** (as in OZ v5). In scope:
   *origination control*: committed-settlement completion and recovery
   (withdraw/reject/cancel) stay open so funds are never frozen. A per-asset
   *freeze* is a distinct future capability.
+- **Supply management (Mint / Burn, AL-5/AL-6)** — capability-gated mint
+  (`Rules_Mint`; A3 dispatch: preapproval-direct or `MintProposal`) and burn
+  (`SimpleHolding_Burn` owner redemption + `Burner`-gated `SimpleHolding_ForcedBurn`
+  clawback). Enforced per-`Minter` allowance (D3) + advisory `TotalSupply` (D2,
+  service-reconciled). Mint is pause-gated (origination); burn is not. See
+  [ADMIN-LAYER-PLAN.md §11](ADMIN-LAYER-PLAN.md#11-supply-management--mint--burn-al-5--al-6).
 
 Hard constraints: **no contract keys** (Daml LF 2.1) — authority contracts are
 referenced by `ContractId` via the keyless ChoiceContext-by-`ContractId` idiom;
@@ -262,8 +268,8 @@ Ordered by priority. Items 1-4 are hardening fixes identified by verification to
 8. Off-ledger HTTP service
 9. Integration tests (depends on off-ledger service)
 10. Fee schedule introduction
-11. Burn/mint extension APIs
-12. Delegation/operator model
+11. ✅ Burn/mint extension APIs — done as AL-5/AL-6 (capability-gated; see [ADMIN-LAYER-PLAN.md §11](ADMIN-LAYER-PLAN.md#11-supply-management--mint--burn-al-5--al-6))
+12. Delegation/operator model — partially via the `Admin` role + provider-managed accounts
 13. Hold standard extension API
 
 ## 10. References

@@ -28,7 +28,7 @@ import SimpleToken.Admin.Roles (Role(..), delegableRole)
 -- issuance so the create site is single-sourced.
 mkRoleCapability : Party -> Party -> Role -> Optional InstrumentId -> Update (ContractId RoleCapability)
 mkRoleCapability admin assignee role scope =
-  create RoleCapability with admin; assignee; role; scope
+  create RoleCapability with admin; assignee; role; scope; mintAllowance = None
 
 -- | Archive a capability issued by this registry. Shared by root and delegated
 -- revocation. `mayRevokeRole` decides which roles the caller is allowed to
@@ -46,8 +46,9 @@ revokeIssuedCapability admin mayRevokeRole capCid = do
 
 -- | Assert `caller` is a governance delegate of this registry: holds a
 -- registry-wide `Admin` capability. Single-sources the precondition shared by
--- the delegated issue and revoke choices.
-requireAdminDelegate : Party -> Party -> ContractId RoleCapability -> Update ()
+-- the delegated issue and revoke choices. Returns the validated capability
+-- (callers discard it).
+requireAdminDelegate : Party -> Party -> ContractId RoleCapability -> Update RoleCapability
 requireAdminDelegate caller admin adminCap = requireRole caller Admin admin None adminCap
 
 -- | The genesis governance anchor for a registry. `admin` is the immutable
@@ -72,6 +73,24 @@ template TokenAdministrator
         scope : Optional InstrumentId   -- ^ None = registry-wide; Some = single instrument.
       controller admin
       do mkRoleCapability admin assignee role scope
+
+    -- | Root issues a capped `Minter` capability with a D3 mint allowance.
+    -- (`Admin_IssueRole … Minter` issues an *unlimited* minter, `mintAllowance =
+    -- None`; this choice issues a *bounded* one.) Minter is root-managed, so this
+    -- lives only on the root anchor, controlled by `admin`.
+    --
+    -- # Invariants enforced:
+    -- - INV-36: a capped allowance is non-negative (also enforced by RoleCapability `ensure`)
+    nonconsuming choice Admin_IssueCappedMinter : ContractId RoleCapability
+      with
+        assignee : Party                -- ^ Party to receive the Minter capability.
+        scope : Optional InstrumentId   -- ^ None = registry-wide; Some = single instrument.
+        allowance : Decimal             -- ^ Initial remaining mint allowance.
+      controller admin
+      do
+        assertMsg eMintAllowanceNegative (allowance >= 0.0)
+        create RoleCapability with
+          admin; assignee; role = Minter; scope; mintAllowance = Some allowance
 
     -- | Root revokes a capability by archiving it (any role, including Admin).
     --

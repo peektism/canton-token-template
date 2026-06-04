@@ -17,11 +17,13 @@ import SimpleToken.Admin.Authority
   ( TokenAdministrator(..)
   , Admin_IssueRole(..)
   , Admin_RevokeRole(..)
+  , Admin_IssueCappedMinter(..)
   , Admin_DelegatedIssueRole(..)
   , Admin_DelegatedRevokeRole(..)
   )
 import SimpleToken.Admin.Capability (RoleCapability)
 import SimpleToken.Admin.Roles (Role)
+import SimpleToken.Supply
 
 import Daml.Script
 
@@ -100,6 +102,28 @@ createHolding registry owner amount = do
     amount
     meta = emptyMetadata
   pure (toInterfaceContractId @Holding cid)
+
+-- | Create a locked holding directly (admin + owner sign; lock holder = admin).
+-- Used by clawback tests that need a standalone locked holding. NOTE: this uses
+-- `expiresAt = None`, a TEST-ONLY shape the production factories never create
+-- (they always set `Some executeBefore`/`settleBefore`); a None-expiry lock can
+-- only be consumed by forced burn (`LockedSimpleHolding_Unlock` requires an
+-- expiry). For wrapper-lifecycle tests, originate a real transfer/allocation
+-- instead so the lock carries a deadline.
+createLockedHolding : SimpleRegistry -> Party -> Decimal -> Script (ContractId LockedSimpleHolding)
+createLockedHolding registry owner amount =
+  submitMulti [registry.admin, owner] [] $ createCmd LockedSimpleHolding with
+    admin = registry.admin
+    owner
+    instrumentId = registry.instrumentId
+    amount
+    lock = Lock with
+      holders = [registry.admin]
+      expiresAt = None
+      expiresAfter = None
+      context = Some "test-lock"
+    extraObservers = []
+    meta = emptyMetadata
 
 -- | Create a holding for a specific instrument (for multi-instrument tests).
 createHoldingForInstrument : Party -> Party -> InstrumentId -> Decimal -> Script (ContractId Holding)
@@ -238,3 +262,54 @@ setPaused registry pauser pauserCap newPaused = do
   (rulesCid, disc) <- currentRules registry
   submitWithDisc pauser disc $
     exerciseCmd rulesCid Rules_SetPaused with actor = pauser; pauserCap; newPaused
+
+-- Supply management helpers (mint / burn — AL-5/AL-6)
+------------------------------------------------------
+
+-- | Issue a capped (D3) Minter capability with an instrument scope + allowance.
+issueCappedMinter : SimpleRegistry -> ContractId TokenAdministrator -> Party -> Optional InstrumentId -> Decimal -> Script (ContractId RoleCapability)
+issueCappedMinter registry adminCid assignee scope allowance =
+  submit registry.admin $ exerciseCmd adminCid Admin_IssueCappedMinter with
+    assignee; scope; allowance
+
+-- | Mint `amount` of the registry's instrument to `recipient` as `minter`,
+-- presenting `minterCap`. Discloses the factory and (for the direct path) the
+-- recipient's preapproval; A3 dispatch picks direct vs. proposal automatically.
+mintTo : SimpleRegistry -> Party -> ContractId RoleCapability -> Party -> Decimal -> Script Rules_MintResult
+mintTo registry minter minterCap recipient amount = do
+  (rulesCid, rulesDisc) <- currentRules registry
+  (preapprovalC, preapprovalD) <- lookupPreapprovalContext registry recipient
+  let extraArgs = ExtraArgs with context = preapprovalC; meta = emptyMetadata
+  submitWithDisc minter (rulesDisc <> preapprovalD) $
+    exerciseCmd rulesCid Rules_Mint with
+      minter; minterCap; recipient; amount
+      instrumentId = registry.instrumentId
+      extraArgs
+
+-- | Like `mintTo`, but asserts the mint submission fails (negative tests).
+mintToMustFail : SimpleRegistry -> Party -> ContractId RoleCapability -> Party -> Decimal -> Script ()
+mintToMustFail registry minter minterCap recipient amount = do
+  (rulesCid, rulesDisc) <- currentRules registry
+  (preapprovalC, preapprovalD) <- lookupPreapprovalContext registry recipient
+  let extraArgs = ExtraArgs with context = preapprovalC; meta = emptyMetadata
+  submitWithDiscMustFail minter (rulesDisc <> preapprovalD) $
+    exerciseCmd rulesCid Rules_Mint with
+      minter; minterCap; recipient; amount
+      instrumentId = registry.instrumentId
+      extraArgs
+
+-- | Create the advisory (D2) total-supply contract for the registry instrument.
+createTotalSupply : SimpleRegistry -> Script (ContractId TotalSupply)
+createTotalSupply registry =
+  submit registry.admin $ createCmd TotalSupply with
+    admin = registry.admin; instrumentId = registry.instrumentId; minted = 0.0
+
+-- | Reconcile the advisory total by `delta` (service-side, admin-controlled).
+adjustSupply : SimpleRegistry -> ContractId TotalSupply -> Decimal -> Script (ContractId TotalSupply)
+adjustSupply registry supplyCid delta =
+  submit registry.admin $ exerciseCmd supplyCid TotalSupply_AdjustMinted with delta
+
+-- | Read the advisory total.
+readSupply : SimpleRegistry -> ContractId TotalSupply -> Script Decimal
+readSupply registry supplyCid =
+  submit registry.admin $ exerciseCmd supplyCid TotalSupply_Read with actor = registry.admin

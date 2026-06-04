@@ -17,6 +17,8 @@ import SimpleToken.Experimental.Cip112.Account
   , isProviderManagedRegularAccount
   , regularAccountProvider
   )
+import SimpleToken.Admin.Capability (RoleCapability, requireRole)
+import SimpleToken.Admin.Roles (Role(..))
 
 -- | A simple, unlocked holding of a token instrument.
 template SimpleHolding
@@ -28,7 +30,43 @@ template SimpleHolding
     meta : Metadata
   where
     signatory admin, owner
-    ensure amount > 0.0
+    -- INV-39: positive amount and the instrument is governed by this admin (parity
+    -- with the provider-managed templates; keeps capability scoping keyed to a
+    -- consistent admin).
+    ensure amount > 0.0 && instrumentId.admin == admin
+
+    -- | Redemption burn (B3): the owner destroys their own holding (e.g. cash-out).
+    -- Consuming, owner-controlled — no capability needed; the admin consented to
+    -- this choice by being a signatory at creation. Not pause-gated (a reduction,
+    -- consistent with INV-33). Supply reduction is reconciled into `TotalSupply`
+    -- off-ledger (D2 advisory).
+    --
+    -- Note: like the ability to transfer funds away, this lets an owner self-destroy
+    -- a holding ahead of a `ForcedBurn` clawback; clawback/seizure cannot be made
+    -- race-free against a consenting owner. The off-ledger reconciler distinguishes
+    -- redemption (this choice) from forced burn by the archiving event's actor.
+    -- See docs/ADMIN-LAYER-PLAN.md §11.
+    choice SimpleHolding_Burn : ()
+      controller owner
+      do pure ()
+
+    -- | Forced burn / clawback (B3): a `Burner`-capability holder destroys this
+    -- holding without the owner's per-action consent (sanctions, error correction,
+    -- court order). This is the deliberate trust shift — a holding can be DESTROYED
+    -- by the registry, not only moved with owner consent. The owner consented to
+    -- this choice's existence at creation (admin+owner signatories). The capability
+    -- is instrument-scoped, so a `Burner` for one instrument cannot burn another.
+    --
+    -- # Invariants enforced:
+    -- - INV-38: forced burn requires a valid `Burner` capability in scope for this instrument
+    choice SimpleHolding_ForcedBurn : ()
+      with
+        burner : Party                       -- ^ The party invoking the clawback.
+        burnerCap : ContractId RoleCapability -- ^ The burner's Burner capability.
+      controller burner
+      do
+        _ <- requireRole burner Burner admin (Some instrumentId) burnerCap
+        pure ()
 
     interface instance Holding for SimpleHolding where
       view = HoldingView with
@@ -61,7 +99,8 @@ template LockedSimpleHolding
   where
     signatory admin, owner, lock.holders
     observer extraObservers
-    ensure amount > 0.0
+    -- INV-39: positive amount and instrument governed by this admin.
+    ensure amount > 0.0 && instrumentId.admin == admin
 
     -- | Owner can unlock a holding whose lock has expired.
     choice LockedSimpleHolding_Unlock : ContractId SimpleHolding
@@ -72,6 +111,33 @@ template LockedSimpleHolding
           None -> fail "Lock has no expiry and cannot be owner-expired"
           Some t -> assertMsg "Lock has not yet expired" (now >= t)
         create SimpleHolding with admin; owner; instrumentId; amount; meta
+
+    -- | Forced burn / clawback (B3, AL-6) of IN-FLIGHT funds. Closes the gap where
+    -- funds locked in a pending transfer/allocation would be immune to clawback. A
+    -- `Burner`-capability holder seizes the locked holding; the funds are destroyed
+    -- immediately, not returned to the sender. The lock holders are signatories, so
+    -- the archive carries their consent (granted at lock creation).
+    --
+    -- Lifecycle note: the seized holding is referenced by its
+    -- `SimpleTransferInstruction` / `SimpleAllocation` (`lockedHoldingCid`). That
+    -- wrapper can no longer complete (its locked holding is gone) and is left
+    -- dangling until its own deadline (`executeBefore` / `settleBefore`), after
+    -- which it is cleaned up through the standard expire-lock recovery path
+    -- (`expireLockContextKey`), which returns nothing. So the funds are seized at
+    -- once while the wrapper self-cleans within its already-bounded lifetime — the
+    -- accepted trade for immediate in-flight seizure (no per-wrapper force-archive
+    -- choice; see docs/ADMIN-LAYER-PLAN.md §11.4).
+    --
+    -- # Invariants enforced:
+    -- - INV-38: forced burn requires a valid `Burner` capability in scope for this instrument
+    choice LockedSimpleHolding_ForcedBurn : ()
+      with
+        burner : Party                       -- ^ The party invoking the clawback.
+        burnerCap : ContractId RoleCapability -- ^ The burner's Burner capability.
+      controller burner
+      do
+        _ <- requireRole burner Burner admin (Some instrumentId) burnerCap
+        pure ()
 
     interface instance Holding for LockedSimpleHolding where
       view = HoldingView with

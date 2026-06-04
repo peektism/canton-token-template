@@ -4,6 +4,7 @@
 module SimpleToken.Rules where
 
 import DA.TextMap qualified as TextMap
+import DA.Optional (isNone)
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV1
@@ -21,6 +22,7 @@ import SimpleToken.Holding
 import SimpleToken.Preapproval
 import SimpleToken.TransferInstruction
 import SimpleToken.Allocation
+import SimpleToken.Supply (MintProposal(..))
 import SimpleToken.ContextUtils
 import SimpleToken.Reporting (recordHoldingsChangeEvent)
 import SimpleToken.Experimental.Cip112.Account
@@ -30,9 +32,18 @@ import SimpleToken.Experimental.Cip112.Account
   , isBasicAccount
   , isSupportedRegularAccount
   )
-import SimpleToken.Admin.Capability (RoleCapability, requireRole)
-import SimpleToken.Admin.Errors (eRegistryPaused, eRedundantPauseChange)
+import SimpleToken.Admin.Capability (RoleCapability, requireRole, consumeMintAllowance)
+import SimpleToken.Admin.Errors (eRegistryPaused, eRedundantPauseChange, eMintAmountNotPositive, eCappedMinterRequiresPreapproval)
 import SimpleToken.Admin.Roles (Role(..))
+
+-- | Result of `Rules_Mint`. Exactly one of `mintedHoldingCids` (direct path, via
+-- the recipient's preapproval) or `pendingProposalCid` (cold-recipient path, via
+-- a `MintProposal` the recipient accepts) is populated. `minterCapCid` is the
+-- caller's `Minter` capability, possibly rotated if its D3 allowance was decremented.
+data Rules_MintResult = Rules_MintResult with
+    mintedHoldingCids : [ContractId Holding]
+    pendingProposalCid : Optional (ContractId MintProposal)
+    minterCapCid : ContractId RoleCapability
 
 -- | Pausable guard: the OpenZeppelin `whenNotPaused` analogue. Fails the
 -- transaction when the registry is paused.
@@ -112,6 +123,76 @@ template SimpleTokenRules
       with actor : Party  -- ^ The querying party.
       controller actor
       do pure paused
+
+    -- | Mint new supply to `recipient` (AL-5). Gated by the caller's `Minter`
+    -- capability (instrument-scoped) and its D3 allowance. Mint is origination, so
+    -- it is `whenNotPaused`. A3 dispatch: if `recipient` has a `TransferPreapproval`
+    -- (supplied in `extraArgs.context`), the holding is created directly; otherwise
+    -- a `MintProposal` is emitted for the recipient to accept (Canton requires the
+    -- recipient's authority to create their holding). The advisory `TotalSupply`
+    -- (D2) is reconciled off-ledger from the resulting create event, not here.
+    --
+    -- # Invariants enforced:
+    -- - INV-25: blocked while paused
+    -- - INV-35: positive amount, supported instrument, instrument admin == registry admin
+    -- - INV-36: D3 allowance enforced + decremented via `consumeMintAllowance`
+    nonconsuming choice Rules_Mint : Rules_MintResult
+      with
+        minter : Party                        -- ^ The Minter-capability holder.
+        minterCap : ContractId RoleCapability -- ^ The caller's Minter capability.
+        recipient : Party                     -- ^ Party to receive the minted holding.
+        amount : Decimal                      -- ^ Amount to mint.
+        instrumentId : InstrumentId           -- ^ Instrument to mint.
+        extraArgs : ExtraArgs                 -- ^ Carries the recipient preapproval (if any) + meta.
+      controller minter
+      do
+        assertNotPaused paused
+        assertMsg eMintAmountNotPositive (amount > 0.0)
+        assertMsg "instrumentId.admin must match factory admin"
+          (instrumentId.admin == admin)
+        assertMsg "Instrument not supported by this factory"
+          (instrumentId.id `elem` supportedInstruments)
+        -- A3 dispatch: direct mint via the recipient's preapproval, else propose.
+        optPreapprovalCid <- lookupFromContextU @(ContractId TransferPreapproval)
+          extraArgs.context transferPreapprovalContextKey
+        case optPreapprovalCid of
+          Some preapprovalCid -> do
+            -- Direct path: the holding is created atomically in THIS transaction, so
+            -- the D3 allowance can be enforced and decremented atomically here.
+            newCapCid <- consumeMintAllowance minter admin (Some instrumentId) amount minterCap
+            preapproval <- fetch preapprovalCid
+            assertMsg "Preapproval admin does not match factory admin"
+              (preapproval.admin == admin)
+            assertMsg "Preapproval receiver does not match mint recipient"
+              (preapproval.receiver == recipient)
+            holdingCid <- exercise preapprovalCid TransferPreapproval_MintInto with
+              mintInstrumentId = instrumentId
+              amount
+              holdingMeta = extraArgs.meta
+            pure Rules_MintResult with
+              mintedHoldingCids = [holdingCid]
+              pendingProposalCid = None
+              minterCapCid = newCapCid
+          None -> do
+            -- Proposal (cold-recipient) path: the holding is created later, in the
+            -- recipient's accept transaction. Because that splits the mint across two
+            -- transactions controlled by different parties, the D3 allowance cannot be
+            -- enforced/decremented atomically — so this path is restricted to
+            -- UNLIMITED minters (no allowance to enforce or leak). A capped minter
+            -- must mint atomically via the recipient's preapproval. The Minter
+            -- capability is still validated; it is not consumed (None ⇒ no rotation).
+            cap <- requireRole minter Minter admin (Some instrumentId) minterCap
+            assertMsg eCappedMinterRequiresPreapproval (isNone cap.mintAllowance)
+            proposalCid <- create MintProposal with
+              admin
+              recipient
+              instrumentId
+              amount
+              meta = extraArgs.meta
+            pure Rules_MintResult with
+              mintedHoldingCids = []
+              pendingProposalCid = Some proposalCid
+              minterCapCid = minterCap
 
     interface instance TransferFactory for SimpleTokenRules where
       view = TransferFactoryView with

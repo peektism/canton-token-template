@@ -1,0 +1,253 @@
+-- | Mint/Burn tests (AL-5/AL-6): capability-gated supply management.
+-- Mint = A3 dispatch (preapproval-direct or MintProposal); Burn = B3 (owner
+-- redemption + Burner-gated forced clawback); supply = D3 enforced per-minter
+-- allowance + D2 advisory TotalSupply. Invariants #35–#38 (ADMIN-LAYER-PLAN §11).
+--
+-- Negative tests disclose what the failing choice must fetch so the must-fail
+-- lands on the intended guard, not on visibility (see Test.Admin header note).
+module SimpleToken.Test.MintBurn where
+
+import DA.Optional (isNone)
+
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.TransferInstructionV1
+
+import SimpleToken.Holding
+  ( SimpleHolding, SimpleHolding_Burn(..), SimpleHolding_ForcedBurn(..)
+  , LockedSimpleHolding, LockedSimpleHolding_ForcedBurn(..)
+  )
+import SimpleToken.Supply (MintProposal_Accept(..), TotalSupply_AdjustMinted(..))
+import SimpleToken.Admin.Roles (Role(..))
+import SimpleToken.Testing.SimpleRegistry
+import SimpleToken.Testing.WalletClient
+import SimpleToken.Test.Setup
+import SimpleToken.Test.Transfer (mkTransfer)
+
+import Daml.Script
+
+-- A `ContractId Holding` (interface) coerced to its `SimpleHolding` template id,
+-- for exercising template-level burn choices in tests.
+asSimpleHolding : ContractId Holding -> ContractId SimpleHolding
+asSimpleHolding = coerceContractId
+
+-- Mint (AL-5)
+--------------
+
+-- | INV-35: direct mint via the recipient's preapproval creates their holding.
+test_mintDirectViaPreapproval : Script ()
+test_mintDirectViaPreapproval = do
+  TestEnv{..} <- setupTestEnv
+  let bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  minterCap <- issueRole registry adminCid parties.alice Minter   -- unlimited minter
+  _ <- createPreapproval registry bob None
+  result <- mintTo registry parties.alice minterCap bob 500.0
+  assert (length result.mintedHoldingCids == 1)
+  assert (isNone result.pendingProposalCid)
+  checkBalance bob registry.instrumentId 500.0
+
+-- | A3 cold-recipient path: no preapproval → a MintProposal the recipient accepts.
+test_mintProposalWhenNoPreapproval : Script ()
+test_mintProposalWhenNoPreapproval = do
+  TestEnv{..} <- setupTestEnv
+  let bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  minterCap <- issueRole registry adminCid parties.alice Minter
+  result <- mintTo registry parties.alice minterCap bob 300.0
+  assert (null result.mintedHoldingCids)
+  case result.pendingProposalCid of
+    Some proposalCid -> do
+      _ <- submit bob $ exerciseCmd proposalCid MintProposal_Accept
+      checkBalance bob registry.instrumentId 300.0
+    None -> fail "Expected a pending MintProposal"
+
+-- | INV-35: minting requires a Minter capability. A Pauser-cap holder cannot mint.
+test_mintRequiresMinterCapability : Script ()
+test_mintRequiresMinterCapability = do
+  TestEnv{..} <- setupTestEnv
+  adminCid <- createTokenAdministrator registry
+  pauserCap <- issueRole registry adminCid parties.alice Pauser
+  _ <- createPreapproval registry parties.bob None
+  mintToMustFail registry parties.alice pauserCap parties.bob 100.0
+
+-- | INV-30/35: an instrument-scoped Minter cannot mint a different instrument.
+test_mintScopedToInstrument : Script ()
+test_mintScopedToInstrument = do
+  -- registry instrument is "USD"; the registry also supports "EUR".
+  registry <- initializeMulti "admin" ["USD", "EUR"]
+  alice <- allocatePartyByHint (PartyIdHint "alice")
+  bob <- allocatePartyByHint (PartyIdHint "bob")
+  adminCid <- createTokenAdministrator registry
+  let eurId = InstrumentId with admin = registry.admin; id = "EUR"
+  -- A Minter scoped to EUR cannot mint the registry's USD instrument.
+  eurMinter <- issueScopedRole registry adminCid alice Minter eurId
+  _ <- createPreapproval registry bob None
+  mintToMustFail registry alice eurMinter bob 100.0
+  -- A Minter scoped to USD can.
+  usdMinter <- issueScopedRole registry adminCid alice Minter registry.instrumentId
+  _ <- mintTo registry alice usdMinter bob 100.0
+  checkBalance bob registry.instrumentId 100.0
+
+-- | INV-36 (D3): a capped Minter enforces and decrements its allowance.
+test_cappedMinterAllowance : Script ()
+test_cappedMinterAllowance = do
+  TestEnv{..} <- setupTestEnv
+  let bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  cap0 <- issueCappedMinter registry adminCid parties.alice (Some registry.instrumentId) 100.0
+  _ <- createPreapproval registry bob None
+  -- mint 60 (allowance 100 -> 40); the capability CID rotates
+  r1 <- mintTo registry parties.alice cap0 bob 60.0
+  let cap1 = r1.minterCapCid
+  -- minting 50 now exceeds the remaining 40
+  mintToMustFail registry parties.alice cap1 bob 50.0
+  -- minting exactly 40 succeeds (allowance -> 0)
+  _ <- mintTo registry parties.alice cap1 bob 40.0
+  checkBalance bob registry.instrumentId 100.0
+
+-- | INV-36: a capped Minter cannot use the proposal (cold-recipient) path — the
+-- allowance can only be enforced atomically via the recipient's preapproval.
+test_cappedMinterRequiresPreapproval : Script ()
+test_cappedMinterRequiresPreapproval = do
+  TestEnv{..} <- setupTestEnv
+  adminCid <- createTokenAdministrator registry
+  cap <- issueCappedMinter registry adminCid parties.alice (Some registry.instrumentId) 100.0
+  -- bob has NO preapproval → proposal path → rejected for a capped minter
+  mintToMustFail registry parties.alice cap parties.bob 50.0
+
+-- | INV-25: minting is origination — blocked while the registry is paused.
+test_mintBlockedWhilePaused : Script ()
+test_mintBlockedWhilePaused = do
+  TestEnv{..} <- setupTestEnv
+  adminCid <- createTokenAdministrator registry
+  minterCap <- issueRole registry adminCid parties.alice Minter
+  pauserCap <- issueRole registry adminCid registry.admin Pauser
+  _ <- createPreapproval registry parties.bob None
+  _ <- setPaused registry registry.admin pauserCap True
+  mintToMustFail registry parties.alice minterCap parties.bob 100.0
+
+-- Burn (AL-6)
+--------------
+
+-- | B3 redemption: the owner burns their own holding (no capability needed).
+test_ownerRedemptionBurn : Script ()
+test_ownerRedemptionBurn = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+  [h1] <- fundParty registry alice 100.0
+  _ <- submit alice $ exerciseCmd (asSimpleHolding h1) SimpleHolding_Burn
+  checkBalance alice registry.instrumentId 0.0
+
+-- | B3 clawback: a Burner-capability holder force-burns another party's holding;
+-- a non-burner cannot.
+test_forcedBurnRequiresBurnerCap : Script ()
+test_forcedBurnRequiresBurnerCap = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice    -- holder whose funds are clawed back
+      burner = parties.bob     -- the burner delegate
+  adminCid <- createTokenAdministrator registry
+  burnerCap <- issueRole registry adminCid burner Burner
+  pauserCap <- issueRole registry adminCid burner Pauser   -- wrong role for forced burn
+  [h1] <- fundParty registry alice 100.0
+  let shCid = asSimpleHolding h1
+  -- the holding is disclosed to the burner so failures prove the cap check, not visibility
+  holdingDisc <- queryDisc @SimpleHolding registry.admin shCid
+  -- wrong role (Pauser) cannot force-burn
+  submitWithDiscMustFail burner holdingDisc $
+    exerciseCmd shCid SimpleHolding_ForcedBurn with burner; burnerCap = pauserCap
+  -- a valid Burner capability can
+  submitWithDisc burner holdingDisc $
+    exerciseCmd shCid SimpleHolding_ForcedBurn with burner; burnerCap
+  checkBalance alice registry.instrumentId 0.0
+
+-- | INV-38/30: an instrument-scoped Burner cannot force-burn another instrument.
+test_forcedBurnScopedToInstrument : Script ()
+test_forcedBurnScopedToInstrument = do
+  registry <- initializeMulti "admin" ["USD", "EUR"]
+  alice <- allocatePartyByHint (PartyIdHint "alice")
+  burner <- allocatePartyByHint (PartyIdHint "burner")
+  adminCid <- createTokenAdministrator registry
+  let eurId = InstrumentId with admin = registry.admin; id = "EUR"
+  eurBurner <- issueScopedRole registry adminCid burner Burner eurId
+  h1 <- createHoldingForInstrument registry.admin alice registry.instrumentId 100.0  -- USD holding
+  let shCid = asSimpleHolding h1
+  holdingDisc <- queryDisc @SimpleHolding registry.admin shCid
+  -- EUR-scoped Burner cannot force-burn the USD holding
+  submitWithDiscMustFail burner holdingDisc $
+    exerciseCmd shCid SimpleHolding_ForcedBurn with burner; burnerCap = eurBurner
+  -- a USD-scoped Burner can
+  usdBurner <- issueScopedRole registry adminCid burner Burner registry.instrumentId
+  submitWithDisc burner holdingDisc $
+    exerciseCmd shCid SimpleHolding_ForcedBurn with burner; burnerCap = usdBurner
+  checkBalance alice registry.instrumentId 0.0
+
+-- | INV-38 (AL-6): a Burner can claw back IN-FLIGHT (locked) funds, closing the
+-- gap where locked holdings would be immune to clawback.
+test_forcedBurnLockedHolding : Script ()
+test_forcedBurnLockedHolding = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      burner = parties.bob
+  adminCid <- createTokenAdministrator registry
+  burnerCap <- issueRole registry adminCid burner Burner
+  lockedCid <- createLockedHolding registry alice 100.0
+  holdingDisc <- queryDisc @LockedSimpleHolding registry.admin lockedCid
+  -- a non-burner (wrong role) cannot claw back the locked holding
+  pauserCap <- issueRole registry adminCid burner Pauser
+  submitWithDiscMustFail burner holdingDisc $
+    exerciseCmd lockedCid LockedSimpleHolding_ForcedBurn with burner; burnerCap = pauserCap
+  -- a valid Burner can
+  submitWithDisc burner holdingDisc $
+    exerciseCmd lockedCid LockedSimpleHolding_ForcedBurn with burner; burnerCap
+  checkBalance alice registry.instrumentId 0.0
+
+-- | INV-38 (AL-6): forced burn of funds in-flight behind a REAL pending two-step
+-- transfer seizes them immediately, and the orphaned transfer instruction can no
+-- longer return funds (it is stuck until its deadline, by design — see
+-- ADMIN-LAYER-PLAN §11.4).
+test_forcedBurnSeizesInFlightTransfer : Script ()
+test_forcedBurnSeizesInFlightTransfer = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      burner = parties.charlie
+  adminCid <- createTokenAdministrator registry
+  burnerCap <- issueRole registry adminCid burner Burner
+  [h1] <- fundParty registry alice 100.0
+  -- originate a two-step transfer (no preapproval) → creates a LockedSimpleHolding
+  let transfer = mkTransfer registry alice bob 100.0 [h1]
+  enriched <- getTransferFactory registry transfer emptyExtraArgs
+  result <- submitWithDisc alice enriched.disclosures $
+    exerciseCmd enriched.factoryCid enriched.arg
+  case result.output of
+    TransferInstructionResult_Pending instrCid -> do
+      [(lockedCid, _)] <- query @LockedSimpleHolding registry.admin
+      holdingDisc <- queryDisc @LockedSimpleHolding registry.admin lockedCid
+      -- burner seizes the in-flight (locked) funds
+      submitWithDisc burner holdingDisc $
+        exerciseCmd lockedCid LockedSimpleHolding_ForcedBurn with burner; burnerCap
+      -- the funds are gone: the pending transfer can no longer be withdrawn
+      -- (its locked holding was seized) — the wrapper is stuck until its deadline
+      submitMustFail alice $
+        exerciseCmd instrCid TransferInstruction_Withdraw with extraArgs = emptyExtraArgs
+      -- and the funds are nowhere: seized from both sender and receiver
+      checkBalance alice registry.instrumentId 0.0
+      checkBalance bob registry.instrumentId 0.0
+    _ -> fail "Expected Pending"
+
+-- Supply observability (D2)
+----------------------------
+
+-- | INV-37 (D2): the advisory TotalSupply reconciles up and down and never goes
+-- negative.
+test_totalSupplyObservability : Script ()
+test_totalSupplyObservability = do
+  TestEnv{..} <- setupTestEnv
+  supply0 <- createTotalSupply registry
+  supply1 <- adjustSupply registry supply0 100.0   -- mint reconciliation
+  supply2 <- adjustSupply registry supply1 (-30.0)  -- burn reconciliation
+  total <- readSupply registry supply2
+  assert (total == 70.0)
+  -- driving the advisory total negative is rejected
+  submitMustFail registry.admin $
+    exerciseCmd supply2 TotalSupply_AdjustMinted with delta = -1000.0

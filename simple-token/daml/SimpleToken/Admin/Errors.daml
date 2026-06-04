@@ -47,3 +47,30 @@ eCapabilityNotIssuedByThisAdmin = "simple-token: capability was not issued by th
 -- delegate-vs-root governance changes.
 eRoleNotDelegable : Text
 eRoleNotDelegable = "simple-token: this role can only be managed by the genesis root"
+
+-- Supply management (mint / burn — AL-5/AL-6)
+----------------------------------------------
+
+-- | INV-35: a mint must be for a positive amount of a supported instrument.
+eMintAmountNotPositive : Text
+eMintAmountNotPositive = "simple-token: mint amount must be positive"
+
+-- | INV-36 (D3): a capped Minter capability cannot mint beyond its remaining allowance.
+eMintAllowanceExceeded : Text
+eMintAllowanceExceeded = "simple-token: mint exceeds the Minter capability's remaining allowance"
+
+-- | A capped-minter allowance must be non-negative.
+eMintAllowanceNegative : Text
+eMintAllowanceNegative = "simple-token: mint allowance must be non-negative"
+
+-- | INV-36 (D3): a capped Minter must mint atomically into a pre-authorized
+-- recipient (preapproval-direct path). The proposal (cold-recipient) path splits
+-- the mint across two transactions controlled by different parties and so cannot
+-- atomically enforce/decrement the allowance — it is restricted to unlimited
+-- minters. See docs/ADMIN-LAYER-PLAN.md §11.
+eCappedMinterRequiresPreapproval : Text
+eCappedMinterRequiresPreapproval = "simple-token: a capped Minter must mint via the recipient's preapproval (no proposal path)"
+
+-- | Reconciling supply must not drive the advisory total negative.
+eSupplyWouldGoNegative : Text
+eSupplyWouldGoNegative = "simple-token: total-supply adjustment would go negative"
