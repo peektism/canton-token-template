@@ -1,0 +1,23 @@
+-- | The closed set of administrative roles for the AccessControl layer.
+--
+-- Using a sum type (rather than free `Text`, as in EVM's `bytes32` role ids)
+-- keeps role identifiers exhaustive, typo-proof, and lintable — see
+-- docs/ADMIN-LAYER-PLAN.md §1 (correction C4). New roles are added here as the
+-- registry grows; every consumer that pattern-matches on `Role` is then forced
+-- by the compiler to handle the new case.
+module SimpleToken.Admin.Roles where
+
+-- | A single administrative capability a registry administrator can grant.
+--
+-- `Admin` is the root governance role — the OpenZeppelin `DEFAULT_ADMIN_ROLE` /
+-- `Ownable` owner analogue. A holder of an `Admin` capability may issue and
+-- revoke other capabilities (delegated governance), which is how operational
+-- "ownership" is handed to a new party without reassigning the immutable
+-- instrument admin party. See docs/ADMIN-LAYER-PLAN.md §5.
+data Role
+  = Minter          -- ^ May create holdings out of band (future mint slice).
+  | Burner          -- ^ May archive holdings out of band (future burn slice).
+  | Pauser          -- ^ May flip the registry pause flag (see SimpleToken.Rules).
+  | BatchProcessor  -- ^ May drive SettlementFactory_SettleBatch on behalf of executors.
+  | Admin           -- ^ Root governance: may issue/revoke capabilities (owner analogue).
+  deriving (Eq, Show)

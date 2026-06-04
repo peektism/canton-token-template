@@ -30,6 +30,25 @@ import SimpleToken.Experimental.Cip112.Account
   , isBasicAccount
   , isSupportedRegularAccount
   )
+import SimpleToken.Admin.Capability (RoleCapability, requireRole)
+import SimpleToken.Admin.Errors (eRegistryPaused)
+import SimpleToken.Admin.Roles (Role(..))
+
+-- | Pausable guard: the OpenZeppelin `whenNotPaused` analogue. Fails the
+-- transaction when the registry is paused.
+--
+-- Pause is ORIGINATION control: it is checked at the factory chokepoints that
+-- *originate* value movement (new transfers, new allocations, factory-driven
+-- batch settlement) before any state mutation. It deliberately does NOT gate
+-- completion of already-committed flows (accepting a pending transfer, settling
+-- a committed allocation) — those are protected by committed-settlement /
+-- counterparty semantics, and in a keyless UTXO ledger their contracts cannot
+-- read the factory flag without a spoofable context hop anyway. Recovery
+-- (withdraw / reject / cancel) also stays open so funds are never frozen
+-- (INV-33). A per-asset emergency *freeze* is a separate capability, not pause.
+-- See docs/ADMIN-LAYER-PLAN.md §4 and §6.
+assertNotPaused : Bool -> Update ()
+assertNotPaused paused = assertMsg eRegistryPaused (not paused)
 
 -- | Experimental V2 actor guard marker used before delegating into the V1 factory.
 v2TransferFactoryActorFailureMsg : Text
@@ -61,8 +80,36 @@ template SimpleTokenRules
   with
     admin : Party
     supportedInstruments : [Text]
+    paused : Bool  -- ^ Pausable flag; when True all gated factory choices revert.
   where
     signatory admin
+
+    -- | Flip the pause flag. The actor must present a registry-wide `Pauser`
+    -- capability issued by this registry's admin. Recreates the factory with the
+    -- new flag; the contract's own admin authority lets a non-admin pauser
+    -- perform the recreate, while the capability check gates who may do so.
+    --
+    -- # Invariants enforced:
+    -- - INV-26: pausing/unpausing requires a registry-wide Pauser capability
+    choice Rules_SetPaused : ContractId SimpleTokenRules
+      with
+        actor : Party                       -- ^ The party flipping the flag.
+        pauserCap : ContractId RoleCapability -- ^ The actor's registry-wide Pauser capability.
+        newPaused : Bool                    -- ^ Target pause state.
+      controller actor
+      do
+        -- Pausing is registry-wide, so it requires a registry-wide (scope None)
+        -- Pauser capability; an instrument-scoped Pauser cannot halt the registry.
+        requireRole actor Pauser admin None pauserCap
+        create this with paused = newPaused
+
+    -- | Read the pause flag without archiving. Read-only and ungated so wallets
+    -- can display registry state even while paused (INV-31). The actor must have
+    -- the factory disclosed to exercise it (the off-ledger service provides this).
+    nonconsuming choice Rules_GetPaused : Bool
+      with actor : Party  -- ^ The querying party.
+      controller actor
+      do pure paused
 
     interface instance TransferFactory for SimpleTokenRules where
       view = TransferFactoryView with
@@ -70,6 +117,8 @@ template SimpleTokenRules
         meta = emptyMetadata
 
       transferFactory_transferImpl _selfCid arg = do
+        -- INV-25: Pausable guard, before any validation or state mutation
+        assertNotPaused paused
         let transfer = arg.transfer
         -- Invariant #1: expectedAdmin matches admin
         assertMsg "expectedAdmin does not match factory admin"
@@ -131,6 +180,8 @@ template SimpleTokenRules
         TokenStandard.transferFactoryV2_privateAsset_transferExtraObserversDefaultImpl
 
       transferFactory_transferImpl selfCid arg = do
+        -- INV-25: Pausable guard (V2 path)
+        assertNotPaused paused
         if isBasicAccount arg.transfer.sender && isBasicAccount arg.transfer.receiver
           then do
             let sender = TokenStandard.accountPrincipal arg.transfer.instrumentId.admin arg.transfer.sender
@@ -158,6 +209,8 @@ template SimpleTokenRules
         meta = emptyMetadata
 
       allocationFactory_allocateImpl _selfCid arg = do
+        -- INV-25: Pausable guard (V1 allocation path)
+        assertNotPaused paused
         let leg = arg.allocation.transferLeg
             settlement = arg.allocation.settlement
         -- Invariant #1: expectedAdmin matches admin
@@ -245,6 +298,8 @@ template SimpleTokenRules
         TokenStandard.allocationFactoryV2_privateAsset_allocateExtraObserversDefaultImpl
 
       allocationFactory_allocateImpl _selfCid arg = do
+        -- INV-25: Pausable guard (V2 allocation path)
+        assertNotPaused paused
         let allocation = arg.allocation
         assertMsg "V2 allocation admin must match factory admin"
           (allocation.admin == admin)
@@ -292,6 +347,8 @@ template SimpleTokenRules
         TokenStandard.settlementFactoryV2_privateAsset_settleBatchExtraObserversDefaultImpl
 
       settlementFactory_settleBatchImpl selfCid arg = do
+        -- INV-25: Pausable guard (V2 settlement path)
+        assertNotPaused paused
         assertMsg v2SettlementFactoryActorFailureMsg
           (samePartySet arg.settlement.executors arg.actors)
         assertMsg "V2 settlement transfer legs or allocations must not be empty"

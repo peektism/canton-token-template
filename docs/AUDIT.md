@@ -173,6 +173,43 @@ per-account allocation model and is re-run against this code.
 | CIP112-A1: settlement actor authorization | Direct `Allocation_Settle` requires `admin + executors`; factory settlement requires `executors` and supplies default allocation actors. | TARGET; covered today by focused negative tests |
 | CIP112-A2: direct/factory validation boundary | Direct `Allocation_Settle` performs local actor and extra-side argument validation only; full batch transfer-leg shape and authorization matching remain factory-owned. | TARGET; covered today by focused negative tests |
 
+### Admin Layer Invariants (AccessControl / Ownable-as-Admin-role / Pausable)
+
+Introduced by slices AL-0..AL-3 (see [ADMIN-LAYER-PLAN.md §7](ADMIN-LAYER-PLAN.md#7-security-invariants-extends-planmd-9)).
+Covered today by Daml Script tests in `Test/Admin.daml`; the `daml-verify` rows
+are proof *targets*, not completed claims, until the symbolic model grows a
+capability relation.
+
+| Invariant | Statement | Status |
+|-----------|-----------|--------|
+| INV-25 | No factory **origination** choice (transfer V1/V2, allocation V1/V2, settlement-via-factory) succeeds while `paused` | Script: `test_pauseBlocksTransfer`, `test_pauseBlocksAllocation` |
+| INV-26 | Pause/unpause requires a **registry-wide** `Pauser` capability | Script: `test_pauseRequiresPauserCap` |
+| INV-27 | Capability honored only if `cap.admin == registry admin` | Script: `test_capabilityImpersonationFails` (indirect) |
+| INV-28 | Capability honored only if `cap.assignee == caller` (anti-impersonation) | Script: `test_capabilityImpersonationFails` |
+| INV-29 | Capability honored only if `cap.role == required role` | Script: `test_pauseRequiresPauserCap`, `test_nonAdminCannotDelegateIssue` |
+| INV-30 | Capability scope must authorize the operation (instrument-scoped cap ≠ registry-wide op) | Script: `test_scopedCapabilityCannotPauseRegistry` |
+| INV-31 | Capabilities issued/revoked only by the root `admin` or an `Admin`-capability holder | Script: `test_delegatedAdminGovernance`, `test_nonAdminCannotDelegateIssue` |
+| INV-32 | A revoked capability can no longer authorize | Script: `test_revokeRole`, `test_revokedAdminCannotDelegate` |
+| INV-33 | Pause is origination control, not a fund freeze: recovery + committed-settlement completion stay open | Script: `test_pauseAllowsRecoveryBlocksOrigination` |
+| INV-34 | Read-only `Rules_GetPaused` succeeds while paused | Script: `test_publicFetchWhilePaused` |
+| admin-authorization | `requireRole` rejects every `(caller, role, admin, scope)` tuple not matching a co-signed capability; `assertNotPaused` is a total guard on the origination set | `daml-verify` TARGET |
+
+> daml-lint note: `Role` is a closed sum type and no admin template has unbounded
+> list fields (`RoleCapability.scope` is `Optional`, not a list) — no new
+> `unbounded-fields` findings.
+
+**Verification run (2026-06-04, SDK 3.4.11 / DPM 1.0.17 / OpenJDK 21.0.11):**
+`scripts/verify.sh` → **3 passed, 0 failed**.
+- `daml-lint`: PASS. **No findings in `SimpleToken/Admin/*`** or the new
+  `SimpleTokenRules` choices/`paused` field. The 7 `unbounded-fields` MEDIUMs are
+  all pre-existing on other templates (`extraObservers`, `supportedInstruments`,
+  `senders`, `allocations`, `inputHoldingCids`) — admin-only creation mitigates.
+- `daml-props` (`dpm test`): PASS — **125/125** (incl. 12 `Test/Admin.daml` rows).
+- `daml-verify`: PASS — 14/14 properties. The 9 C/D/T rows model this repo's
+  transfer/allocation logic; the V1–V5 rows are the tool's own stablecoin models.
+  The AccessControl/Pausable proof rows (`admin-authorization`, a `scopeAuthorizes`
+  lemma) remain AL-4 targets (the symbolic model has no capability relation yet).
+
 ## Temporal Proofs (daml-verify)
 
 These proofs establish that time-dependent logic is consistent.

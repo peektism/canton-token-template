@@ -1,0 +1,35 @@
+-- | Error message bindings for the administrative layer (AccessControl /
+-- Ownable-as-Admin-role / Pausable). Collected in one module so messages are
+-- consistent and greppable; referenced from `assertMsg`. Each binding is
+-- annotated with the invariant it enforces (see docs/ADMIN-LAYER-PLAN.md §7).
+module SimpleToken.Admin.Errors where
+
+-- Pausable
+------------
+
+-- | INV-25: gated factory origination choices must fail while the registry is paused.
+eRegistryPaused : Text
+eRegistryPaused = "simple-token: registry is paused"
+
+-- AccessControl (capabilities)
+--------------------------------
+
+-- | INV-27: a capability is only honored for its issuing registry admin.
+eCapabilityAdminMismatch : Text
+eCapabilityAdminMismatch = "simple-token: capability admin does not match registry admin"
+
+-- | INV-28: a capability is only honored for the caller it names (anti-impersonation).
+eCapabilityAssigneeMismatch : Text
+eCapabilityAssigneeMismatch = "simple-token: capability assignee does not match caller"
+
+-- | INV-29: a capability is only honored for the role it carries.
+eCapabilityRoleMismatch : Text
+eCapabilityRoleMismatch = "simple-token: capability role does not match required role"
+
+-- | INV-30: a capability is only honored when its scope authorizes the operation.
+eCapabilityScopeMismatch : Text
+eCapabilityScopeMismatch = "simple-token: capability scope does not authorize this operation"
+
+-- | INV-31: a capability presented for revocation must have been issued by this registry.
+eCapabilityNotIssuedByThisAdmin : Text
+eCapabilityNotIssuedByThisAdmin = "simple-token: capability was not issued by this registry administrator"

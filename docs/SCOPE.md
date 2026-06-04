@@ -107,6 +107,42 @@ Every omitted feature is Splice-specific infrastructure, not CIP-056 requirement
 - 36 tests: 9 transfer + 5 allocation + 2 defrag + 20 security
 - Compatibility with Splice off-ledger APIs (our contracts produce the same interface views and result types the off-ledger service expects)
 
+## 3b. Administrative Layer (Ownable / AccessControl / Pausable)
+
+Design-complete, implementation pending. Authoritative design:
+[ADMIN-LAYER-PLAN.md](ADMIN-LAYER-PLAN.md); slice backlog:
+[PLAN.md §17](PLAN.md#17-active-and-future-slices-admin-layer--cip-112).
+
+Architecture: **AccessControl is the substrate; Ownable and Pausable are its
+specializations** (as in OZ v5). In scope:
+
+- **AccessControl** — `RoleCapability` contracts over a **closed `Role` sum type**
+  (`Minter`/`Burner`/`Pauser`/`BatchProcessor`/`Admin`), with an optional
+  `scope : Optional InstrumentId` for least privilege (registry-wide vs
+  per-instrument). Authorized by proof-by-`fetch` (`requireRole`: co-signed by
+  admin, names the assignee, matches role + scope), not mapping lookups.
+- **Ownable** — the **`Admin` role *is* the owner** (the `DEFAULT_ADMIN_ROLE`
+  analogue). The genesis `admin` party is the fixed cryptographic root;
+  `TokenAdministrator` issues capabilities directly (root) and via delegation
+  (any `Admin`-capability holder, through `Admin_Delegated*`). **Ownership handoff
+  = grant the `Admin` role to a new governance party and revoke the old** — there
+  is no on-ledger reassignment of the instrument `admin` party (it is baked into
+  every `InstrumentId`/holding; reassigning it would orphan assets). Operator key
+  handoff is a Canton topology operation.
+- **Pausable** — a non-spoofable `paused : Bool` flag on `SimpleTokenRules`,
+  checked via `assertNotPaused` at the factory **origination** chokepoints
+  (transfer V1/V2, allocation V1/V2, settlement-via-factory). Pause is
+  *origination control*: committed-settlement completion and recovery
+  (withdraw/reject/cancel) stay open so funds are never frozen. A per-asset
+  *freeze* is a distinct future capability.
+
+Hard constraints: **no contract keys** (Daml LF 2.1) — authority contracts are
+referenced by `ContractId` via the keyless ChoiceContext-by-`ContractId` idiom;
+and the instrument `admin` party is immutable. The source research's keyed
+`TokenAdministrator`/`RoleCapability`/`GlobalPause` and its party-transfer
+`Ownable2Step` do not hold here — see
+[ADMIN-LAYER-PLAN.md §1](ADMIN-LAYER-PLAN.md#1-corrections-to-the-source-research-still-load-bearing).
+
 ## 4. Out of Scope
 
 Items not covered by the omitted feature analysis (section 2).
@@ -184,6 +220,18 @@ Specifically:
 - Wallets using the Splice off-ledger APIs can exercise choices on our contracts without modification.
 
 The off-ledger service provides `ChoiceContext` (with contract IDs like preapprovals) and `disclosedContracts` (for contracts the wallet cannot see but needs to reference) via OpenAPI-aligned endpoints. Our factory reads preapproval contract IDs from `ChoiceContext` under key `"transfer-preapproval"` following the same convention.
+
+The admin layer ([ADMIN-LAYER-PLAN.md](ADMIN-LAYER-PLAN.md)) reuses this exact
+mechanism for keyless authority references (since LF 2.1 has no contract keys):
+
+- `"simple-token/role-capability"` — the caller's `RoleCapability` CID, disclosed
+  for capability-gated choices (future mint/burn, `BatchProcessor` settlement).
+- Pause state is **not** a context key — it is a field on the factory contract
+  itself (non-spoofable), read via `Rules_PublicFetchPaused`.
+- Because the registry API returns the current factory CID + `ChoiceContext` on
+  every transfer-factory request, pausing (which rotates the factory CID) is
+  transparent to compliant wallets. This supersedes the older Q11 "pause = archive
+  the factory" answer with a recoverable, observable flag.
 
 OpenAPI endpoint structure (implemented by Splice off-ledger service):
 - Metadata: `GET /registry/metadata/v1/info`, `/instruments`, `/instruments/{instrumentId}`

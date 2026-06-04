@@ -1,0 +1,251 @@
+-- | Admin layer tests: AccessControl (capabilities + Admin role = owner) and
+-- Pausable. Covers PLAN.md §17 slices AL-1..AL-3 and invariants #25–#34
+-- (ADMIN-LAYER-PLAN.md §7).
+module SimpleToken.Test.Admin where
+
+import Splice.Api.Token.TransferInstructionV1
+
+import SimpleToken.Rules (Rules_SetPaused(..), Rules_GetPaused(..))
+import SimpleToken.Admin.Authority
+import SimpleToken.Admin.Capability (RoleCapability)
+import SimpleToken.Admin.Roles (Role(..))
+import SimpleToken.Testing.SimpleRegistry
+import SimpleToken.Testing.WalletClient
+import SimpleToken.Test.Setup
+import SimpleToken.Test.Transfer (mkTransfer)
+import SimpleToken.Test.Allocation (mkAllocationArgs)
+
+import Daml.Script
+
+-- Pausable (AL-1) — origination control at the factory
+--------------------------------------------------------
+
+-- | INV-25: a paused registry rejects new transfers at the factory chokepoint.
+test_pauseBlocksTransfer : Script ()
+test_pauseBlocksTransfer = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+  adminCid <- createTokenAdministrator registry
+  pauserCap <- issueRole registry adminCid registry.admin Pauser
+  _ <- setPaused registry registry.admin pauserCap True
+  [h1] <- fundParty registry alice 100.0
+  let transfer = mkTransfer registry alice alice 100.0 [h1]
+  enriched <- getTransferFactory registry transfer emptyExtraArgs
+  submitWithDiscMustFail alice enriched.disclosures $
+    exerciseCmd enriched.factoryCid enriched.arg
+
+-- | INV-25: a paused registry rejects new allocations at the factory chokepoint.
+test_pauseBlocksAllocation : Script ()
+test_pauseBlocksAllocation = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      exec = parties.executor
+  adminCid <- createTokenAdministrator registry
+  pauserCap <- issueRole registry adminCid registry.admin Pauser
+  _ <- setPaused registry registry.admin pauserCap True
+  [h1] <- fundParty registry alice 100.0
+  let args = mkAllocationArgs registry alice bob exec 70.0 [h1]
+  enriched <- getAllocationFactory registry args
+  submitWithDiscMustFail alice enriched.disclosures $
+    exerciseCmd enriched.factoryCid enriched.arg
+
+-- | Unpausing restores normal operation.
+test_unpauseRestores : Script ()
+test_unpauseRestores = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+  adminCid <- createTokenAdministrator registry
+  pauserCap <- issueRole registry adminCid registry.admin Pauser
+  _ <- setPaused registry registry.admin pauserCap True
+  _ <- setPaused registry registry.admin pauserCap False
+  [h1] <- fundParty registry alice 100.0
+  let transfer = mkTransfer registry alice alice 100.0 [h1]
+  enriched <- getTransferFactory registry transfer emptyExtraArgs
+  result <- submitWithDisc alice enriched.disclosures $
+    exerciseCmd enriched.factoryCid enriched.arg
+  case result.output of
+    TransferInstructionResult_Completed _ -> pure ()
+    _ -> fail "Expected Completed after unpause"
+  checkBalance alice registry.instrumentId 100.0
+
+-- | INV-26: pausing requires a registry-wide Pauser capability. A holder of a
+-- different role (Minter) cannot pause; a genuine, non-admin Pauser delegate can.
+test_pauseRequiresPauserCap : Script ()
+test_pauseRequiresPauserCap = do
+  TestEnv{..} <- setupTestEnv
+  let bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  -- bob holds only a Minter capability
+  minterCap <- issueRole registry adminCid bob Minter
+  (rulesCid, disc) <- currentRules registry
+  submitWithDiscMustFail bob disc $
+    exerciseCmd rulesCid Rules_SetPaused with
+      actor = bob; pauserCap = minterCap; newPaused = True
+  -- with a real Pauser capability, bob (a delegate, not the admin) can pause
+  pauserCap <- issueRole registry adminCid bob Pauser
+  _ <- setPaused registry bob pauserCap True
+  pure ()
+
+-- | INV-30: pausing is registry-wide and rejects an instrument-scoped Pauser
+-- capability (least privilege); a registry-wide Pauser succeeds.
+test_scopedCapabilityCannotPauseRegistry : Script ()
+test_scopedCapabilityCannotPauseRegistry = do
+  TestEnv{..} <- setupTestEnv
+  let bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  -- An instrument-scoped Pauser cannot halt the whole registry.
+  scopedPauser <- issueScopedRole registry adminCid bob Pauser registry.instrumentId
+  (rulesCid, disc) <- currentRules registry
+  submitWithDiscMustFail bob disc $
+    exerciseCmd rulesCid Rules_SetPaused with
+      actor = bob; pauserCap = scopedPauser; newPaused = True
+  -- A registry-wide Pauser does.
+  widePauser <- issueRole registry adminCid bob Pauser
+  _ <- setPaused registry bob widePauser True
+  pure ()
+
+-- | INV-34: read-only pause state is observable while paused.
+test_publicFetchWhilePaused : Script ()
+test_publicFetchWhilePaused = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+  adminCid <- createTokenAdministrator registry
+  pauserCap <- issueRole registry adminCid registry.admin Pauser
+  _ <- setPaused registry registry.admin pauserCap True
+  (rulesCid, disc) <- currentRules registry
+  isPaused <- submitWithDisc alice disc $
+    exerciseCmd rulesCid Rules_GetPaused with actor = alice
+  assert isPaused
+
+-- | INV-33: pause is origination control, not a fund freeze. Under a single
+-- paused state, a NEW transfer (origination) is blocked, while recovery of a
+-- pending two-step transfer (withdraw) still returns funds to the sender.
+test_pauseAllowsRecoveryBlocksOrigination : Script ()
+test_pauseAllowsRecoveryBlocksOrigination = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  pauserCap <- issueRole registry adminCid registry.admin Pauser
+  [h1] <- fundParty registry alice 100.0
+  [h2] <- fundParty registry alice 10.0
+  -- Originate a two-step transfer (alice -> bob) BEFORE pausing.
+  let transfer = mkTransfer registry alice bob 100.0 [h1]
+  enriched <- getTransferFactory registry transfer emptyExtraArgs
+  result <- submitWithDisc alice enriched.disclosures $
+    exerciseCmd enriched.factoryCid enriched.arg
+  case result.output of
+    TransferInstructionResult_Pending instrCid -> do
+      _ <- setPaused registry registry.admin pauserCap True
+      -- ORIGINATION blocked: a new transfer fails while paused.
+      let t2 = mkTransfer registry alice alice 10.0 [h2]
+      e2 <- getTransferFactory registry t2 emptyExtraArgs
+      submitWithDiscMustFail alice e2.disclosures $
+        exerciseCmd e2.factoryCid e2.arg
+      -- RECOVERY allowed: alice withdraws the pending transfer and reclaims funds.
+      withdrawResult <- submit alice $ exerciseCmd instrCid TransferInstruction_Withdraw with
+        extraArgs = emptyExtraArgs
+      case withdrawResult.output of
+        TransferInstructionResult_Failed -> pure ()
+        _ -> fail "Expected Failed after withdraw"
+      checkBalance alice registry.instrumentId 110.0
+    _ -> fail "Expected Pending"
+
+-- AccessControl (AL-2) — capabilities
+---------------------------------------
+
+-- | INV-28: a capability is only valid for the party it names. Presenting
+-- another assignee's capability fails even when the contract is disclosed.
+test_capabilityImpersonationFails : Script ()
+test_capabilityImpersonationFails = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  -- The Pauser capability belongs to bob
+  bobCap <- issueRole registry adminCid bob Pauser
+  (rulesCid, rulesDisc) <- currentRules registry
+  -- Disclose bob's capability so the failure is the auth check, not visibility
+  capDisc <- queryDisc @RoleCapability registry.admin bobCap
+  submitWithDiscMustFail alice (rulesDisc <> capDisc) $
+    exerciseCmd rulesCid Rules_SetPaused with
+      actor = alice; pauserCap = bobCap; newPaused = True
+
+-- | INV-32: a revoked capability can no longer authorize.
+test_revokeRole : Script ()
+test_revokeRole = do
+  TestEnv{..} <- setupTestEnv
+  adminCid <- createTokenAdministrator registry
+  pauserCap <- issueRole registry adminCid registry.admin Pauser
+  -- works before revocation
+  _ <- setPaused registry registry.admin pauserCap True
+  _ <- setPaused registry registry.admin pauserCap False
+  revokeRole registry adminCid pauserCap
+  -- after revocation the capability is archived; using it fails
+  (rulesCid, disc) <- currentRules registry
+  submitWithDiscMustFail registry.admin disc $
+    exerciseCmd rulesCid Rules_SetPaused with
+      actor = registry.admin; pauserCap; newPaused = True
+
+-- Ownable-as-Admin-role (AL-3) — delegated governance
+-------------------------------------------------------
+
+-- | INV-31: ownership-handoff analogue. The genesis admin grants the `Admin`
+-- role to a governance delegate, who then issues a Pauser capability to a third
+-- party — exercising the delegate's authority, anchored to the fixed admin.
+test_delegatedAdminGovernance : Script ()
+test_delegatedAdminGovernance = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice    -- governance delegate
+      bob = parties.bob        -- pauser
+      charlie = parties.charlie
+  adminCid <- createTokenAdministrator registry
+  -- Hand operational governance to alice via an Admin capability.
+  adminCap <- issueRole registry adminCid alice Admin
+  -- alice (a delegate, not the root) mints a Pauser capability for bob.
+  pauserCap <- delegatedIssueRole registry adminCid alice adminCap bob Pauser
+  -- bob pauses with the delegate-issued capability; a transfer is then blocked.
+  _ <- setPaused registry bob pauserCap True
+  [h1] <- fundParty registry charlie 50.0
+  let transfer = mkTransfer registry charlie charlie 50.0 [h1]
+  enriched <- getTransferFactory registry transfer emptyExtraArgs
+  submitWithDiscMustFail charlie enriched.disclosures $
+    exerciseCmd enriched.factoryCid enriched.arg
+
+-- | INV-31/#32: revoking a delegate's Admin capability ends its governance
+-- authority — subsequent delegated issuance fails.
+test_revokedAdminCannotDelegate : Script ()
+test_revokedAdminCannotDelegate = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      charlie = parties.charlie
+  adminCid <- createTokenAdministrator registry
+  adminCap <- issueRole registry adminCid alice Admin
+  -- alice can delegate-issue while holding the Admin capability
+  _ <- delegatedIssueRole registry adminCid alice adminCap bob Pauser
+  -- root revokes alice's Admin capability
+  revokeRole registry adminCid adminCap
+  -- alice can no longer delegate-issue (the Admin capability is archived)
+  adminDisc <- queryDisc @TokenAdministrator registry.admin adminCid
+  submitWithDiscMustFail alice adminDisc $
+    exerciseCmd adminCid Admin_DelegatedIssueRole with
+      caller = alice; adminCap; assignee = charlie; role = Pauser; scope = None
+
+-- | INV-31: a party that can SEE the genesis anchor and its own capability but
+-- holds the wrong role (Pauser, not Admin) cannot perform delegated issuance.
+-- The failure is the role check, not contract visibility.
+test_nonAdminCannotDelegateIssue : Script ()
+test_nonAdminCannotDelegateIssue = do
+  TestEnv{..} <- setupTestEnv
+  let bob = parties.bob
+      charlie = parties.charlie
+  adminCid <- createTokenAdministrator registry
+  -- bob holds a Pauser capability (visible to bob), NOT an Admin capability.
+  bobPauser <- issueRole registry adminCid bob Pauser
+  -- The anchor is disclosed to bob, so the failure proves the Admin-role check.
+  adminDisc <- queryDisc @TokenAdministrator registry.admin adminCid
+  submitWithDiscMustFail bob adminDisc $
+    exerciseCmd adminCid Admin_DelegatedIssueRole with
+      caller = bob; adminCap = bobPauser; assignee = charlie; role = Pauser; scope = None

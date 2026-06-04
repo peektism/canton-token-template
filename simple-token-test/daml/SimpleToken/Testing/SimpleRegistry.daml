@@ -13,6 +13,14 @@ import SimpleToken.Holding
 import SimpleToken.Rules
 import SimpleToken.Preapproval
 import SimpleToken.ContextUtils
+import SimpleToken.Admin.Authority
+  ( TokenAdministrator(..)
+  , Admin_IssueRole(..)
+  , Admin_RevokeRole(..)
+  , Admin_DelegatedIssueRole(..)
+  )
+import SimpleToken.Admin.Capability (RoleCapability)
+import SimpleToken.Admin.Roles (Role)
 
 import Daml.Script
 
@@ -64,6 +72,7 @@ initialize adminName instrumentName = do
   _ <- submit admin $ createCmd SimpleTokenRules with
     admin
     supportedInstruments = [instrumentName]
+    paused = False
   pure SimpleRegistry with admin; instrumentId
 
 -- | Initialize a multi-instrument registry.
@@ -77,6 +86,7 @@ initializeMulti adminName instrumentNames = do
   _ <- submit admin $ createCmd SimpleTokenRules with
     admin
     supportedInstruments = instrumentNames
+    paused = False
   pure SimpleRegistry with admin; instrumentId
 
 -- | Create a holding for a party (admin + owner must sign).
@@ -162,3 +172,55 @@ emptyExtraArgs : ExtraArgs
 emptyExtraArgs = ExtraArgs with
   context = emptyChoiceContext
   meta = emptyMetadata
+
+-- Admin layer helpers (Ownable / AccessControl / Pausable)
+------------------------------------------------------------
+
+-- | Create the genesis governance anchor for the registry administrator.
+createTokenAdministrator : SimpleRegistry -> Script (ContractId TokenAdministrator)
+createTokenAdministrator registry =
+  submit registry.admin $ createCmd TokenAdministrator with admin = registry.admin
+
+-- | Issue a registry-wide role capability to `assignee` via the genesis root.
+issueRole : SimpleRegistry -> ContractId TokenAdministrator -> Party -> Role -> Script (ContractId RoleCapability)
+issueRole registry adminCid assignee role =
+  submit registry.admin $ exerciseCmd adminCid Admin_IssueRole with
+    assignee; role; scope = None
+
+-- | Issue an instrument-scoped (least-privilege) role capability.
+issueScopedRole : SimpleRegistry -> ContractId TokenAdministrator -> Party -> Role -> InstrumentId -> Script (ContractId RoleCapability)
+issueScopedRole registry adminCid assignee role instrumentId =
+  submit registry.admin $ exerciseCmd adminCid Admin_IssueRole with
+    assignee; role; scope = Some instrumentId
+
+-- | Revoke a role capability via the genesis root.
+revokeRole : SimpleRegistry -> ContractId TokenAdministrator -> ContractId RoleCapability -> Script ()
+revokeRole registry adminCid capCid =
+  submit registry.admin $ exerciseCmd adminCid Admin_RevokeRole with capCid
+
+-- | Delegated issuance: `caller` (holding a registry-wide Admin capability) mints
+-- a registry-wide capability for `assignee`. The genesis anchor is disclosed to
+-- the delegate (the off-ledger service provides this disclosure in production).
+delegatedIssueRole : SimpleRegistry -> ContractId TokenAdministrator -> Party -> ContractId RoleCapability -> Party -> Role -> Script (ContractId RoleCapability)
+delegatedIssueRole registry adminCid caller adminCap assignee role = do
+  adminDisc <- queryDisc @TokenAdministrator registry.admin adminCid
+  submitWithDisc caller adminDisc $
+    exerciseCmd adminCid Admin_DelegatedIssueRole with
+      caller; adminCap; assignee; role; scope = None
+
+-- | The current factory contract id together with a disclosure for it.
+currentRules : SimpleRegistry -> Script (ContractId SimpleTokenRules, Disclosures)
+currentRules registry = do
+  [(rulesCid, _)] <- query @SimpleTokenRules registry.admin
+  disc <- queryDisc @SimpleTokenRules registry.admin rulesCid
+  pure (rulesCid, disc)
+
+-- | Pause or unpause the registry as `pauser`, presenting their Pauser
+-- capability. Works whether `pauser` is the admin or a delegated party: the
+-- factory is disclosed, and the factory's own admin authority performs the
+-- recreate while the capability check gates who may trigger it.
+setPaused : SimpleRegistry -> Party -> ContractId RoleCapability -> Bool -> Script (ContractId SimpleTokenRules)
+setPaused registry pauser pauserCap newPaused = do
+  (rulesCid, disc) <- currentRules registry
+  submitWithDisc pauser disc $
+    exerciseCmd rulesCid Rules_SetPaused with actor = pauser; pauserCap; newPaused

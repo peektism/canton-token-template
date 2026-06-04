@@ -1,6 +1,19 @@
 # PLAN: CIP-056 Simple Token Implementation
 
-Status: on-ledger implementation complete (36/36 tests passing)
+Status:
+- **CIP-056 (V1):** on-ledger implementation complete (36/36 tests passing).
+- **CIP-112 (V2):** experimental, non-conformant prototype landed across
+  Holding, Transfer, Allocation, Settlement, AllocationRequest, iterated
+  settlement, and provider-managed accounts — see
+  [CIP-0112-EXTENSION-PLAN.md](CIP-0112-EXTENSION-PLAN.md).
+- **Admin layer (AccessControl / Ownable / Pausable):** implemented and green
+  (slices AL-0..AL-3) under `SimpleToken/Admin/` plus the Pausable chokepoints on
+  `SimpleTokenRules`. Uses the hybrid **AccessControl-as-substrate** model: the
+  `Admin` role is the Ownable owner; Pausable is `Pauser`-gated origination
+  control. 12 tests in `Test/Admin.daml`; full suite **125/125 passing** and
+  `scripts/verify.sh` **3/3** on SDK 3.4.11 / Java 21. Design:
+  [ADMIN-LAYER-PLAN.md](ADMIN-LAYER-PLAN.md); slices:
+  [§17](#17-active-and-future-slices-admin-layer--cip-112).
 
 Scope: see [SCOPE.md](SCOPE.md) for authoritative scope boundaries, out-of-scope items, and post-MVP backlog.
 
@@ -794,8 +807,10 @@ All post-MVP hardening items (SCOPE.md §9, items 1-7) are now resolved:
 
 ## 15. Deferred (Post-MVP)
 
-- Burn/mint extension APIs
-- Delegation/operator model
+Items below are superseded where they now appear as active slices in [§17](#17-active-and-future-slices-admin-layer--cip-112).
+
+- Burn/mint extension APIs → now active as **AL-5/AL-6** (capability-gated)
+- Delegation/operator model → partially active via provider-managed accounts (V2) + `BatchProcessor` role (**AL-3**)
 - Multi-step allocation instructions (`AllocationInstruction` with `Update` workflow)
 - Compliance policy contracts and richer settlement orchestration
 - Fee schedule and holding fee decay
@@ -819,3 +834,109 @@ Known Canton Network constraints relevant to this implementation.
 **Disclosure and privacy:** Canton's privacy model means wallets may not see contracts they need to exercise choices against. Our `extraObservers` field on `LockedSimpleHolding` addresses this for on-ledger flows by ensuring receivers and executors can see locked holdings.
 
 **SDK and Canton version pinning:** The ecosystem is evolving rapidly (Polyglot Canton with EVM support announced late 2025, automated fee calculation via oracles proposed). Pinning SDK versions early and tracking the CHANGELOG is essential. Current pin: SDK 3.4.11, LF 2.1.
+
+---
+
+## 17. Active and Future Slices (Admin Layer + CIP-112)
+
+This section is the authoritative slice backlog for everything beyond the
+completed CIP-056 V1 core. It encompasses (a) the new Ownable / AccessControl /
+Pausable administrative layer and (b) the remaining CIP-112 conformance work,
+sequenced so the security perimeter lands and is verified **before** the V2
+throughput surface depends on it.
+
+Conventions: each slice is non-release and locally validated (`dpm build` +
+`dpm test` + `scripts/verify.sh`) unless noted. Design authority for the admin
+layer is [ADMIN-LAYER-PLAN.md](ADMIN-LAYER-PLAN.md); for V2 it is
+[CIP-0112-EXTENSION-PLAN.md](CIP-0112-EXTENSION-PLAN.md). Status legend:
+✅ done · 🔬 experimental prototype landed · 🎯 active/next · 📋 planned.
+
+> **Hard constraint reminder (do not regress):** Daml LF 2.1 has **no contract
+> keys**. No slice below may use `key` / `maintainer` / `lookupByKey` /
+> `fetchByKey`. All admin/capability/pause references go by `ContractId` through
+> `ChoiceContext` + explicit disclosure (the `transferPreapprovalContextKey`
+> idiom). This is why the source research's keyed `TokenAdministrator` /
+> `RoleCapability` / `GlobalPause` designs are **not** implementable as written —
+> see [ADMIN-LAYER-PLAN.md §1](ADMIN-LAYER-PLAN.md#1-corrections-to-the-source-research-read-first).
+
+### 17.1 Admin layer slices (priority — land first)
+
+Status legend: ✅ implemented and tested · 🎯 active/next · 📋 planned.
+
+| Slice | Title | Status | Depends on | Deliverables (as built) |
+|---|---|---|---|---|
+Architecture: the hybrid **AccessControl-as-substrate** model — `Admin` role = the
+Ownable owner (`DEFAULT_ADMIN_ROLE`); Pausable = `Pauser`-gated origination control.
+See [ADMIN-LAYER-PLAN.md §0](ADMIN-LAYER-PLAN.md).
+
+| Slice | Title | Status | Depends on | Deliverables (as built) |
+|---|---|---|---|---|
+| **AL-0** | Module skeleton | ✅ | — | `SimpleToken/Admin/Roles.daml` (closed `Role` sum type incl. `Admin`), `SimpleToken/Admin/Errors.daml`, `roleCapabilityContextKey` in `ContextUtils.daml`. |
+| **AL-1** | Pausable chokepoint | ✅ | AL-0 | `paused : Bool` on `SimpleTokenRules`; `assertNotPaused` injected at the five **origination** impls (transfer V1/V2, allocation V1/V2, settlement-via-factory); `Rules_SetPaused` (registry-wide `Pauser`-gated) + `Rules_GetPaused`. Pause is origination control — committed settlement/completion and recovery stay open ([ADMIN-LAYER-PLAN.md §4](ADMIN-LAYER-PLAN.md#4-pausable--origination-control-simpletokenrules)). Tests: `test_pauseBlocksTransfer`, `test_pauseBlocksAllocation`, `test_unpauseRestores`, `test_publicFetchWhilePaused`, `test_pauseAllowsRecoveryBlocksOrigination` (inv #33), `test_scopedCapabilityCannotPauseRegistry` (inv #30). |
+| **AL-2** | AccessControl capabilities | ✅ | AL-0 | `SimpleToken/Admin/Capability.daml`: `RoleCapability` (with `scope : Optional InstrumentId` for least privilege) + `requireRole` (proof-by-fetch, scope-aware). Tests: `test_capabilityImpersonationFails`, `test_revokeRole`, `test_pauseRequiresPauserCap`. |
+| **AL-3** | Ownable-as-Admin-role + delegated governance | ✅ | AL-2 | `SimpleToken/Admin/Authority.daml`: `TokenAdministrator` (fixed genesis root) with `Admin_IssueRole`/`Admin_RevokeRole` (root) and `Admin_DelegatedIssueRole`/`Admin_DelegatedRevokeRole` (any `Admin`-capability holder). Ownership handoff = grant/revoke the `Admin` role; **no party reassignment, no `OwnershipOffer`** (resolves the desync, C9). Tests: `test_delegatedAdminGovernance`, `test_revokedAdminCannotDelegate`, `test_nonAdminCannotDelegateIssue`. |
+| **AL-4** | Off-ledger + verification wiring | 🎯 | AL-1..AL-3 | ✅ `ChoiceContext`/pause off-ledger semantics in [SCOPE.md §8](SCOPE.md#8-off-ledger-compatibility); ✅ `scripts/verify.sh` runs green (lint/props/verify). 🎯 Remaining: add `daml-props` paused/role rows and a `daml-verify` `admin-authorization` + `scopeAuthorizes` proof model ([AUDIT.md](AUDIT.md)). |
+
+> **Build/verify status:** validated on SDK 3.4.11 / DPM 1.0.17 / OpenJDK 21.
+> `cd simple-token && dpm build` then `cd ../simple-token-test && dpm test` →
+> **125/125 passing** (12 in `Test/Admin.daml`). `scripts/verify.sh` → **3/3**
+> (daml-lint clean on `Admin/*`; daml-props; daml-verify 14/14). The
+> `simple-token-test` package consumes the rebuilt `simple-token` DAR, so build
+> the source package first. Standalone tools install via `scripts/setup.sh`.
+
+### 17.2 CIP-112 V2 slices (gated by the admin layer where applicable)
+
+Prototype slices already landed (historical evidence in CIP-0112-EXTENSION-PLAN.md):
+
+| Slice | Title | Status |
+|---|---|---|
+| V2-1 | Account/Holding compile probe + V2 `Holding` interface | 🔬 |
+| V2-2 | V2 `TransferInstruction` / `TransferFactory` (basic accounts) | 🔬 |
+| V2-3 | V2 `AllocationInstruction` / `Allocation` | 🔬 |
+| V2-4 | `SettlementFactory_SettleBatch` + `TransferEvents` (`EventLog`) | 🔬 |
+| V2-5 | Compatibility matrix + negative tests (§5.4/§5.5 subset) | 🔬 |
+| V2-6 | Provider-managed account authority | 🔬 |
+| V2-7 | V2 `AllocationRequest` workflow | 🔬 |
+| V2-8 | Iterated settlement + partial-progress (`numIterations`) | 🔬 |
+
+Active / planned V2 slices:
+
+| Slice | Title | Status | Depends on | Notes |
+|---|---|---|---|---|
+| **V2-9** | Pause the V2 origination chokepoints | ✅ | AL-1 | Done as part of AL-1: `assertNotPaused` sits on the V2 transfer/allocation factories and `SettlementFactory_SettleBatch`. By design, completion of committed flows (`Allocation_Settle`, `TransferInstruction_Accept`) is **not** gated — origination-control semantics ([ADMIN-LAYER-PLAN.md §4](ADMIN-LAYER-PLAN.md#4-pausable--origination-control-simpletokenrules), §6). |
+| **V2-10** | `BatchProcessor`-gated `SettlementFactory_SettleBatch` | 📋 | AL-2 | Optional delegated matching-engine path: a capability holder drives the batch on behalf of executors. Replaces the research's invented `MatchingEngineRole`/`V2BatchTransferFactory` (corrections C5). |
+| **V2-11** | V1/V2-compatible `Allocation` (`SimpleAllocationV1Compat`) | 📋 | V2-3 | CIP-0112 §5.1 dual-implementation. Open question TT-Q-002 (subset vs parallel template). |
+| **V2-12** | Receipt allocations + `extraReceiptAuthorizers` | 📋 | V2-8 | **Blocked**: preview DAR omits the draft field; re-baseline with CIP authors (CIP-0112-EXTENSION-PLAN blocker evidence). |
+| **V2-13** | Reduced-privacy / public-asset observer mode (§4.3.5.3) | 📋 | V2-4 | Opt-in observer expansion; default stays private-asset baseline. |
+| **V2-14** | View-count baselines (§4.3.5: 28/21/25/4-view) + 3-trader batch | 📋 | V2-4 | Privacy-optimization evidence; test-only. |
+| **V2-15** | Broader transfer-event reporting (direct/self/reject/withdraw) | 📋 | V2-4 | Mixed V1/V2 parsing + metadata fallback. |
+| **V2-16** | CIP-0112 conformance matrix (full §5.4/§5.5) | 📋 | V2-9..V2-15 | Source-of-record gate: requires an **accepted** (non-preview) DAR set; currently pinned to `origin/token-standard-v2-daml-preview` `b91de5d4…`. |
+
+### 17.3 Sequencing rationale
+
+1. **AL-0 → AL-1 → AL-2 → AL-3** first: the research's central thesis is
+   "establish the administrative perimeter before enabling V2 throughput." We
+   honor it literally — Pausable and AccessControl land and are tested before
+   any V2 slice takes a dependency on them.
+2. **V2-9** is satisfied by AL-1: the V2 origination chokepoints already carry
+   `assertNotPaused`. Pause is origination control; committed-settlement
+   completion is intentionally ungated (the only robustly enforceable semantic in
+   a keyless UTXO ledger — see [ADMIN-LAYER-PLAN.md §4](ADMIN-LAYER-PLAN.md#4-pausable--origination-control-simpletokenrules)).
+3. Remaining V2 slices (V2-10..V2-16) proceed per CIP-0112-EXTENSION-PLAN, each
+   gated by the now-present admin layer.
+4. **Release gate (all slices):** the preview DAR source-of-record
+   (M1-PF-001 / CIP-112-D-002) and AGPL→MIT extraction boundary (M1-PF-004) must
+   be resolved before any conformance or public-API claim. Nothing in §17
+   changes those gates.
+
+### 17.4 Explicitly excluded (with rationale)
+
+Per [ADMIN-LAYER-PLAN.md §10](ADMIN-LAYER-PLAN.md#10-out-of-scope-for-this-layer)
+and the research corrections:
+
+- **Keyed `GlobalPause` / `TokenAdministrator` / `RoleCapability`** — impossible on LF 2.1 (corrections C1/C2/C3).
+- **On-ledger transfer of the instrument `admin` party (`OwnershipOffer` / a separate transferable `owner` field)** — the admin party is baked into every `InstrumentId`/holding, so it cannot move without re-issuing assets (correction C9). Ownership is the **`Admin` role**: handoff = grant/revoke the `Admin` capability. Operator key handoff is a Canton topology operation.
+- **`V2BatchTransferFactory` (foldlA array dispatch)** — not the real CIP-112 surface (correction C5).
+- **`V2OmnibusAccount`, Memo Pledge, CDP/`SecuritiesIntermediaryRole`/`LiquidatorRole`, `BridgeEscrowRole`** — stablecoin/custody/bridge use-cases; consume the `Role` primitive from sibling repos, not built here (correction C7).
+- **Spoofable pause guards on committed-settlement choices** — pause is origination control; a per-asset emergency *freeze* is a separate future capability (correction: see [ADMIN-LAYER-PLAN.md §4](ADMIN-LAYER-PLAN.md#4-pausable--origination-control-simpletokenrules)).
+- **Per-role admin hierarchy (`getRoleAdmin`) / two-step / timelocked issuance / on-ledger multisig** — named extension seams; the `Admin` role + Canton topology cover the MVP (see [ADMIN-LAYER-PLAN.md §5](ADMIN-LAYER-PLAN.md#5-ownable-as-admin-role-adminauthoritydaml)).

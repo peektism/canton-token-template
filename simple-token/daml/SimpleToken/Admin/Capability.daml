@@ -1,0 +1,81 @@
+-- | AccessControl capability contracts — the substrate of the whole admin layer.
+--
+-- A `RoleCapability` is a bearer credential, co-signed by the registry
+-- administrator, that grants one `Role` to one `assignee`, optionally scoped to
+-- a single instrument. Possession of a valid capability *is* the authorization:
+-- a gated choice fetches the capability the caller presents and asserts it is
+-- admin-signed, names the caller, carries the required role, and is in scope.
+-- This replaces EVM's runtime role-map lookups with a cryptographic signatory
+-- check (docs/ADMIN-LAYER-PLAN.md §3).
+--
+-- Ownable and Pausable are not separate mechanisms: the `Admin` role is the
+-- owner / `DEFAULT_ADMIN_ROLE`, and pause is gated on a `Pauser` capability.
+--
+-- Keyless by necessity — Daml LF 2.1 dropped contract keys. Capabilities are
+-- referenced by `ContractId`, delivered to gated choices through the existing
+-- `ChoiceContext` plumbing (`ContextUtils.roleCapabilityContextKey`) or as an
+-- explicit choice argument.
+module SimpleToken.Admin.Capability where
+
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import SimpleToken.Admin.Errors
+import SimpleToken.Admin.Roles (Role)
+
+-- | A capability granting `assignee` a single `role` over the registry governed
+-- by `admin`, optionally narrowed to one instrument via `scope`.
+--
+-- `admin` is the immutable registry root party (the instrument issuer). Every
+-- instrument on a `SimpleTokenRules` shares that admin, so a `scope = None`
+-- capability is registry-wide; `scope = Some iid` is least-privilege, valid only
+-- for that instrument. Operational "ownership" is the `Admin` role; handing it
+-- to a new governance party (and revoking the old) is the ownership-transfer
+-- analogue — no party reassignment, no rebind. See docs/ADMIN-LAYER-PLAN.md §5.
+template RoleCapability
+  with
+    admin : Party                   -- ^ The registry root party that issued this capability.
+    assignee : Party                -- ^ The party granted the role.
+    role : Role                     -- ^ The single role granted.
+    scope : Optional InstrumentId   -- ^ None = registry-wide; Some = limited to that instrument.
+  where
+    -- INV-31: only the registry root (or its delegate, via TokenAdministrator)
+    -- can mint a capability; it is admin-signed and therefore unforgeable.
+    signatory admin
+    -- The assignee can see (and present) their own capability, nothing more.
+    observer assignee
+
+-- | Does a capability's scope authorize an operation requiring `requiredScope`?
+--
+-- A registry-wide capability (`None`) authorizes any operation. An
+-- instrument-scoped capability authorizes only operations on that exact
+-- instrument — in particular it does NOT authorize registry-wide operations
+-- (e.g. pausing the whole registry), preserving least privilege.
+scopeAuthorizes : Optional InstrumentId -> Optional InstrumentId -> Bool
+scopeAuthorizes capScope requiredScope = case capScope of
+  None -> True
+  Some s -> requiredScope == Some s
+
+-- | Assert that `caller` holds `role` for the registry governed by
+-- `expectedAdmin`, in scope for `requiredScope`. Fetches the presented
+-- capability and validates it.
+--
+-- `requiredScope = None` denotes a registry-wide operation (e.g. pause, role
+-- management); `requiredScope = Some iid` denotes an operation on instrument
+-- `iid` (e.g. minting that instrument).
+--
+-- # Invariants enforced:
+-- - INV-27: capability admin must equal the registry admin
+-- - INV-28: capability assignee must equal the caller (anti-impersonation)
+-- - INV-29: capability role must equal the required role
+-- - INV-30: capability scope must authorize the operation's scope
+--
+-- Soundness without keys: the capability is admin-signed (unforgeable) and
+-- names a specific assignee, so the worst an adversary can do is present a
+-- capability they do not hold and fail their own authorization.
+requireRole : Party -> Role -> Party -> Optional InstrumentId -> ContractId RoleCapability -> Update ()
+requireRole caller role expectedAdmin requiredScope capCid = do
+  cap <- fetch capCid
+  assertMsg eCapabilityAdminMismatch (cap.admin == expectedAdmin)
+  assertMsg eCapabilityAssigneeMismatch (cap.assignee == caller)
+  assertMsg eCapabilityRoleMismatch (cap.role == role)
+  assertMsg eCapabilityScopeMismatch (scopeAuthorizes cap.scope requiredScope)
