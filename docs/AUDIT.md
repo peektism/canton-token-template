@@ -19,6 +19,15 @@ Three open-source verification tools and manual code review by the author were u
 
 ## Tools Used
 
+> **Tool provenance.** The three tools are independent OpenZeppelin repos that
+> live in the shared workspace `$CANTON_TOOLS_HOME` (`/Users/amar/canton-tools`):
+> `tools/daml-lint`, `tools/daml-props`, `tools/daml-verify` (see
+> `$CANTON_TOOLS_HOME/AGENTS.md`). The `canton-token-template/tools/` copies are
+> convenience clones produced by `scripts/setup.sh`; the **canonical source and
+> the target for extensions (e.g. AL-4's `daml-verify` capability relation) is the
+> upstream repo, contributed via a feature branch + PR** — see
+> [PLAN.md §17.6](PLAN.md#176-tooling-workspace-canton_tools_home--contribution-model).
+
 ### daml-lint (Static Analysis)
 
 Static analyzer for DAML that catches security anti-patterns through AST pattern matching. 6 detectors covering missing ensure clauses, unguarded division, missing positive-amount checks, archive-before-execute, head-of-list on queries, and unbounded fields.

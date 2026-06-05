@@ -889,7 +889,7 @@ across five fix rounds for the admin layer and two for mint/burn. **AL-4**
 | **AL-1** | Pausable chokepoint | ✅ | AL-0 | `paused : Bool` on `SimpleTokenRules`; `assertNotPaused` injected at the five **origination** impls (transfer V1/V2, allocation V1/V2, settlement-via-factory); `Rules_SetPaused` (registry-wide `Pauser`-gated) + `Rules_GetPaused`. Pause is origination control — committed settlement/completion and recovery stay open ([ADMIN-LAYER-PLAN.md §4](ADMIN-LAYER-PLAN.md#4-pausable--origination-control-simpletokenrules)). Tests: `test_pauseBlocksTransfer`, `test_pauseBlocksAllocation`, `test_unpauseRestores`, `test_publicFetchWhilePaused`, `test_pauseAllowsRecoveryBlocksOrigination` (inv #33), `test_scopedCapabilityCannotPauseRegistry` (inv #30). |
 | **AL-2** | AccessControl capabilities | ✅ | AL-0 | `SimpleToken/Admin/Capability.daml`: `RoleCapability` (with `scope : Optional InstrumentId` for least privilege) + `requireRole` (proof-by-fetch, scope-aware). Tests: `test_capabilityImpersonationFails`, `test_revokeRole`, `test_pauseRequiresPauserCap`. |
 | **AL-3** | Ownable-as-Admin-role + delegated governance | ✅ | AL-2 | `SimpleToken/Admin/Authority.daml`: `TokenAdministrator` (fixed genesis root) with `Admin_IssueRole`/`Admin_RevokeRole` (root) and `Admin_DelegatedIssueRole`/`Admin_DelegatedRevokeRole` (any `Admin`-capability holder). The **`Admin` role is root-managed** — delegates issue/revoke only roles for which the single-source `delegableRole` policy is `True` (today just `Pauser`; `Admin` and reserved roles are root-only — no re-delegation, no reserved-role pre-minting), via single-sourced `mkRoleCapability`/`revokeIssuedCapability` helpers. Ownership handoff = grant/revoke the `Admin` role; **no party reassignment, no `OwnershipOffer`** (resolves the desync, C9). The `delegableRole` policy is enforced at **compile time** (`-Werror=incomplete-patterns` in `simple-token/daml.yaml`): a new `Role` without a delegation decision fails the build. Tests: `test_delegatedAdminGovernance`, `test_revokedAdminCannotDelegate`, `test_nonAdminCannotDelegateIssue`, `test_delegatedRevoke`, `test_delegatedCannotRevokeAdmin`. |
-| **AL-4** | Verification model for the admin/supply layer | 🎯 | AL-1..AL-3, AL-5/6 | ✅ `ChoiceContext`/pause off-ledger semantics in [SCOPE.md §8](SCOPE.md#8-off-ledger-compatibility); ✅ `scripts/verify.sh` runs green (lint/props/verify). 🎯 **Remaining (the next admin-layer task):** grow `daml-props` rows (pause / role-authorization / mint-allowance conservation) and a `daml-verify` symbolic model with a capability relation (`admin-authorization`, `scopeAuthorizes`, capped-mint conservation) so invariants #25–#39 move from Daml-Script-covered to Z3-proved ([AUDIT.md](AUDIT.md)). |
+| **AL-4** | Verification model for the admin/supply layer | 🎯 | AL-1..AL-3, AL-5/6 | ✅ `ChoiceContext`/pause off-ledger semantics in [SCOPE.md §8](SCOPE.md#8-off-ledger-compatibility); ✅ `scripts/verify.sh` runs green (lint/props/verify). 🎯 **Remaining (the next admin-layer task):** grow `daml-props` rows (pause / role-authorization / mint-allowance conservation) and a `daml-verify` symbolic model with a capability relation (`admin-authorization`, `scopeAuthorizes`, capped-mint conservation) so invariants #25–#39 move from Daml-Script-covered to Z3-proved ([AUDIT.md](AUDIT.md)). These tools live in `$CANTON_TOOLS_HOME/tools/` and are extended via branches + PRs upstream — see [§17.6](#176-tooling-workspace-canton_tools_home--contribution-model). |
 | **AL-5** | Capability-gated Mint | ✅ | AL-2 | `Rules_Mint` (instrument-scoped `Minter`, `whenNotPaused`) with **A3 dispatch**: direct via the recipient's `TransferPreapproval` (`TransferPreapproval_MintInto`) or a `MintProposal` (`SimpleToken/Supply.daml`) the recipient accepts. **D3** enforced cap: `RoleCapability.mintAllowance` checked + decremented (`consumeMintAllowance`, atomic on the direct path; the proposal path is unlimited-minters-only — `eCappedMinterRequiresPreapproval`); `Admin_IssueCappedMinter` for bounded minters. **D2** advisory `TotalSupply`, `(admin,instrumentId)`-anchored, service-reconciled via `TotalSupply_AdjustMinted` (not on the hot path). Tests: `test_mint*`, `test_cappedMinterAllowance`, `test_cappedMinterRequiresPreapproval`, `test_totalSupplyObservability`. See [ADMIN-LAYER-PLAN.md §11](ADMIN-LAYER-PLAN.md#11-supply-management--mint--burn-al-5--al-6). |
 | **AL-6** | Capability-gated Burn | ✅ | AL-2 | **B3**: `SimpleHolding_Burn` (owner redemption, no cap, not pause-gated) + `SimpleHolding_ForcedBurn` and `LockedSimpleHolding_ForcedBurn` (instrument-scoped `Burner`-gated clawback, incl. **in-flight/locked** funds — the seized wrapper self-cleans after its deadline). `Minter`/`Burner` are enforced but root-managed (`delegableRole = False`). Tests: `test_ownerRedemptionBurn`, `test_forcedBurn*`, `test_forcedBurnSeizesInFlightTransfer`. |
 
@@ -970,7 +970,7 @@ keeps the suite green and is independently reviewable:
 
 | Order | Slice | Why next / scope | Gating |
 |---|---|---|---|
-| 1 | **AL-4** — formal-verification model | Closes the only open admin-layer item: lift invariants #25–#39 from Daml-Script-covered to Z3-proved by giving `daml-verify` a capability relation + `daml-props` rows (pause / role-auth / capped-mint conservation). Pure verification depth, no new on-ledger surface — lowest risk, highest assurance-per-effort. | none |
+| 1 | **AL-4** — formal-verification model | Closes the only open admin-layer item: lift invariants #25–#39 from Daml-Script-covered to Z3-proved by giving `daml-verify` a capability relation + `daml-props` rows (pause / role-auth / capped-mint conservation). Pure verification depth, no new on-ledger surface — lowest risk, highest assurance-per-effort. **Lands in the `$CANTON_TOOLS_HOME` tool repos via branches + PRs** ([§17.6](#176-tooling-workspace-canton_tools_home--contribution-model)). | none |
 | 2 | **V2-10** — `BatchProcessor`-gated `SettlementFactory_SettleBatch` | Graduates the last reserved role: a delegated matching engine drives batch settlement on behalf of executors via a `BatchProcessor` capability (the real CIP-112 surface, replacing the research's invented `V2BatchTransferFactory`). Decide whether `BatchProcessor` becomes `delegableRole`. | AL-2 |
 | 3 | **V2 provider-managed clawback** (V2 hardening) | The documented V1-only gap: add forced-burn to `ProviderManagedSimpleHolding`/`ProviderManagedLockedHolding` for parity with AL-6, or keep deferred. | V2 source-of-record |
 | 4 | **V2-11 … V2-16** — CIP-112 conformance | V1/V2-compatible allocations, receipt allocations, reduced-privacy observer mode, view-count baselines, broader transfer events, and the full §5.4/§5.5 conformance matrix (per [CIP-0112-EXTENSION-PLAN.md](CIP-0112-EXTENSION-PLAN.md)). | preview→accepted DAR gate |
@@ -984,3 +984,37 @@ conformance or public-API claim.
 (2 new files: `SimpleToken/Supply.daml`, `Test/MintBurn.daml`; plus the new
 `SimpleToken/Admin/` modules and `Test/Admin.daml`). A branch + commit is the
 natural checkpoint before starting AL-4.
+
+### 17.6 Tooling workspace (`CANTON_TOOLS_HOME`) & contribution model
+
+The verification/library tooling that several upcoming slices **extend** lives in
+a shared workspace at `~/canton-tools` (export
+`CANTON_TOOLS_HOME=/Users/amar/canton-tools`; root guide:
+`$CANTON_TOOLS_HOME/AGENTS.md`). Each entry below is an **independent git repo**,
+not part of this repo's history.
+
+| Path under `$CANTON_TOOLS_HOME` | Upstream | Role | Extended by |
+|---|---|---|---|
+| `tools/daml-lint` | `github.com/OpenZeppelin/daml-lint` | Rust static analyzer | AL-4 (optional CIP-112 dual-impl / capability-misuse detectors) |
+| `tools/daml-props` | `github.com/OpenZeppelin/daml-props` | DAML property-testing library | **AL-4** (pause / role-authorization / capped-mint-conservation property rows) |
+| `tools/daml-verify` | `github.com/OpenZeppelin/daml-verify` | Python/Z3 symbolic verifier | **AL-4** (add a capability relation → `admin-authorization`, `scopeAuthorizes`, capped-mint conservation proofs; the V2 proof rows in [AUDIT.md](AUDIT.md)) |
+| `repos/oz-daml-contracts` | `github.com/peektism/oz-daml-contracts` | Canonical reusable DAML library scaffold | Public-API **extraction target** (gated by M1-PF-004 AGPL→MIT) |
+| `canton-stablecoin` | `github.com/OpenZeppelin/canton-stablecoin` | CIP-056 + CDP/clawback reference | Pattern reference for the sibling stablecoin / forced-burn work |
+
+**Contribution model (best practices, do not regress):**
+- Treat each repo as independent — inspect/commit with `git -C <child>`; never
+  assume the workspace root has git history, and never rewrite/reset/clean a
+  child repo unless explicitly asked (per `$CANTON_TOOLS_HOME/AGENTS.md`).
+- **Work off a feature branch and open a PR** for every tooling change — do not
+  commit to a repo's default branch. Keep PRs small and single-purpose, scoped to
+  one slice; land code + tests + docs together; reference the driving slice
+  (e.g. "AL-4: daml-verify capability relation") in the PR; keep the repo's own
+  CI/validation green (`cargo` for daml-lint, `python3 main.py`/`pytest` for
+  daml-verify, `dpm build`/`dpm test` for daml-props).
+- The repo-local `canton-token-template/tools/{daml-lint,daml-verify}` are
+  **convenience clones** created by `scripts/setup.sh`; the **canonical source of
+  truth and the target for extensions is `$CANTON_TOOLS_HOME/tools/`** → the
+  upstream OZ repos. Land tool improvements upstream via PR, then re-pull locally.
+- The active `daml.yaml` SDK/Java pins (3.4.11 / OpenJDK 21) and the DPM-native
+  command conventions are shared workspace baselines — see
+  `$CANTON_TOOLS_HOME/AGENTS.md`.

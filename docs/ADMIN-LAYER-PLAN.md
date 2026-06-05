@@ -281,6 +281,11 @@ whenNotPaused`.
   `admin-authorization` capability relation, a `scopeAuthorizes` lemma, and a
   mint-allowance conservation property remain Z3 proof *targets* (the symbolic
   model has no capability relation yet); today they are covered by Daml Script.
+  Closing these is **AL-4**, implemented by extending the `daml-verify` /
+  `daml-props` repos under `$CANTON_TOOLS_HOME/tools/` via feature branches + PRs
+  (the upstream OpenZeppelin tool repos are the source of truth, not the
+  `scripts/setup.sh` convenience clones) — see
+  [PLAN.md §17.6](PLAN.md#176-tooling-workspace-canton_tools_home--contribution-model).
 
 ---
 

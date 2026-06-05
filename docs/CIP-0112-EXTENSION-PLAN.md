@@ -1046,7 +1046,13 @@ New test scenarios from CIP-0112 to add:
 ## Verification pipeline impact
 
 `scripts/verify.sh` orchestrates `daml-lint` → `daml-props` → `daml-verify`
-today. Discovery findings:
+today. These three tools are independent OpenZeppelin repos in the shared
+workspace `$CANTON_TOOLS_HOME` (`/Users/amar/canton-tools/tools/`); the V2 slices
+that extend them (e.g. property/proof rows for allocations and settlement) do so
+via feature branches + PRs upstream, not by editing the `scripts/setup.sh`
+convenience clones — see
+[PLAN.md §17.6](PLAN.md#176-tooling-workspace-canton_tools_home--contribution-model).
+Discovery findings:
 
 - `daml-lint`: no V1-only assumptions. Confirm during the implementation
   slice; add a CIP-112 dual-implementation detector if surfacing is

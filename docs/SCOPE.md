@@ -275,6 +275,7 @@ Ordered by priority. Items 1-4 are hardening fixes identified by verification to
 ## 10. References
 
 ### Primary Sources
+- **Tooling workspace** `$CANTON_TOOLS_HOME` (`/Users/amar/canton-tools`, guide `AGENTS.md`): the independent OpenZeppelin tool repos this project uses and the upcoming slices extend — `tools/daml-lint`, `tools/daml-props`, `tools/daml-verify` — plus `repos/oz-daml-contracts` (extraction target) and `canton-stablecoin` (CDP/clawback reference). Tool changes land upstream via branches + PRs; see [PLAN.md §17.6](PLAN.md#176-tooling-workspace-canton_tools_home--contribution-model).
 - CIP-0056 Final (created 2025-03-07, approved 2025-03-31): canonical standard intent and required APIs
 - `../splice/token-standard`: reference implementation of interfaces, OpenAPI specs, and tests
 - `../splice/token-standard/CHANGELOG.md`: deltas and compatibility expectations (`expectedAdmin`, `requestedAt`, `supportedApis`, metadata evolution, result type semantics)
