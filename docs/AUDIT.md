@@ -206,7 +206,7 @@ capability relation.
 | INV-37 | Advisory `TotalSupply` (D2) reconciles up/down, never negative | Script: `test_totalSupplyObservability` |
 | INV-38 | Forced burn (incl. in-flight/locked funds) requires an in-scope `Burner` cap; owner redemption needs none | Script: `test_forcedBurnRequiresBurnerCap`, `test_forcedBurnScopedToInstrument`, `test_forcedBurnLockedHolding`, `test_ownerRedemptionBurn` |
 | INV-39 | Every `SimpleHolding`/`LockedSimpleHolding` has `instrumentId.admin == admin` | template `ensure` clauses |
-| admin-authorization | `requireRole` rejects every `(caller, role, admin, scope)` tuple not matching a co-signed capability; `assertNotPaused` is a total guard on the origination set; capped mint is conserved | `daml-verify` TARGET |
+| admin-authorization | `requireRole` rejects every `(caller, role, admin, scope)` tuple not matching a co-signed capability; `assertNotPaused` is a total guard on the origination set; capped mint is conserved | `daml-verify` **PROVED** (A1–A8, [OpenZeppelin/daml-verify#4](https://github.com/OpenZeppelin/daml-verify/pull/4)) + `daml-props` **state-machine** (pause / authorization / conservation over random sequences, [OpenZeppelin/daml-props#2](https://github.com/OpenZeppelin/daml-props/pull/2)); both show locally after the PRs merge + `setup.sh` re-pull |
 
 > daml-lint note: `Role` is a closed sum type and no admin template has unbounded
 > list fields (`RoleCapability.scope` is `Optional`, not a list) — no new
@@ -220,11 +220,19 @@ capability relation.
   (`extraObservers`, `supportedInstruments`, `senders`, `allocations`,
   `inputHoldingCids`) — admin-only creation mitigates.
 - `daml-props` (`dpm test`): PASS — **141/141** (incl. 15 `Test/Admin.daml` + 10
-  `Test/MintBurn.daml` rows).
-- `daml-verify`: PASS — 14/14 properties. The 9 C/D/T rows model this repo's
-  transfer/allocation logic; the V1–V5 rows are the tool's own stablecoin models.
-  The AccessControl/Pausable proof rows (`admin-authorization`, a `scopeAuthorizes`
-  lemma) remain AL-4 targets (the symbolic model has no capability relation yet).
+  `Test/MintBurn.daml` rows). The admin-layer state-machine rows (pause /
+  role-authorization / mint-allowance conservation, 5 property tests in
+  `Examples/AdminLayer/`) are **implemented and passing upstream** in
+  [OpenZeppelin/daml-props#2](https://github.com/OpenZeppelin/daml-props/pull/2);
+  they join the local count once that PR merges and `scripts/setup.sh` re-pulls.
+- `daml-verify`: PASS — 14/14 properties in the local `setup.sh` clone. The 9
+  C/D/T rows model this repo's transfer/allocation logic; the V1–V5 rows are the
+  tool's own stablecoin models. The AccessControl/Pausable/mint-cap proof rows
+  (A1–A8: `admin-authorization`, `scopeAuthorizes`, capped-mint conservation,
+  pause guard) are **implemented and proving upstream** in
+  [OpenZeppelin/daml-verify#4](https://github.com/OpenZeppelin/daml-verify/pull/4)
+  (AL-4 — 22/22 proved, pytest 22/22); they appear in the local count once that PR
+  merges and `scripts/setup.sh` re-pulls the tool.
 
 ## Temporal Proofs (daml-verify)
 
