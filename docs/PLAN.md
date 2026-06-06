@@ -1011,6 +1011,18 @@ not part of this repo's history.
   (e.g. "AL-4: daml-verify capability relation") in the PR; keep the repo's own
   CI/validation green (`cargo` for daml-lint, `python3 main.py`/`pytest` for
   daml-verify, `dpm build`/`dpm test` for daml-props).
+- **Signed commits are required** for all PRs to the OpenZeppelin org repos. This
+  workspace signs via **SSH** (no GPG): `~/.ssh/id_ed25519_signing`, registered on
+  GitHub (`peektism`) under **Settings → SSH and GPG keys → _Signing keys_** — it
+  must be the **Signing Key** type, *not* Authentication, or commits show
+  `unknown_key` / unverified. Git is configured globally to sign everything
+  (`gpg.format=ssh`, `user.signingkey=~/.ssh/id_ed25519_signing.pub`,
+  `commit.gpgsign=true`, `tag.gpgsign=true`; `gpg.ssh.allowedSignersFile` for local
+  verify). The committer email (`asinghchrony@protonmail.com`) must be a **verified
+  email** on the account holding the key. To re-sign an already-pushed branch:
+  `git rebase -f <base>` (recreates + signs each commit), then
+  `git push --force-with-lease`; confirm with
+  `gh api repos/<org>/<repo>/commits/<sha> --jq '.commit.verification'` → `verified: true`.
 - The repo-local `canton-token-template/tools/{daml-lint,daml-verify}` are
   **convenience clones** created by `scripts/setup.sh`; the **canonical source of
   truth and the target for extensions is `$CANTON_TOOLS_HOME/tools/`** → the
