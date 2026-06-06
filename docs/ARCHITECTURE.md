@@ -327,4 +327,11 @@ not from bundling more into the token.
    is downstream of *our* validation, not a precondition for it.
 
 The actionable form of this section lives in [PLAN.md §17.5 / slice AL-7](PLAN.md).
+
+> **Status (AL-7, step 2 done).** The decoupled library is built and tested on a
+> branch: `oz-access-control` / `oz-ownable` / `oz-pausable` — three independent
+> DARs, no cross-dependencies, `daml-script`-free, 16 passing scripts including the
+> typed-wrapper bridge — in [peektism/oz-daml-contracts#1](https://github.com/peektism/oz-daml-contracts/pull/1).
+> Steps 4–5 (token consumes them via a branch-pinned `data-dependency`; reduce the
+> in-token modules to the Layer-B composition; compare) are next.
 ```
