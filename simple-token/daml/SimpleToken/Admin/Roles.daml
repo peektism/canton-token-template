@@ -28,24 +28,26 @@ module SimpleToken.Admin.Roles where
 --     the slice that consumes it (V2-10 delegated settlement). No choice gates on
 --     it yet, so granting it authorizes nothing today. Do not treat it as live
 --     access control until its slice lands.
---   * `LegalAdmin` — RESERVED (AL-11): the seize / forced-transfer / court-order
---     role. Manual-only + two-person control by decision (AL-9 OQ-2); no choice
---     gates on it until AL-11 lands.
+--   * `LegalAdmin` — enforced by `Admin_ProposeSeizure` / `SeizureProposal_Approve`
+--     (AL-11, forced transfer / seize-and-reallocate). Manual-only + TWO-PERSON
+--     control: a seizure needs one LegalAdmin to propose and a DIFFERENT LegalAdmin
+--     to approve (AL-9 OQ-2 — separation of duties for irreversible deprivation).
 --   * `EmergencyOps` — RESERVED (AL-13): the intended holder of emergency-halt
 --     authority. AL-13 is runbook/doc-first (AL-9 OQ-5: AL-1 pause + AL-10 freeze +
 --     sync-domain suspension cover it), so no choice gates on it today.
 --
 -- AL-9 (OQ-4) added `ComplianceAdmin`/`LegalAdmin`/`EmergencyOps` as the generic
--- regulated-token roles a US-FI-ready RI ships with. Only `ComplianceAdmin` is live
--- in AL-10; the other two follow the `BatchProcessor` reserved-role pattern until
--- their slices graduate them. See docs/AL-9-PARITY-GAP-REVIEW.md §3.
+-- regulated-token roles a US-FI-ready RI ships with. `ComplianceAdmin` is live (AL-10
+-- freeze) and `LegalAdmin` is live (AL-11 seizure); `EmergencyOps` follows the
+-- `BatchProcessor` reserved-role pattern until AL-13 graduates it. See
+-- docs/AL-9-PARITY-GAP-REVIEW.md §3.
 data Role
   = Minter          -- ^ May create holdings via `Rules_Mint` (AL-5). Enforced; instrument-scopable.
   | Burner          -- ^ May force-burn holdings via `SimpleHolding_ForcedBurn` (AL-6). Enforced.
   | Pauser          -- ^ May flip the registry pause flag (see SimpleToken.Rules). Enforced.
   | ComplianceAdmin -- ^ May set account holds via `Rules_SetAccountFrozen` (AL-10). Enforced.
   | BatchProcessor  -- ^ (reserved) Delegated SettlementFactory_SettleBatch — future slice (V2-10).
-  | LegalAdmin      -- ^ (reserved) Seize / forced transfer / court orders — future slice (AL-11).
+  | LegalAdmin      -- ^ May propose/approve forced seizure (`SeizureProposal`, AL-11). Enforced; two-person.
   | EmergencyOps    -- ^ (reserved) Emergency-halt authority — AL-13 (runbook-first today).
   | Admin           -- ^ Root governance: may issue/revoke capabilities (owner analogue). Enforced.
   deriving (Eq, Show)

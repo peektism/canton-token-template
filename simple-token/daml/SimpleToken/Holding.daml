@@ -68,6 +68,32 @@ template SimpleHolding
         _ <- requireRole burner Burner admin (Some instrumentId) burnerCap
         pure ()
 
+    -- | Forced-seize primitive (AL-11): archives this holding so its value can be
+    -- REALLOCATED to a recovery party, without the owner's per-action consent (court
+    -- order, lost-key recovery, theft remediation). Like `SimpleHolding_ForcedBurn`
+    -- it is a consuming archive the owner consented to at creation (admin+owner
+    -- signatories) — but the governed caller pairs it, in the same transaction, with a
+    -- re-creation of an equal holding for the new owner, so value is PRESERVED rather
+    -- than destroyed; the consuming archive gives the original owner immutable
+    -- cryptographic proof of the seizure.
+    --
+    -- `controller admin`: a low-level primitive with no capability check, reachable
+    -- ONLY by a context bearing the registry root's authority — the genesis root, or
+    -- (the governed path) the admin-signed `SeizureProposal` whose TWO-PERSON
+    -- `LegalAdmin` approval is the AL-11 separation-of-duties control (AL-9 OQ-2). A
+    -- lone capability holder cannot exercise it (they hold a capability, not the
+    -- root's authority). Re-creating the holding for the new owner is done by the
+    -- caller via the new owner's `TransferPreapproval` (creating a holding needs the
+    -- new owner's authority), since `Holding` cannot import the preapproval/authority
+    -- modules without a cycle. See `SimpleToken.Admin.Authority.SeizureProposal`.
+    --
+    -- # Invariants enforced:
+    -- - INV-43: seizing a holding requires the registry root's authority; the governed
+    --   path layers two-person `LegalAdmin` control on top.
+    choice SimpleHolding_ForcedSeize : ()
+      controller admin
+      do pure ()
+
     interface instance Holding for SimpleHolding where
       view = HoldingView with
         owner

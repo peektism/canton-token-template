@@ -208,19 +208,34 @@ gating open questions (§4) are resolved.**
   already-committed `allocations` (seizing committed funds is the distinct
   forced-transfer capability, AL-11).
 
-### AL-11 — Forced transfer / seize-and-reallocate *(Must-Have)*
+### AL-11 — Forced transfer / seize-and-reallocate *(Must-Have)* — ✅ DELIVERED (code+tests; verify/props pending)
 
 - **Driver:** court-ordered seizure, lost-key recovery, SEC 17Ad-12 theft recovery,
-  erroneous-transfer correction. We have forced-*burn* (AL-6); seize-to-a-new-party
-  (reallocation) is the missing half.
-- **Daml mechanics:** because the issuer is a holding signatory, a `LegalAdmin`-gated
-  `ForceTransfer` choice archives the current holding and re-creates it for a new
-  owner, bypassing the original owner's authorization — the archived-contract
-  notification gives the original owner **immutable cryptographic proof** of the
-  seizure (superior auditability to EVM).
-- **New role:** `LegalAdmin`.
-- **Gating OQs:** **OQ-2 (must be a manual administrative override, never automated)**,
-  OQ-4.
+  erroneous-transfer correction. We had forced-*burn* (AL-6); seize-to-a-new-party
+  (reallocation) was the missing half.
+- **Daml mechanics (as built):** the issuer co-signs every holding, so a consuming
+  **`SimpleHolding_ForcedSeize`** (controller `admin`) archives it without the owner's
+  per-action consent — the consuming archive is the owner's **immutable cryptographic
+  proof** of the seizure. The value is reallocated to `newOwner` via `newOwner`'s
+  `TransferPreapproval` (creating a holding needs the recipient's authority — the
+  recovery destination must be onboarded, as any transfer recipient), so net supply is
+  unchanged. The whole thing is wrapped in **two-person control** (OQ-2): one
+  `LegalAdmin` calls `Admin_ProposeSeizure` (→ a `SeizureProposal`) and a **different**
+  `LegalAdmin` calls `SeizureProposal_Approve` (`approver /= proposer`) — no single
+  officer can effect an irreversible deprivation of property. Manual-only; the `reason`
+  is carried into the (consuming) approve transaction as an on-ledger audit trail.
+- **New role:** `LegalAdmin` (graduated from reserved; `roleAdmin = Admin`, delegable).
+- **OQs honored:** OQ-2 (manual-only + two-person/separation-of-duties — the irreversible
+  counterpart to AL-10's single-officer freeze), OQ-4 (role lives here).
+  **Invariants:** INV-43 (two-person + LegalAdmin), INV-44 (value preserved, no redirect,
+  stale rejected). **Tests:** `Test/Seize.daml`, 7 scripts, **suite 158→166 green**.
+- **Pending (next, branch-pinned like AL-8/AL-10):** daml-verify two-person-control proof
+  + a daml-props seizure property model.
+- **Documented scope boundary:** v1 seizes unlocked `SimpleHolding` (settled funds — the
+  primary court-order target); the type system scopes the choice to unlocked holdings.
+  Seizing in-flight/`LockedSimpleHolding` funds (mid-transfer/allocation) reuses the AL-6
+  `LockedSimpleHolding_ForcedBurn` destruction pattern; reallocation of locked funds is a
+  follow-up.
 
 ### AL-12 — Modular transfer-restriction hook *(Must-Have / Strong)*
 
@@ -331,7 +346,7 @@ hybrid compliance validation, cross-domain identity deferred.*
 - [x] **Open questions surfaced and resolved** (§4): OQ-1…OQ-6 — OQ-2/4/5/6 closed, OQ-1/3 decided-with-posture (validate OQ-1 w/ compliance+infra; cross-domain deferred).
 - [x] **PLAN.md §17.4 / §17.5 / §17.7 + ADMIN-LAYER-PLAN §10 updated** to point here and carry the new slice IDs.
 - [x] **AL-10 ✅ delivered + review-hardened + formally verified** (§3 above) — `frozenAccounts` freeze, `ComplianceAdmin` role, unified `assertCanOriginate` gate, INV-40..42, suite 146→158. Code-review fixes #1–#8 (`c2e61f3`/`f062f16`); formal rows **daml-verify A14–A17 ([#6](https://github.com/OpenZeppelin/daml-verify/pull/6); gate logic, non-vacuous)** + **daml-props `Freeze` ([#4](https://github.com/OpenZeppelin/daml-props/pull/4); owner+provider + cold-path accept)** — the proofs verify the gate logic, the per-chokepoint wiring / V2 expansion / cold-path are script-tested. `LegalAdmin`/`EmergencyOps` added reserved.
-- [ ] **AL-11 ready** — manual-only + dual-control (propose + approve) for irreversible seize/forced-transfer; `LegalAdmin` graduates from reserved.
+- [x] **AL-11 ✅ delivered (code+tests; verify/props pending)** (§3 above) — two-person `SeizureProposal` (propose + approve, `approver /= proposer`), `SimpleHolding_ForcedSeize` + reallocation via preapproval, `LegalAdmin` graduated, INV-43/44, suite 158→166. daml-verify/props rows are the next branch-pinned sub-PRs.
 - [ ] **AL-13 → runbook/doc-only** unless per-instrument on-ledger halt is later requested. **AL-12** proceeds on single-domain v1 once the OQ-1 hybrid SLA is confirmed with stakeholders.
 
 AL-9 is a review/planning slice — it adds **no on-ledger surface**. Its output is

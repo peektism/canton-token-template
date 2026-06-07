@@ -346,14 +346,16 @@ cap), `test_delegatedCannotRevokeAdmin` (delegate cannot revoke an `Admin` cap).
   the token's `PendingDefaultAdminTransfer`; plus `renounceRole`.
 - **[permanent]** Multisig / threshold owner — Canton topology (multi-hosted
   party), no code.
-- **[✅ AL-10 delivered; AL-11/AL-13 slated]** Per-account **freeze**/seize distinct
+- **[✅ AL-10 + AL-11 delivered; AL-13 slated]** Per-account **freeze**/seize distinct
   from pause — high US-FI (sanctions/compliance) relevance. Reclassified Must-Have and
   split: **[AL-10](AL-9-PARITY-GAP-REVIEW.md#al-10--account-level-freeze--compliance-hold-must-have)
-  (account freeze) is delivered** (`frozenAccounts` on `SimpleTokenRules`,
+  (account freeze)** is delivered (`frozenAccounts` on `SimpleTokenRules`,
   `ComplianceAdmin`-gated `Rules_SetAccountFrozen`, unified `assertCanOriginate` gate,
-  INV-40..42, §4 above); [AL-11](AL-9-PARITY-GAP-REVIEW.md#al-11--forced-transfer--seize-and-reallocate-must-have)
-  (forced transfer/seize-reallocate) and [AL-13](AL-9-PARITY-GAP-REVIEW.md#al-13--reference-contract-global-halt-strong)
-  (global halt, runbook-only) remain slated. AL-9's open questions are resolved
+  INV-40..42, §4 above); **[AL-11](AL-9-PARITY-GAP-REVIEW.md#al-11--forced-transfer--seize-and-reallocate-must-have)
+  (forced transfer/seize-reallocate)** is delivered (two-person `SeizureProposal`
+  propose+approve, `SimpleHolding_ForcedSeize` + reallocation via preapproval,
+  `LegalAdmin` graduated, INV-43/44); [AL-13](AL-9-PARITY-GAP-REVIEW.md#al-13--reference-contract-global-halt-strong)
+  (global halt, runbook-only) remains slated. AL-9's open questions are resolved
   (manual-only, dual-control for irreversible seize, AL-13 runbook-only); see
   [AL-9 §4](AL-9-PARITY-GAP-REVIEW.md#4-open-questions--resolved-2026-06-07).
 - **[permanent]** On-ledger reassignment of the instrument `admin` party —

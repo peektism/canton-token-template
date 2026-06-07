@@ -25,6 +25,10 @@ import SimpleToken.Admin.Authority
   , PendingDefaultAdminTransfer
   , PendingDefaultAdminTransfer_Accept(..)
   , PendingDefaultAdminTransfer_Cancel(..)
+  , Admin_ProposeSeizure(..)
+  , SeizureProposal
+  , SeizureProposal_Approve(..)
+  , SeizureProposal_Cancel(..)
   )
 import SimpleToken.Admin.Capability (RoleCapability, RoleCapability_Renounce(..))
 import SimpleToken.Admin.Roles (Role)
@@ -62,6 +66,16 @@ queryDisc p cid = do
   case optDisc of
     None -> fail $ "Disclosure not found for: " <> show cid
     Some d -> pure Disclosures with disclosureList = [d]
+
+-- | Like `queryDisc`, but yields no disclosure (rather than failing) when the
+-- contract is absent — used to gather disclosures for a choice whose target(s) may
+-- already be archived (e.g. a stale/cancelled seizure in a must-fail test).
+optDisc : forall t. Template t => Party -> ContractId t -> Script Disclosures
+optDisc p cid = do
+  optD <- queryDisclosure @t p cid
+  pure $ case optD of
+    None -> mempty
+    Some d -> Disclosures with disclosureList = [d]
 
 -- | Submit a command with disclosures.
 submitWithDisc : Party -> Disclosures -> Commands a -> Script a
@@ -101,14 +115,19 @@ initializeMulti adminName instrumentNames = do
 
 -- | Create a holding for a party (admin + owner must sign).
 createHolding : SimpleRegistry -> Party -> Decimal -> Script (ContractId Holding)
-createHolding registry owner amount = do
-  cid <- submitMulti [registry.admin, owner] [] $ createCmd SimpleHolding with
+createHolding registry owner amount =
+  toInterfaceContractId @Holding <$> createSimpleHolding registry owner amount
+
+-- | Like `createHolding`, but returns the concrete `SimpleHolding` cid (AL-11 seizure
+-- targets a concrete holding, not the interface).
+createSimpleHolding : SimpleRegistry -> Party -> Decimal -> Script (ContractId SimpleHolding)
+createSimpleHolding registry owner amount =
+  submitMulti [registry.admin, owner] [] $ createCmd SimpleHolding with
     admin = registry.admin
     owner
     instrumentId = registry.instrumentId
     amount
     meta = emptyMetadata
-  pure (toInterfaceContractId @Holding cid)
 
 -- | Create a locked holding directly (admin + owner sign; lock holder = admin).
 -- Used by clawback tests that need a standalone locked holding. NOTE: this uses
@@ -277,6 +296,74 @@ acceptDefaultAdminTransfer newAdmin pendingCid =
 cancelDefaultAdminTransfer : SimpleRegistry -> ContractId PendingDefaultAdminTransfer -> Script ()
 cancelDefaultAdminTransfer registry pendingCid =
   submit registry.admin $ exerciseCmd pendingCid PendingDefaultAdminTransfer_Cancel
+
+-- Forced transfer / seizure helpers (AL-11)
+--------------------------------------------
+
+-- | A LegalAdmin `proposer` proposes a forced seizure of `targetHoldingCid` to
+-- `newOwner` (step 1 of 2). The genesis anchor is disclosed to the delegate (the
+-- off-ledger service provides this in production). The choice fetches the target
+-- holding under the anchor's admin authority, so the proposer needs no extra
+-- disclosure for it.
+proposeSeizure : SimpleRegistry -> ContractId TokenAdministrator -> Party -> ContractId RoleCapability -> ContractId SimpleHolding -> Party -> Text -> Script (ContractId SeizureProposal)
+proposeSeizure registry adminCid proposer proposerLegalCap targetHoldingCid newOwner reason = do
+  disc <- proposeSeizureDisc registry adminCid targetHoldingCid
+  submitWithDisc proposer disc $
+    exerciseCmd adminCid Admin_ProposeSeizure with
+      proposer; proposerLegalCap; targetHoldingCid; newOwner; reason
+
+-- | Like `proposeSeizure`, but asserts the proposal fails (negative tests).
+proposeSeizureMustFail : SimpleRegistry -> ContractId TokenAdministrator -> Party -> ContractId RoleCapability -> ContractId SimpleHolding -> Party -> Text -> Script ()
+proposeSeizureMustFail registry adminCid proposer proposerLegalCap targetHoldingCid newOwner reason = do
+  disc <- proposeSeizureDisc registry adminCid targetHoldingCid
+  submitWithDiscMustFail proposer disc $
+    exerciseCmd adminCid Admin_ProposeSeizure with
+      proposer; proposerLegalCap; targetHoldingCid; newOwner; reason
+
+-- | The contracts the proposing LegalAdmin (a non-stakeholder) must have disclosed to
+-- exercise `Admin_ProposeSeizure`: the genesis anchor and the target holding the
+-- choice fetches (to capture its owner/amount/instrument). The off-ledger service
+-- provides these in production. Holding gathered tolerantly so a must-fail against a
+-- stale target still reaches the choice.
+proposeSeizureDisc : SimpleRegistry -> ContractId TokenAdministrator -> ContractId SimpleHolding -> Script Disclosures
+proposeSeizureDisc registry adminCid targetHoldingCid = do
+  adminDisc <- queryDisc @TokenAdministrator registry.admin adminCid
+  holdingDisc <- optDisc @SimpleHolding registry.admin targetHoldingCid
+  pure (adminDisc <> holdingDisc)
+
+-- | The contracts the approving LegalAdmin (a non-stakeholder) must have disclosed to
+-- exercise `SeizureProposal_Approve`: the proposal itself, the target holding it
+-- archives, and the destination preapproval it reallocates into. Gathered tolerantly
+-- (a stale/cancelled target simply contributes no disclosure, so the must-fail tests
+-- still reach the choice and fail with `NotActive`). The off-ledger service provides
+-- these disclosures in production.
+approveSeizureDisc : SimpleRegistry -> ContractId SeizureProposal -> ContractId TransferPreapproval -> Script Disclosures
+approveSeizureDisc registry proposalCid newOwnerPreapprovalCid = do
+  proposalDisc <- optDisc @SeizureProposal registry.admin proposalCid
+  optProposal <- queryContractId registry.admin proposalCid
+  holdingDisc <- case optProposal of
+    Some p -> optDisc @SimpleHolding registry.admin p.targetHoldingCid
+    None -> pure mempty
+  preDisc <- optDisc @TransferPreapproval registry.admin newOwnerPreapprovalCid
+  pure (proposalDisc <> holdingDisc <> preDisc)
+
+-- | A DIFFERENT LegalAdmin `approver` approves and executes a seizure (step 2),
+-- reallocating the value into `newOwner` via `newOwner`'s preapproval. The approver
+-- presents their own LegalAdmin capability.
+approveSeizure : SimpleRegistry -> ContractId SeizureProposal -> Party -> ContractId RoleCapability -> ContractId TransferPreapproval -> Script (ContractId Holding)
+approveSeizure registry proposalCid approver approverLegalCap newOwnerPreapprovalCid = do
+  disc <- approveSeizureDisc registry proposalCid newOwnerPreapprovalCid
+  submitWithDisc approver disc $
+    exerciseCmd proposalCid SeizureProposal_Approve with
+      approver; approverLegalCap; newOwnerPreapprovalCid
+
+-- | Like `approveSeizure`, but asserts the approval fails (negative tests).
+approveSeizureMustFail : SimpleRegistry -> ContractId SeizureProposal -> Party -> ContractId RoleCapability -> ContractId TransferPreapproval -> Script ()
+approveSeizureMustFail registry proposalCid approver approverLegalCap newOwnerPreapprovalCid = do
+  disc <- approveSeizureDisc registry proposalCid newOwnerPreapprovalCid
+  submitWithDiscMustFail approver disc $
+    exerciseCmd proposalCid SeizureProposal_Approve with
+      approver; approverLegalCap; newOwnerPreapprovalCid
 
 -- | The current factory contract id together with a disclosure for it.
 currentRules : SimpleRegistry -> Script (ContractId SimpleTokenRules, Disclosures)

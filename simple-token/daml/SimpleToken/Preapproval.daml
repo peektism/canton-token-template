@@ -100,3 +100,36 @@ template TransferPreapproval
           amount
           meta = holdingMeta
         pure (toInterfaceContractId @Holding cid)
+
+    -- | Seize-reallocation path (AL-11): create a holding for the receiver to RECEIVE
+    -- value seized from another party, reusing the receiver's authority from this
+    -- preapproval. Mechanically identical to `TransferPreapproval_MintInto`, but a
+    -- DISTINCT choice so the ledger (and the off-ledger D2 reconciler) records a
+    -- seizure-reallocation rather than new supply: the governed caller pairs it, in
+    -- the same transaction, with a `SimpleHolding_ForcedSeize` that archives the
+    -- seized holding, so net supply is unchanged. The intended caller is the
+    -- two-person `SeizureProposal_Approve`; controller is `admin` (the root authority
+    -- the SeizureProposal carries), so non-admin parties cannot reach it.
+    nonconsuming choice TransferPreapproval_ReceiveSeized : ContractId Holding
+      with
+        seizedInstrumentId : InstrumentId  -- ^ Instrument being reallocated (must match the preapproval).
+        amount : Decimal                   -- ^ Amount reallocated into the receiver's holding.
+        holdingMeta : Metadata
+      controller admin
+      do
+        assertMsg "Preapproval instrumentId does not match seized instrumentId"
+          (instrumentId == seizedInstrumentId)
+        assertMsg "Seized amount must be positive"
+          (amount > 0.0)
+        now <- getTime
+        case expiresAt of
+          None -> pure ()
+          Some deadline ->
+            assertMsg "Transfer preapproval has expired" (now < deadline)
+        cid <- create SimpleHolding with
+          admin
+          owner = receiver
+          instrumentId = seizedInstrumentId
+          amount
+          meta = holdingMeta
+        pure (toInterfaceContractId @Holding cid)

@@ -20,10 +20,13 @@ module SimpleToken.Admin.Authority where
 
 import DA.Time (RelTime, addRelTime)
 
-import Splice.Api.Token.HoldingV1 (InstrumentId)
+import Splice.Api.Token.HoldingV1 (InstrumentId, Holding)
+import Splice.Api.Token.MetadataV1 (emptyMetadata)
 
 import qualified OpenZeppelin.AccessControl as AC
 
+import SimpleToken.Holding (SimpleHolding, SimpleHolding_ForcedSeize(..))
+import SimpleToken.Preapproval (TransferPreapproval, TransferPreapproval_ReceiveSeized(..))
 import SimpleToken.Admin.Capability (RoleCapability(..), requireRole)
 import SimpleToken.Admin.Errors
 import SimpleToken.Admin.Roles (Role(..), roleAdmin, delegableViaRoleAdmin)
@@ -192,6 +195,115 @@ template TokenAdministrator
         now <- getTime
         create PendingDefaultAdminTransfer with
           admin; newAdmin; effectiveTime = addRelTime now delay
+
+    -- | Propose a forced seizure of `targetHoldingCid`, reallocating its value to
+    -- `newOwner` (AL-11). Step ONE of the two-person control (AL-9 OQ-2): the
+    -- proposer presents a `LegalAdmin` capability in scope for the holding's
+    -- instrument; a DIFFERENT `LegalAdmin` must later approve via
+    -- `SeizureProposal_Approve` for the seizure to take effect — no single officer
+    -- can both propose and approve an irreversible deprivation of property. The
+    -- holding's owner/amount/instrument are captured now for the audit record and to
+    -- detect tampering at approval (`eSeizureHoldingMismatch`). The choice runs with
+    -- this anchor's admin authority, so the created `SeizureProposal` is admin-signed
+    -- (it later carries the authority to archive the seized holding); the proposer is
+    -- only an observer, exactly as a `LegalAdmin` delegate holds a capability, not the
+    -- root key.
+    --
+    -- # Invariants enforced:
+    -- - INV-43: proposing a seizure requires a LegalAdmin capability (step 1 of 2)
+    nonconsuming choice Admin_ProposeSeizure : ContractId SeizureProposal
+      with
+        proposer : Party                            -- ^ The LegalAdmin proposing the seizure.
+        proposerLegalCap : ContractId RoleCapability -- ^ The proposer's LegalAdmin capability.
+        targetHoldingCid : ContractId SimpleHolding -- ^ The holding to seize.
+        newOwner : Party                            -- ^ The recovery destination (must be preapproved at approval).
+        reason : Text                               -- ^ Audit metadata (court-order reference, ticket, etc.).
+      controller proposer
+      do
+        holding <- fetch targetHoldingCid
+        assertMsg eSeizureForeignHolding (holding.admin == admin)
+        _ <- requireRole proposer LegalAdmin admin (Some holding.instrumentId) proposerLegalCap
+        create SeizureProposal with
+          admin
+          proposer
+          targetHoldingCid
+          seizedOwner = holding.owner
+          amount = holding.amount
+          instrumentId = holding.instrumentId
+          newOwner
+          reason
+
+-- | A pending two-person forced seizure (AL-11) — the seize-and-reallocate analogue
+-- of the AL-6 forced *burn*, but value-preserving. Created by `Admin_ProposeSeizure`
+-- (step 1, by one `LegalAdmin`) and finalized by `SeizureProposal_Approve` (step 2,
+-- by a DIFFERENT `LegalAdmin`). The separation of duties (AL-9 OQ-2) guards the
+-- irreversible deprivation of property: no single officer can seize. It is the
+-- counterpart to AL-10's single-officer, reversible freeze.
+--
+-- Signatories: admin (so the approve can archive the admin-co-signed holding and
+--   reallocate via a preapproval). Observers: proposer (so they can cancel / track).
+-- Disclosed parties: the approving LegalAdmin (a non-stakeholder) acts via explicit
+--   disclosure — the off-ledger service provides it, exactly as for delegated revoke.
+-- Manual-only (AL-9 OQ-2): every step is a human-exercised choice; nothing fires
+--   automatically. The `reason` is carried into the (consuming) approve transaction
+--   as an immutable on-ledger audit trail.
+template SeizureProposal
+  with
+    admin : Party
+    proposer : Party                            -- ^ The LegalAdmin who proposed (cannot also approve).
+    targetHoldingCid : ContractId SimpleHolding -- ^ The holding to seize.
+    seizedOwner : Party                         -- ^ The current owner, captured at propose (tamper check).
+    amount : Decimal                            -- ^ The amount, captured at propose.
+    instrumentId : InstrumentId                 -- ^ The instrument, captured at propose.
+    newOwner : Party                            -- ^ The reallocation destination.
+    reason : Text                               -- ^ Audit metadata.
+  where
+    signatory admin
+    observer proposer
+
+    -- | Approve and execute the seizure (step 2). The approver must be a DIFFERENT
+    -- `LegalAdmin` than the proposer (two-person control). Archives the target holding
+    -- (`SimpleHolding_ForcedSeize`) and reallocates an EQUAL holding to `newOwner` via
+    -- `newOwner`'s `TransferPreapproval` (creating a holding needs the new owner's
+    -- authority — the recovery/custody destination must be onboarded, exactly as any
+    -- transfer recipient). The seized `amount`/`instrumentId` were captured at propose
+    -- from the same (immutable) holding cid, so net supply is unchanged (one holding
+    -- archived, an equal one created). The approver must supply `newOwner`'s OWN
+    -- preapproval, so they cannot redirect the seized value to a different party.
+    --
+    -- If the owner moved/split/burned the holding between propose and approve, its cid
+    -- is stale and `SimpleHolding_ForcedSeize` fails (`NotActive`) — the seizure must
+    -- be re-proposed against the current holding (a seizure cannot be made race-free
+    -- against a still-consenting owner; see `SimpleHolding_ForcedBurn`).
+    --
+    -- # Invariants enforced:
+    -- - INV-43: approval requires a LegalAdmin capability AND `approver /= proposer` (two-person)
+    -- - INV-44: value preserved — an equal amount/instrument is reallocated to the proposed `newOwner`
+    choice SeizureProposal_Approve : ContractId Holding
+      with
+        approver : Party                              -- ^ A second LegalAdmin (≠ proposer).
+        approverLegalCap : ContractId RoleCapability  -- ^ The approver's LegalAdmin capability.
+        newOwnerPreapprovalCid : ContractId TransferPreapproval -- ^ newOwner's preapproval (carries their authority to receive).
+      controller approver
+      do
+        assertMsg eSeizureRequiresTwoOfficers (approver /= proposer)
+        _ <- requireRole approver LegalAdmin admin (Some instrumentId) approverLegalCap
+        preapproval <- fetch newOwnerPreapprovalCid
+        assertMsg eSeizureNewOwnerMismatch
+          (preapproval.admin == admin && preapproval.receiver == newOwner)
+        -- Archive the seized holding (consuming choice on it; admin authority present;
+        -- fails NotActive if the owner already moved it — re-propose).
+        exercise targetHoldingCid SimpleHolding_ForcedSeize
+        -- Reallocate an equal holding to newOwner via their preapproval.
+        exercise newOwnerPreapprovalCid TransferPreapproval_ReceiveSeized with
+          seizedInstrumentId = instrumentId
+          amount
+          holdingMeta = emptyMetadata
+
+    -- | Cancel an unexecuted seizure proposal (the proposer withdraws it).
+    choice SeizureProposal_Cancel : ()
+      controller proposer
+      do pure ()
 
 -- | A pending, timelocked transfer of the `Admin`/`DEFAULT_ADMIN_ROLE` to
 -- `newAdmin` — the token's `AccessControlDefaultAdminRules` handoff. It mirrors

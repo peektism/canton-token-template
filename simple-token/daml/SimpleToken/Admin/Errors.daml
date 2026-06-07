@@ -44,6 +44,27 @@ eRedundantFreezeChange = "simple-token: account already in the requested freeze 
 eCannotFreezeAdmin : Text
 eCannotFreezeAdmin = "simple-token: the registry administrator cannot be frozen"
 
+-- Forced transfer / seize-and-reallocate (AL-11)
+-------------------------------------------------
+
+-- | INV-43: a forced seizure is an irreversible deprivation of property, so it
+-- requires TWO distinct `LegalAdmin` officers — the party that proposes a seizure
+-- (`Admin_ProposeSeizure`) cannot also approve it (`SeizureProposal_Approve`). The
+-- separation-of-duties control decided in AL-9 OQ-2 (vs the single-officer,
+-- reversible AL-10 freeze).
+eSeizureRequiresTwoOfficers : Text
+eSeizureRequiresTwoOfficers = "simple-token: a forced seizure requires two distinct LegalAdmin officers (the proposer cannot approve)"
+
+-- | The seized holding must be governed by this registry (its admin must match).
+eSeizureForeignHolding : Text
+eSeizureForeignHolding = "simple-token: seized holding is not governed by this registry"
+
+-- | INV-44: the destination preapproval must belong to this registry and name the
+-- exact `newOwner` recorded in the proposal — the approver cannot redirect the
+-- seized value to a different party than the one proposed.
+eSeizureNewOwnerMismatch : Text
+eSeizureNewOwnerMismatch = "simple-token: seizure destination preapproval does not match the proposed new owner"
+
 -- AccessControl (capabilities)
 --------------------------------
 

@@ -1,0 +1,160 @@
+-- | Forced transfer / seize-and-reallocate tests (AL-11). Covers PLAN.md §17 slice
+-- AL-11 and invariants #43–#44 — the court-order / lost-key / theft-recovery
+-- capability. Seizure is the irreversible counterpart to AL-10's reversible freeze,
+-- so it is gated by TWO-PERSON control (AL-9 OQ-2): one `LegalAdmin` proposes
+-- (`Admin_ProposeSeizure`) and a DIFFERENT `LegalAdmin` approves
+-- (`SeizureProposal_Approve`), which archives the seized holding and reallocates an
+-- equal holding to a preapproved recovery party.
+--
+-- Negative-test discipline mirrors SimpleToken.Test.Admin: each `submitMustFail`
+-- discloses exactly the contracts the failing choice must fetch (the genesis anchor,
+-- the proposal) so the failure lands on the guard under test — an `assertMsg`
+-- (`eSeizureRequiresTwoOfficers`, `eSeizureNewOwnerMismatch`, the `LegalAdmin`
+-- capability gate) or a structural `NotActive` (a stale / cancelled target).
+module SimpleToken.Test.Seize where
+
+import SimpleToken.Holding (SimpleHolding_Burn(..))
+import SimpleToken.Admin.Authority (SeizureProposal_Cancel(..))
+import SimpleToken.Admin.Roles (Role(..))
+import SimpleToken.Testing.SimpleRegistry
+import SimpleToken.Testing.WalletClient
+import SimpleToken.Test.Setup
+
+import Daml.Script
+
+-- | Standard AL-11 cast: alice is the seized owner, bob the recovery destination,
+-- and charlie / executor are two distinct LegalAdmin officers.
+data SeizeEnv = SeizeEnv with
+  env : TestEnv
+  legalA : Party        -- proposer
+  legalB : Party        -- approver (≠ proposer)
+  seized : Party        -- alice — current owner
+  recovery : Party      -- bob — new owner
+
+setupSeize : Script SeizeEnv
+setupSeize = do
+  env@TestEnv{..} <- setupTestEnv
+  pure SeizeEnv with
+    env
+    legalA = parties.charlie
+    legalB = parties.executor
+    seized = parties.alice
+    recovery = parties.bob
+
+-- INV-44 — seize-and-reallocate preserves value, only the owner changes
+------------------------------------------------------------------------
+
+-- | Happy path: two distinct LegalAdmin officers seize alice's holding and
+-- reallocate it to the recovery party bob. Value is preserved (alice → 0, bob → 100).
+test_seizeReallocatesToNewOwner : Script ()
+test_seizeReallocatesToNewOwner = do
+  SeizeEnv{env = TestEnv{..}, ..} <- setupSeize
+  adminCid <- createTokenAdministrator registry
+  capA <- issueRole registry adminCid legalA LegalAdmin
+  capB <- issueRole registry adminCid legalB LegalAdmin
+  hCid <- createSimpleHolding registry seized 100.0
+  recoveryPre <- createPreapproval registry recovery None
+  proposal <- proposeSeizure registry adminCid legalA capA hCid recovery "court order 12-345"
+  _ <- approveSeizure registry proposal legalB capB recoveryPre
+  checkBalance seized registry.instrumentId 0.0       -- seized holding removed
+  checkBalance recovery registry.instrumentId 100.0   -- equal value reallocated
+
+-- INV-43 — two-person control: one officer cannot both propose and approve
+--------------------------------------------------------------------------
+
+-- | The proposer cannot approve their own seizure, even holding a valid LegalAdmin
+-- capability — separation of duties for an irreversible action.
+test_seizeRequiresTwoOfficers : Script ()
+test_seizeRequiresTwoOfficers = do
+  SeizeEnv{env = TestEnv{..}, ..} <- setupSeize
+  adminCid <- createTokenAdministrator registry
+  capA <- issueRole registry adminCid legalA LegalAdmin
+  hCid <- createSimpleHolding registry seized 100.0
+  recoveryPre <- createPreapproval registry recovery None
+  proposal <- proposeSeizure registry adminCid legalA capA hCid recovery "x"
+  -- legalA proposed; legalA cannot also approve (eSeizureRequiresTwoOfficers)
+  approveSeizureMustFail registry proposal legalA capA recoveryPre
+  -- a genuine second officer can.
+  capB <- issueRole registry adminCid legalB LegalAdmin
+  _ <- approveSeizure registry proposal legalB capB recoveryPre
+  checkBalance recovery registry.instrumentId 100.0
+
+-- INV-43 — both steps require a LegalAdmin capability
+------------------------------------------------------
+
+-- | Proposing a seizure requires a LegalAdmin capability; a holder of another role
+-- (Minter) cannot propose.
+test_seizeProposeRequiresLegalAdmin : Script ()
+test_seizeProposeRequiresLegalAdmin = do
+  SeizeEnv{env = TestEnv{..}, ..} <- setupSeize
+  adminCid <- createTokenAdministrator registry
+  notLegal <- issueRole registry adminCid legalA Minter   -- wrong role
+  hCid <- createSimpleHolding registry seized 100.0
+  proposeSeizureMustFail registry adminCid legalA notLegal hCid recovery "x"
+
+-- | Approving a seizure requires a LegalAdmin capability; the second officer holding
+-- a non-LegalAdmin capability cannot approve (the failure is the role gate, not the
+-- two-person gate — the approver differs from the proposer here).
+test_seizeApproveRequiresLegalAdmin : Script ()
+test_seizeApproveRequiresLegalAdmin = do
+  SeizeEnv{env = TestEnv{..}, ..} <- setupSeize
+  adminCid <- createTokenAdministrator registry
+  capA <- issueRole registry adminCid legalA LegalAdmin
+  notLegalB <- issueRole registry adminCid legalB Minter   -- approver holds wrong role
+  hCid <- createSimpleHolding registry seized 100.0
+  recoveryPre <- createPreapproval registry recovery None
+  proposal <- proposeSeizure registry adminCid legalA capA hCid recovery "x"
+  approveSeizureMustFail registry proposal legalB notLegalB recoveryPre
+
+-- INV-44 — the approver cannot redirect the seized value
+---------------------------------------------------------
+
+-- | The approver must supply the PROPOSED new owner's preapproval; presenting a
+-- different party's preapproval is rejected (eSeizureNewOwnerMismatch), so a rogue
+-- approver cannot reallocate the seized value to themselves.
+test_seizeCannotRedirect : Script ()
+test_seizeCannotRedirect = do
+  SeizeEnv{env = TestEnv{..}, ..} <- setupSeize
+  adminCid <- createTokenAdministrator registry
+  capA <- issueRole registry adminCid legalA LegalAdmin
+  capB <- issueRole registry adminCid legalB LegalAdmin
+  hCid <- createSimpleHolding registry seized 100.0
+  -- proposal names `recovery` as the new owner, but the approver supplies legalB's
+  -- own preapproval — rejected.
+  roguePre <- createPreapproval registry legalB None
+  proposal <- proposeSeizure registry adminCid legalA capA hCid recovery "x"
+  approveSeizureMustFail registry proposal legalB capB roguePre
+
+-- Lifecycle: stale target, cancellation
+----------------------------------------
+
+-- | If the owner moves/burns the holding before approval, its cid is stale and the
+-- seizure fails (NotActive) — it must be re-proposed (a seizure cannot be made
+-- race-free against a still-consenting owner).
+test_seizeStaleTargetRejected : Script ()
+test_seizeStaleTargetRejected = do
+  SeizeEnv{env = TestEnv{..}, ..} <- setupSeize
+  adminCid <- createTokenAdministrator registry
+  capA <- issueRole registry adminCid legalA LegalAdmin
+  capB <- issueRole registry adminCid legalB LegalAdmin
+  hCid <- createSimpleHolding registry seized 100.0
+  recoveryPre <- createPreapproval registry recovery None
+  proposal <- proposeSeizure registry adminCid legalA capA hCid recovery "x"
+  -- the owner redeems (burns) the holding before approval → target cid is stale.
+  submit seized $ exerciseCmd hCid SimpleHolding_Burn
+  approveSeizureMustFail registry proposal legalB capB recoveryPre
+
+-- | The proposer can cancel an unexecuted proposal; approval then fails (NotActive).
+test_seizeCancellable : Script ()
+test_seizeCancellable = do
+  SeizeEnv{env = TestEnv{..}, ..} <- setupSeize
+  adminCid <- createTokenAdministrator registry
+  capA <- issueRole registry adminCid legalA LegalAdmin
+  capB <- issueRole registry adminCid legalB LegalAdmin
+  hCid <- createSimpleHolding registry seized 100.0
+  recoveryPre <- createPreapproval registry recovery None
+  proposal <- proposeSeizure registry adminCid legalA capA hCid recovery "x"
+  submit legalA $ exerciseCmd proposal SeizureProposal_Cancel
+  approveSeizureMustFail registry proposal legalB capB recoveryPre
+  -- the holding is untouched: alice still holds it.
+  checkBalance seized registry.instrumentId 100.0
