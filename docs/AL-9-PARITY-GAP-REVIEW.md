@@ -226,9 +226,11 @@ gating open questions (§4) are resolved.**
   is carried into the (consuming) approve transaction as an on-ledger audit trail.
 - **New role:** `LegalAdmin` (graduated from reserved; `roleAdmin = Admin`, delegable).
 - **OQs honored:** OQ-2 (manual-only + two-person/separation-of-duties — the irreversible
-  counterpart to AL-10's single-officer freeze), OQ-4 (role lives here).
-  **Invariants:** INV-43 (two-person + LegalAdmin), INV-44 (value preserved, no redirect,
-  stale rejected). **Tests:** `Test/Seize.daml`, 7 scripts, **suite 158→166 green**.
+  counterpart to AL-10's single-officer freeze; **neither officer may be the beneficiary**),
+  OQ-4 (role lives here). **Invariants:** INV-43 (two-person + LegalAdmin + beneficiary≠officer
+  + cross-registry rejected), INV-44 (value preserved, no redirect, stale rejected).
+  **Tests:** `Test/Seize.daml`, 11 scripts (incl. beneficiary-is-officer, cross-registry,
+  foreign-preapproval, instrument-scoped), **suite 158→170 green**. Review-hardened (`/code-review`).
 - **Pending (next, branch-pinned like AL-8/AL-10):** daml-verify two-person-control proof
   + a daml-props seizure property model.
 - **Documented scope boundary:** v1 seizes unlocked `SimpleHolding` (settled funds — the
@@ -346,7 +348,7 @@ hybrid compliance validation, cross-domain identity deferred.*
 - [x] **Open questions surfaced and resolved** (§4): OQ-1…OQ-6 — OQ-2/4/5/6 closed, OQ-1/3 decided-with-posture (validate OQ-1 w/ compliance+infra; cross-domain deferred).
 - [x] **PLAN.md §17.4 / §17.5 / §17.7 + ADMIN-LAYER-PLAN §10 updated** to point here and carry the new slice IDs.
 - [x] **AL-10 ✅ delivered + review-hardened + formally verified** (§3 above) — `frozenAccounts` freeze, `ComplianceAdmin` role, unified `assertCanOriginate` gate, INV-40..42, suite 146→158. Code-review fixes #1–#8 (`c2e61f3`/`f062f16`); formal rows **daml-verify A14–A17 ([#6](https://github.com/OpenZeppelin/daml-verify/pull/6); gate logic, non-vacuous)** + **daml-props `Freeze` ([#4](https://github.com/OpenZeppelin/daml-props/pull/4); owner+provider + cold-path accept)** — the proofs verify the gate logic, the per-chokepoint wiring / V2 expansion / cold-path are script-tested. `LegalAdmin`/`EmergencyOps` added reserved.
-- [x] **AL-11 ✅ delivered (code+tests; verify/props pending)** (§3 above) — two-person `SeizureProposal` (propose + approve, `approver /= proposer`), `SimpleHolding_ForcedSeize` + reallocation via preapproval, `LegalAdmin` graduated, INV-43/44, suite 158→166. daml-verify/props rows are the next branch-pinned sub-PRs.
+- [x] **AL-11 ✅ delivered (code+tests, review-hardened; verify/props pending)** (§3 above) — two-person + SoD `SeizureProposal` (`approver /= proposer`, neither is beneficiary), `SimpleHolding_ForcedSeize` + reallocation via preapproval, `LegalAdmin` graduated, INV-43/44, suite 158→170 (11 tests). 3 design calls open ([PLAN §17.7](PLAN.md#177-resolved-decisions--al-8--al-9)). daml-verify/props rows are the next branch-pinned sub-PRs.
 - [ ] **AL-13 → runbook/doc-only** unless per-instrument on-ledger halt is later requested. **AL-12** proceeds on single-domain v1 once the OQ-1 hybrid SLA is confirmed with stakeholders.
 
 AL-9 is a review/planning slice — it adds **no on-ledger surface**. Its output is

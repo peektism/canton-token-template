@@ -7,6 +7,33 @@ import Splice.Api.Token.MetadataV1
 
 import SimpleToken.Holding
 
+-- | Create the receiver's holding via a preapproval, reusing the receiver's
+-- authority carried by the preapproval contract. Shared by
+-- `TransferPreapproval_MintInto` (AL-5) and `TransferPreapproval_ReceiveSeized`
+-- (AL-11) so the create-via-preapproval logic (instrument match, positive amount,
+-- expiry, holding shape) cannot drift between the mint and seizure-reallocation
+-- paths — those remain distinct CHOICES (for the reconciler's event distinction) but
+-- share this BODY. Must be called from a choice on the preapproval (so the receiver's
+-- signatory authority is in scope to create the holding).
+createViaPreapproval :
+  Party -> Party -> Optional Time -> InstrumentId -> InstrumentId -> Decimal -> Metadata
+  -> Update (ContractId Holding)
+createViaPreapproval admin receiver expiresAt preapprovalInstrumentId requestedInstrumentId amount holdingMeta = do
+  assertMsg "Preapproval instrumentId does not match requested instrumentId"
+    (preapprovalInstrumentId == requestedInstrumentId)
+  assertMsg "Amount must be positive" (amount > 0.0)
+  now <- getTime
+  case expiresAt of
+    None -> pure ()
+    Some deadline -> assertMsg "Transfer preapproval has expired" (now < deadline)
+  cid <- create SimpleHolding with
+    admin
+    owner = receiver
+    instrumentId = requestedInstrumentId
+    amount
+    meta = holdingMeta
+  pure (toInterfaceContractId @Holding cid)
+
 -- | A preapproval that allows any sender to transfer tokens to the receiver.
 -- The TransferPreapproval_Send choice is nonconsuming, making it reusable.
 -- The choice creates the receiver holding (and sender change) using the receiver's
@@ -83,53 +110,29 @@ template TransferPreapproval
         amount : Decimal                 -- ^ Amount to mint into the receiver's holding.
         holdingMeta : Metadata
       controller admin
-      do
-        assertMsg "Preapproval instrumentId does not match mint instrumentId"
-          (instrumentId == mintInstrumentId)
-        assertMsg "Mint amount must be positive"
-          (amount > 0.0)
-        now <- getTime
-        case expiresAt of
-          None -> pure ()
-          Some deadline ->
-            assertMsg "Transfer preapproval has expired" (now < deadline)
-        cid <- create SimpleHolding with
-          admin
-          owner = receiver
-          instrumentId = mintInstrumentId
-          amount
-          meta = holdingMeta
-        pure (toInterfaceContractId @Holding cid)
+      do createViaPreapproval admin receiver expiresAt instrumentId mintInstrumentId amount holdingMeta
 
     -- | Seize-reallocation path (AL-11): create a holding for the receiver to RECEIVE
     -- value seized from another party, reusing the receiver's authority from this
-    -- preapproval. Mechanically identical to `TransferPreapproval_MintInto`, but a
-    -- DISTINCT choice so the ledger (and the off-ledger D2 reconciler) records a
-    -- seizure-reallocation rather than new supply: the governed caller pairs it, in
-    -- the same transaction, with a `SimpleHolding_ForcedSeize` that archives the
-    -- seized holding, so net supply is unchanged. The intended caller is the
-    -- two-person `SeizureProposal_Approve`; controller is `admin` (the root authority
-    -- the SeizureProposal carries), so non-admin parties cannot reach it.
+    -- preapproval. Shares its body (`createViaPreapproval`) with
+    -- `TransferPreapproval_MintInto`, but is a DISTINCT choice so the ledger (and the
+    -- off-ledger D2 reconciler) records a seizure-reallocation rather than new supply:
+    -- the governed caller (`SeizureProposal_Approve`) pairs it, in the same
+    -- transaction, with a `SimpleHolding_ForcedSeize` that archives the seized holding,
+    -- so net supply is unchanged.
+    --
+    -- ⚠ Like `MintInto`, this is a pure create-via-preapproval (no input consumed) with
+    -- `controller admin`. Non-admin parties cannot reach it, but the registry ROOT can
+    -- exercise it standalone — WITHOUT a paired `ForcedSeize` — as an unmetered root
+    -- mint (no Minter cap, allowance, or pause). Supply-neutrality is a property of the
+    -- `SeizureProposal_Approve` caller pairing the two exercises, NOT of this primitive;
+    -- the off-ledger D2 reconciler must net the seizure pair (archive + create in one
+    -- tx) to zero, and must NOT treat a standalone `ReceiveSeized` as value-neutral.
+    -- See docs/ADMIN-LAYER-PLAN.md §11.4.
     nonconsuming choice TransferPreapproval_ReceiveSeized : ContractId Holding
       with
         seizedInstrumentId : InstrumentId  -- ^ Instrument being reallocated (must match the preapproval).
         amount : Decimal                   -- ^ Amount reallocated into the receiver's holding.
         holdingMeta : Metadata
       controller admin
-      do
-        assertMsg "Preapproval instrumentId does not match seized instrumentId"
-          (instrumentId == seizedInstrumentId)
-        assertMsg "Seized amount must be positive"
-          (amount > 0.0)
-        now <- getTime
-        case expiresAt of
-          None -> pure ()
-          Some deadline ->
-            assertMsg "Transfer preapproval has expired" (now < deadline)
-        cid <- create SimpleHolding with
-          admin
-          owner = receiver
-          instrumentId = seizedInstrumentId
-          amount
-          meta = holdingMeta
-        pure (toInterfaceContractId @Holding cid)
+      do createViaPreapproval admin receiver expiresAt instrumentId seizedInstrumentId amount holdingMeta

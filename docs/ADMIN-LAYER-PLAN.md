@@ -446,6 +446,29 @@ creation. The design follows from that.
   V1/V2 allocation, allocation-instruction): that would add more surface/risk than
   the bounded, self-cleaning orphan it removes. Funds are never at risk — they are
   destroyed at seizure time. Verified by `test_forcedBurnSeizesInFlightTransfer`.
+- **AL-11 seizure — `TransferPreapproval_ReceiveSeized` is a root-callable create.**
+  Like `MintInto`, it is `controller admin` and creates a holding with no input, so
+  the registry root can exercise it standalone as an unmetered root mint. Supply is
+  preserved only because `SeizureProposal_Approve` pairs it with a
+  `SimpleHolding_ForcedSeize` archive in the same transaction — that is a property of
+  the *caller*, not the primitive. The off-ledger D2 reconciler must therefore **net
+  the seizure pair** (one `ForcedSeize` archive + one `ReceiveSeized` create in the
+  same tx ⇒ zero) and must **not** treat a *standalone* `ReceiveSeized` (no paired
+  archive) as value-neutral — otherwise a root mint via this path would be invisible.
+- **AL-11 two-person control is enforced in the `SeizureProposal` wrapper, not the
+  holding primitive.** `SimpleHolding_ForcedSeize` is `controller admin` with no
+  capability/proposal linkage (it cannot reference `SeizureProposal` without a module
+  cycle), so the separation-of-duties guarantee (INV-43) holds only for seizes routed
+  through `SeizureProposal`. A future *admin-signed* choice that calls `ForcedSeize`
+  directly would bypass it — the obligation on new admin-signed choices is to route
+  seizures through the wrapper. (A lone capability holder still cannot reach it; only
+  the genesis root or another admin-signed contract can.) **[design call — see PLAN §17.7]**
+- **AL-11 v1 seizes only unlocked `SimpleHolding`** (type-scoped); a target can shield
+  funds from value-preserving *reallocation* by keeping them locked/in-flight, leaving
+  only the destructive `LockedSimpleHolding_ForcedBurn`. And the reallocation
+  destination must already hold a `TransferPreapproval` (creating a holding needs the
+  recipient's authority), so a court order naming an un-onboarded custodian requires
+  onboarding that party first. **[design calls — see PLAN §17.7]**
 - **Pending `MintProposal`s are not cancelled** by revoking the minter's capability
   or by pausing — a proposal is a committed origination, and only
   `MintProposal_Withdraw` (admin) or recipient `MintProposal_Reject` stops it.

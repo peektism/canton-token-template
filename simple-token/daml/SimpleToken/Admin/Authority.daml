@@ -202,15 +202,18 @@ template TokenAdministrator
     -- instrument; a DIFFERENT `LegalAdmin` must later approve via
     -- `SeizureProposal_Approve` for the seizure to take effect — no single officer
     -- can both propose and approve an irreversible deprivation of property. The
-    -- holding's owner/amount/instrument are captured now for the audit record and to
-    -- detect tampering at approval (`eSeizureHoldingMismatch`). The choice runs with
+    -- holding's owner/amount/instrument are captured now for the immutable audit
+    -- record (no re-validation is needed at approval: `targetHoldingCid` is an
+    -- immutable contract id, so if the owner moved/burned it the cid is stale and the
+    -- approve's `SimpleHolding_ForcedSeize` fails `NotActive`). The choice runs with
     -- this anchor's admin authority, so the created `SeizureProposal` is admin-signed
     -- (it later carries the authority to archive the seized holding); the proposer is
     -- only an observer, exactly as a `LegalAdmin` delegate holds a capability, not the
     -- root key.
     --
     -- # Invariants enforced:
-    -- - INV-43: proposing a seizure requires a LegalAdmin capability (step 1 of 2)
+    -- - INV-43: proposing a seizure requires a LegalAdmin capability (step 1 of 2);
+    --   the proposer may not be the seizure beneficiary (separation of duties)
     nonconsuming choice Admin_ProposeSeizure : ContractId SeizureProposal
       with
         proposer : Party                            -- ^ The LegalAdmin proposing the seizure.
@@ -222,6 +225,9 @@ template TokenAdministrator
       do
         holding <- fetch targetHoldingCid
         assertMsg eSeizureForeignHolding (holding.admin == admin)
+        -- Separation of duties: an officer cannot propose a seizure into their own
+        -- account (the approver is barred too, at approval).
+        assertMsg eSeizureBeneficiaryIsOfficer (newOwner /= proposer)
         _ <- requireRole proposer LegalAdmin admin (Some holding.instrumentId) proposerLegalCap
         create SeizureProposal with
           admin
@@ -252,7 +258,7 @@ template SeizureProposal
     admin : Party
     proposer : Party                            -- ^ The LegalAdmin who proposed (cannot also approve).
     targetHoldingCid : ContractId SimpleHolding -- ^ The holding to seize.
-    seizedOwner : Party                         -- ^ The current owner, captured at propose (tamper check).
+    seizedOwner : Party                         -- ^ The owner seized from, captured at propose for the immutable audit record (not re-validated — cid immutability already forces a re-propose if the holding moved).
     amount : Decimal                            -- ^ The amount, captured at propose.
     instrumentId : InstrumentId                 -- ^ The instrument, captured at propose.
     newOwner : Party                            -- ^ The reallocation destination.
@@ -277,7 +283,8 @@ template SeizureProposal
     -- against a still-consenting owner; see `SimpleHolding_ForcedBurn`).
     --
     -- # Invariants enforced:
-    -- - INV-43: approval requires a LegalAdmin capability AND `approver /= proposer` (two-person)
+    -- - INV-43: approval requires a LegalAdmin capability, `approver /= proposer`
+    --   (two-person), and neither officer is the beneficiary (separation of duties)
     -- - INV-44: value preserved — an equal amount/instrument is reallocated to the proposed `newOwner`
     choice SeizureProposal_Approve : ContractId Holding
       with
@@ -287,6 +294,10 @@ template SeizureProposal
       controller approver
       do
         assertMsg eSeizureRequiresTwoOfficers (approver /= proposer)
+        -- Separation of duties: neither officer may be the beneficiary, so an
+        -- approver cannot approve a seizure into their own (or the proposer's)
+        -- account. (`newOwner /= proposer` was also checked at propose.)
+        assertMsg eSeizureBeneficiaryIsOfficer (newOwner /= approver && newOwner /= proposer)
         _ <- requireRole approver LegalAdmin admin (Some instrumentId) approverLegalCap
         preapproval <- fetch newOwnerPreapprovalCid
         assertMsg eSeizureNewOwnerMismatch

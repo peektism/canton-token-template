@@ -13,8 +13,11 @@
 -- capability gate) or a structural `NotActive` (a stale / cancelled target).
 module SimpleToken.Test.Seize where
 
-import SimpleToken.Holding (SimpleHolding_Burn(..))
-import SimpleToken.Admin.Authority (SeizureProposal_Cancel(..))
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import SimpleToken.Holding (SimpleHolding(..), SimpleHolding_Burn(..))
+import SimpleToken.Preapproval (TransferPreapproval)
+import SimpleToken.Admin.Authority (TokenAdministrator, SeizureProposal, Admin_ProposeSeizure(..), SeizureProposal_Approve(..), SeizureProposal_Cancel(..))
 import SimpleToken.Admin.Roles (Role(..))
 import SimpleToken.Testing.SimpleRegistry
 import SimpleToken.Testing.WalletClient
@@ -143,6 +146,8 @@ test_seizeStaleTargetRejected = do
   -- the owner redeems (burns) the holding before approval → target cid is stale.
   submit seized $ exerciseCmd hCid SimpleHolding_Burn
   approveSeizureMustFail registry proposal legalB capB recoveryPre
+  -- atomic: the failed seizure created no recovery holding.
+  checkBalance recovery registry.instrumentId 0.0
 
 -- | The proposer can cancel an unexecuted proposal; approval then fails (NotActive).
 test_seizeCancellable : Script ()
@@ -158,3 +163,86 @@ test_seizeCancellable = do
   approveSeizureMustFail registry proposal legalB capB recoveryPre
   -- the holding is untouched: alice still holds it.
   checkBalance seized registry.instrumentId 100.0
+
+-- INV-43 — separation of duties: an officer cannot be the beneficiary
+---------------------------------------------------------------------
+
+-- | Neither the proposer nor the approver may be the seizure beneficiary — an
+-- officer cannot approve a seizure into their own account (conflict of interest).
+test_seizeBeneficiaryCannotBeOfficer : Script ()
+test_seizeBeneficiaryCannotBeOfficer = do
+  SeizeEnv{env = TestEnv{..}, ..} <- setupSeize
+  adminCid <- createTokenAdministrator registry
+  capA <- issueRole registry adminCid legalA LegalAdmin
+  capB <- issueRole registry adminCid legalB LegalAdmin
+  hCid <- createSimpleHolding registry seized 100.0
+  -- proposer cannot name itself as beneficiary (rejected at propose).
+  proposeSeizureMustFail registry adminCid legalA capA hCid legalA "self-deal"
+  -- approver cannot approve a seizure whose beneficiary is the approver.
+  legalBPre <- createPreapproval registry legalB None
+  proposal <- proposeSeizure registry adminCid legalA capA hCid legalB "to-approver"
+  approveSeizureMustFail registry proposal legalB capB legalBPre
+
+-- INV-43/44 — cross-registry isolation
+---------------------------------------
+
+-- | A seizure proposed through registry A cannot target a holding governed by a
+-- different registry B (eSeizureForeignHolding). The foreign holding is disclosed so
+-- the failure is the registry guard, not contract visibility.
+test_seizeForeignHoldingRejected : Script ()
+test_seizeForeignHoldingRejected = do
+  SeizeEnv{env = TestEnv{..}, ..} <- setupSeize
+  adminCid <- createTokenAdministrator registry
+  capA <- issueRole registry adminCid legalA LegalAdmin
+  registryB <- initialize "admin-b" "TokenB"
+  foreignHolding <- createSimpleHolding registryB seized 100.0
+  anchorDisc <- queryDisc @TokenAdministrator registry.admin adminCid
+  foreignDisc <- queryDisc @SimpleHolding registryB.admin foreignHolding
+  submitWithDiscMustFail legalA (anchorDisc <> foreignDisc) $
+    exerciseCmd adminCid Admin_ProposeSeizure with
+      proposer = legalA; proposerLegalCap = capA
+      targetHoldingCid = foreignHolding; newOwner = recovery; reason = "x"
+
+-- | At approval, the destination preapproval must belong to THIS registry; a
+-- foreign-registry preapproval (correct receiver, wrong admin) is rejected
+-- (the `preapproval.admin == admin` half of eSeizureNewOwnerMismatch).
+test_seizeForeignPreapprovalRejected : Script ()
+test_seizeForeignPreapprovalRejected = do
+  SeizeEnv{env = TestEnv{..}, ..} <- setupSeize
+  adminCid <- createTokenAdministrator registry
+  capA <- issueRole registry adminCid legalA LegalAdmin
+  capB <- issueRole registry adminCid legalB LegalAdmin
+  hCid <- createSimpleHolding registry seized 100.0
+  proposal <- proposeSeizure registry adminCid legalA capA hCid recovery "x"
+  -- a preapproval for `recovery` but issued under a DIFFERENT registry's admin.
+  registryB <- initialize "admin-b2" "TokenB2"
+  foreignPre <- createPreapproval registryB recovery None
+  proposalDisc <- queryDisc @SeizureProposal registry.admin proposal
+  holdingDisc <- queryDisc @SimpleHolding registry.admin hCid
+  foreignPreDisc <- queryDisc @TransferPreapproval registryB.admin foreignPre
+  submitWithDiscMustFail legalB (proposalDisc <> holdingDisc <> foreignPreDisc) $
+    exerciseCmd proposal SeizureProposal_Approve with
+      approver = legalB; approverLegalCap = capB; newOwnerPreapprovalCid = foreignPre
+
+-- INV-43 — instrument-scoped LegalAdmin
+----------------------------------------
+
+-- | An instrument-scoped LegalAdmin can seize a holding of its instrument (and a
+-- LegalAdmin scoped to a DIFFERENT instrument cannot — least privilege).
+test_seizeScopedLegalAdmin : Script ()
+test_seizeScopedLegalAdmin = do
+  SeizeEnv{env = TestEnv{..}, ..} <- setupSeize
+  adminCid <- createTokenAdministrator registry
+  hCid <- createSimpleHolding registry seized 100.0
+  recoveryPre <- createPreapproval registry recovery None
+  -- instrument-scoped LegalAdmins for the registry's instrument: the seizure works.
+  capA <- issueScopedRole registry adminCid legalA LegalAdmin registry.instrumentId
+  capB <- issueScopedRole registry adminCid legalB LegalAdmin registry.instrumentId
+  proposal <- proposeSeizure registry adminCid legalA capA hCid recovery "scoped"
+  _ <- approveSeizure registry proposal legalB capB recoveryPre
+  checkBalance recovery registry.instrumentId 100.0
+  -- a LegalAdmin scoped to a DIFFERENT instrument cannot propose (eCapabilityScopeMismatch).
+  h2 <- createSimpleHolding registry seized 50.0
+  let otherInstrument = (registry.instrumentId : InstrumentId) with id = "OTHER"
+  wrongScope <- issueScopedRole registry adminCid legalA LegalAdmin otherInstrument
+  proposeSeizureMustFail registry adminCid legalA wrongScope h2 recovery "wrong-scope"

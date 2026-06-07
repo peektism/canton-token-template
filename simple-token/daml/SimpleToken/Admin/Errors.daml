@@ -59,6 +59,14 @@ eSeizureRequiresTwoOfficers = "simple-token: a forced seizure requires two disti
 eSeizureForeignHolding : Text
 eSeizureForeignHolding = "simple-token: seized holding is not governed by this registry"
 
+-- | INV-43 (separation of duties): neither seizure officer — the proposer nor the
+-- approver — may be the seizure beneficiary (`newOwner`). Two-person control bars a
+-- single officer from acting unilaterally; this bars an approving officer from
+-- approving a seizure into their OWN account (a direct conflict of interest), so the
+-- value cannot land with a party that authorized taking it.
+eSeizureBeneficiaryIsOfficer : Text
+eSeizureBeneficiaryIsOfficer = "simple-token: a seizure officer (proposer or approver) cannot be the seizure beneficiary"
+
 -- | INV-44: the destination preapproval must belong to this registry and name the
 -- exact `newOwner` recorded in the proposal — the approver cannot redirect the
 -- seized value to a different party than the one proposed.
