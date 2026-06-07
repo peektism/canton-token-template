@@ -354,6 +354,24 @@ mintToMustFail registry minter minterCap recipient amount = do
       instrumentId = registry.instrumentId
       extraArgs
 
+-- | Accept a cold-path `MintProposal` through the live factory (AL-10): the
+-- recipient exercises `Rules_AcceptMintProposal`, which re-checks the account
+-- freeze before creating the holding. The factory is disclosed to the recipient
+-- (the off-ledger service provides this in production); the recipient observes
+-- the proposal, so no extra disclosure is needed for it.
+acceptMintProposal : SimpleRegistry -> Party -> ContractId MintProposal -> Script (ContractId Holding)
+acceptMintProposal registry recipient proposalCid = do
+  (rulesCid, disc) <- currentRules registry
+  submitWithDisc recipient disc $
+    exerciseCmd rulesCid Rules_AcceptMintProposal with recipient; proposalCid
+
+-- | Like `acceptMintProposal`, but asserts acceptance fails (e.g. a frozen recipient).
+acceptMintProposalMustFail : SimpleRegistry -> Party -> ContractId MintProposal -> Script ()
+acceptMintProposalMustFail registry recipient proposalCid = do
+  (rulesCid, disc) <- currentRules registry
+  submitWithDiscMustFail recipient disc $
+    exerciseCmd rulesCid Rules_AcceptMintProposal with recipient; proposalCid
+
 -- | Create the advisory (D2) total-supply contract for the registry instrument.
 createTotalSupply : SimpleRegistry -> Script (ContractId TotalSupply)
 createTotalSupply registry =

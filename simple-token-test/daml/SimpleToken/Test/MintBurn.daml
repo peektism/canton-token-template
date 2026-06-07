@@ -16,7 +16,7 @@ import SimpleToken.Holding
   ( SimpleHolding, SimpleHolding_Burn(..), SimpleHolding_ForcedBurn(..)
   , LockedSimpleHolding, LockedSimpleHolding_ForcedBurn(..)
   )
-import SimpleToken.Supply (MintProposal_Accept(..), TotalSupply_AdjustMinted(..))
+import SimpleToken.Supply (TotalSupply_AdjustMinted(..))
 import SimpleToken.Admin.Roles (Role(..))
 import SimpleToken.Testing.SimpleRegistry
 import SimpleToken.Testing.WalletClient
@@ -57,7 +57,7 @@ test_mintProposalWhenNoPreapproval = do
   assert (null result.mintedHoldingCids)
   case result.pendingProposalCid of
     Some proposalCid -> do
-      _ <- submit bob $ exerciseCmd proposalCid MintProposal_Accept
+      _ <- acceptMintProposal registry bob proposalCid
       checkBalance bob registry.instrumentId 300.0
     None -> fail "Expected a pending MintProposal"
 

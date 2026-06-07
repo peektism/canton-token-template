@@ -20,11 +20,15 @@ eRedundantPauseChange = "simple-token: registry already in the requested pause s
 -- Account freeze / compliance hold (AL-10)
 -------------------------------------------
 
--- | INV-40: a frozen account is refused at every origination chokepoint — it can
--- neither send nor receive (nor be minted to). The per-account analogue of
--- `eRegistryPaused`; freeze is origination control like pause (it does not reach
--- into committed flows). The compliance hold is enforced by withholding the
--- registry admin's required signature at the factory, not via a public blocklist.
+-- | INV-40: a frozen account is refused at every origination chokepoint — it
+-- cannot ORIGINATE a send or a receive, cannot be minted to (incl. accepting a
+-- cold-path MintProposal), and cannot be a counterparty on a newly-originated
+-- transfer/allocation. The per-account analogue of `eRegistryPaused`: freeze is
+-- ORIGINATION control like pause (INV-33) — an inbound transfer/allocation that was
+-- already committed (funds locked) before the freeze still completes; clawing those
+-- back is the separate forced-transfer capability (AL-11), not freeze. The hold is
+-- enforced by withholding the registry admin's required signature at the factory,
+-- never a public on-ledger blocklist.
 eAccountFrozen : Text
 eAccountFrozen = "simple-token: account is frozen (compliance hold)"
 

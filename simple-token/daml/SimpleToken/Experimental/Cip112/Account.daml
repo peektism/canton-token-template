@@ -82,6 +82,15 @@ accountAuthority admin account =
 accountPrincipal : Party -> Account -> Party
 accountPrincipal = TokenStandard.accountPrincipal
 
+-- | All freeze-relevant parties of an account: the owning principal AND the
+-- provider, when distinct (for provider-managed accounts). The freeze guards use
+-- this rather than `accountPrincipal` alone so that a compliance hold on EITHER
+-- the account owner OR its acting provider blocks the flow — `accountPrincipal`
+-- resolves only the owner, which would let a sanctioned provider keep transacting
+-- on behalf of an un-frozen owner. Works for both regular and special accounts.
+accountParties : Party -> Account -> [Party]
+accountParties = TokenStandard.accountParties
+
 -- | Parties that must be able to observe regular account movements.
 -- The full V2 authorization split remains intentionally unresolved here.
 accountObservers : Account -> [Party]

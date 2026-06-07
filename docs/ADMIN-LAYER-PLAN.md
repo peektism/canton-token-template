@@ -406,11 +406,17 @@ creation. The design follows from that.
   `Rules_Mint` rejects the proposal path for capped minters
   (`eCappedMinterRequiresPreapproval`). **Unlimited** minters use the proposal path
   freely (no allowance to leak; the capability is validated but not consumed).
-- **A `MintProposal` is a committed origination.** The minter, capability, pause,
-  and supported-instrument were all validated at `Rules_Mint` time; the recipient's
-  later `MintProposal_Accept` *completes* an already-authorized mint, so — like a
-  committed transfer/allocation — it is not re-gated on pause. (Robust pause is
-  only enforceable at the factory chokepoint in a keyless model; see §4.)
+- **A `MintProposal` is a committed origination — but acceptance re-checks the
+  account freeze (AL-10).** The minter, capability, pause, and supported-instrument
+  were validated at `Rules_Mint` time. Acceptance is **not** a choice on the proposal;
+  the recipient accepts via **`Rules_AcceptMintProposal` on the live factory**, which
+  re-checks `frozenAccounts` before creating the holding — closing the propose→accept
+  window in which the recipient could be placed on a compliance hold (a frozen party
+  must never be *credited* new supply). Pause is **not** re-gated at accept (like a
+  committed transfer/allocation completion; robust pause is only enforceable at the
+  factory chokepoint in a keyless model — see §4). Routing accept through the factory
+  rather than a bare proposal choice is what makes the live freeze state reachable
+  (the proposal lives in `Supply`, which `Rules` imports — the reverse would cycle).
 
 ### 11.4 Accepted limitations (surfaced, not hidden)
 

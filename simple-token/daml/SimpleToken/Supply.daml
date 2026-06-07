@@ -20,7 +20,6 @@ module SimpleToken.Supply where
 import Splice.Api.Token.HoldingV1
 import Splice.Api.Token.MetadataV1
 
-import SimpleToken.Holding
 import SimpleToken.Admin.Errors
 
 -- | Advisory, auditable circulating-supply total for one instrument. Anchored to
@@ -69,13 +68,14 @@ template MintProposal
     observer recipient
     ensure amount > 0.0
 
-    -- | Recipient accepts; their holding is created (admin authority from the
-    -- proposal signatory, recipient authority from the controller).
-    choice MintProposal_Accept : ContractId Holding
-      controller recipient
-      do
-        cid <- create SimpleHolding with admin; owner = recipient; instrumentId; amount; meta
-        pure (toInterfaceContractId @Holding cid)
+    -- NB: acceptance is NOT a choice here. The recipient accepts via
+    -- `SimpleToken.Rules.Rules_AcceptMintProposal` on the live factory, so the
+    -- holding is created through the same origination chokepoint as a direct mint
+    -- and the account-freeze (AL-10) is re-checked at accept time — closing the
+    -- propose→accept window in which the recipient could be placed on a compliance
+    -- hold. A bare accept-choice here could not read the live `frozenAccounts`
+    -- (it lives on the factory; `Rules` imports this module, so the reverse import
+    -- would be a cycle). See docs/ADMIN-LAYER-PLAN.md §11.
 
     -- | Recipient declines the mint.
     choice MintProposal_Reject : ()

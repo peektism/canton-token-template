@@ -13,14 +13,18 @@
 module SimpleToken.Test.Freeze where
 
 import Splice.Api.Token.TransferInstructionV1
+import Splice.Api.Token.TransferInstructionV2 qualified as TransferV2
 
 import SimpleToken.Rules (Rules_FreezeAccount(..), Rules_UnfreezeAccount(..))
 import SimpleToken.Admin.Roles (Role(..))
+import SimpleToken.Experimental.Cip112.Account (providerManagedAccount)
 import SimpleToken.Testing.SimpleRegistry
 import SimpleToken.Testing.WalletClient
 import SimpleToken.Test.Setup
 import SimpleToken.Test.Transfer (mkTransfer)
 import SimpleToken.Test.Allocation (mkAllocationArgs)
+import SimpleToken.Test.Cip112Transfer (mkV2Transfer, getV2TransferFactory)
+import SimpleToken.Test.Cip112ProviderManaged (mkProviderTransfer, createProviderManagedHolding)
 
 import Daml.Script
 
@@ -200,3 +204,83 @@ test_complianceAdminDelegableAndObservable = do
   minterCap <- issueRole registry adminCid registry.admin Minter
   _ <- createPreapproval registry charlie None
   mintToMustFail registry registry.admin minterCap charlie 10.0
+
+-- V2 / provider-managed coverage (the accountParties-based guards)
+------------------------------------------------------------------
+
+-- | INV-40 on the V2 transfer chokepoint (basic accounts): a frozen sender cannot
+-- originate a V2 transfer. Exercises the `accountParties`-based guard, which the
+-- V1-interface freeze tests above do not reach.
+test_freezeBlocksV2BasicTransfer : Script ()
+test_freezeBlocksV2BasicTransfer = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  compCap <- issueRole registry adminCid registry.admin ComplianceAdmin
+  [h1] <- fundParty registry alice 100.0
+  _ <- freezeAccount registry registry.admin compCap alice "OFAC SDN match"
+  (tfCid, rulesDisc) <- getV2TransferFactory registry
+  submitWithDiscMustFail alice rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkV2Transfer registry alice bob 70.0 [h1]
+      actors = [alice]
+      extraArgs = emptyExtraArgs
+
+-- | INV-40 (#3 fix): on a provider-managed account, freezing the acting PROVIDER —
+-- not just the owner — blocks the transfer. The guard checks `accountParties` (owner
+-- AND provider), so a sanctioned custody provider cannot keep transacting on behalf
+-- of an un-frozen owner. Unfreezing the provider restores the flow, proving the block
+-- is the provider hold and not a broken setup.
+test_freezeProviderBlocksProviderManagedTransfer : Script ()
+test_freezeProviderBlocksProviderManagedTransfer = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice          -- account owner (NOT frozen)
+      charlie = parties.charlie      -- acting provider (frozen)
+      executor = parties.executor
+      aliceAcct = providerManagedAccount alice charlie "alice-managed"
+      bobAcct = providerManagedAccount parties.bob executor "bob-managed"
+  adminCid <- createTokenAdministrator registry
+  compCap <- issueRole registry adminCid registry.admin ComplianceAdmin
+  h1 <- createProviderManagedHolding registry aliceAcct 100.0
+  -- Freeze the PROVIDER (charlie); the owner (alice) is not frozen.
+  _ <- freezeAccount registry registry.admin compCap charlie "custody provider sanctioned"
+  (tfCid, rulesDisc) <- getV2TransferFactory registry
+  submitWithDiscMustFail charlie rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkProviderTransfer registry aliceAcct bobAcct 70.0 [h1]
+      actors = [charlie]
+      extraArgs = emptyExtraArgs
+  -- Unfreezing the provider restores the flow → proves the block was the hold.
+  _ <- unfreezeAccount registry registry.admin compCap charlie "cleared"
+  (tfCid2, rulesDisc2) <- getV2TransferFactory registry
+  _ <- submitWithDisc charlie rulesDisc2 $
+    exerciseCmd tfCid2 TransferV2.TransferFactory_Transfer with
+      transfer = mkProviderTransfer registry aliceAcct bobAcct 70.0 [h1]
+      actors = [charlie]
+      extraArgs = emptyExtraArgs
+  pure ()
+
+-- | INV-40 (#1 fix): a recipient frozen in the propose→accept window of a cold-path
+-- mint cannot accept the MintProposal (acceptance is re-checked at the factory).
+-- Unfreezing lets them accept, so the block is the hold, not a broken proposal.
+test_mintProposalAcceptBlockedWhenRecipientFrozen : Script ()
+test_mintProposalAcceptBlockedWhenRecipientFrozen = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice          -- unlimited minter
+      bob = parties.bob              -- recipient, frozen after propose
+  adminCid <- createTokenAdministrator registry
+  minterCap <- issueRole registry adminCid alice Minter
+  compCap <- issueRole registry adminCid registry.admin ComplianceAdmin
+  -- No preapproval for bob → cold path → a MintProposal.
+  result <- mintTo registry alice minterCap bob 300.0
+  case result.pendingProposalCid of
+    Some proposalCid -> do
+      -- Freeze bob AFTER the proposal exists (the previously-open window).
+      _ <- freezeAccount registry registry.admin compCap bob "OFAC SDN match"
+      acceptMintProposalMustFail registry bob proposalCid
+      -- Once cleared, bob can accept and receive.
+      _ <- unfreezeAccount registry registry.admin compCap bob "cleared"
+      _ <- acceptMintProposal registry bob proposalCid
+      checkBalance bob registry.instrumentId 300.0
+    None -> fail "Expected a pending MintProposal (unlimited minter, no preapproval)"

@@ -28,7 +28,7 @@ import SimpleToken.Reporting (recordHoldingsChangeEvent)
 import SimpleToken.Experimental.Cip112.Account
   ( accountAuthority
   , accountObservers
-  , accountPrincipal
+  , accountParties
   , assertSupportedRegularAccount
   , isBasicAccount
   , isSupportedRegularAccount
@@ -70,8 +70,11 @@ assertNotPaused paused = assertMsg eRegistryPaused (not paused)
 -- | Account-freeze guard (AL-10): the per-account analogue of `assertNotPaused`.
 -- Fails the transaction if ANY of the given parties is on the registry's
 -- `frozenAccounts` list. Checked at the same origination chokepoints as pause,
--- against sender AND receiver (and the mint recipient), so a frozen account can
--- neither send nor receive — the OFAC/AML compliance hold (INV-40).
+-- against sender AND receiver (and the mint recipient / proposal acceptor), so a
+-- frozen account cannot ORIGINATE a send or receive (the OFAC/AML hold, INV-40).
+-- Like pause, this is origination control (INV-33): an inbound transfer/allocation
+-- committed before the freeze still completes — seizing those funds is the separate
+-- forced-transfer capability (AL-11), deliberately not folded into freeze.
 --
 -- It is non-spoofable for the same reason pause is: `frozenAccounts` is a field on
 -- the `SimpleTokenRules` contract being exercised, not a caller-supplied lookup
@@ -278,6 +281,42 @@ template SimpleTokenRules
               pendingProposalCid = Some proposalCid
               minterCapCid = minterCap
 
+    -- | Accept a cold-path `MintProposal` THROUGH the factory (AL-10). Routing the
+    -- accept through the live factory — rather than a bare choice on the proposal —
+    -- lets holding-creation re-check the account freeze against the current
+    -- `frozenAccounts`, closing the propose→accept window in which `recipient` could
+    -- be placed on a compliance hold (the direct mint path is already freeze-checked
+    -- in `Rules_Mint`, but the cold path creates the holding in a later transaction).
+    -- The factory's `admin` signatory authorizes archiving the proposal and creating
+    -- the holding; `recipient` (the controller) supplies the recipient authority —
+    -- the same authorities the old `MintProposal_Accept` carried. Pause is NOT
+    -- re-checked here: like accepting an in-flight transfer, this completes a mint the
+    -- minter already originated under `Rules_Mint`'s pause gate (origination control).
+    --
+    -- # Invariants enforced:
+    -- - INV-40: a recipient frozen after the proposal was created cannot accept it
+    nonconsuming choice Rules_AcceptMintProposal : ContractId Holding
+      with
+        recipient : Party                        -- ^ The proposal recipient accepting.
+        proposalCid : ContractId MintProposal    -- ^ The pending proposal to accept.
+      controller recipient
+      do
+        proposal <- fetch proposalCid
+        assertMsg "MintProposal admin does not match factory admin"
+          (proposal.admin == admin)
+        assertMsg "MintProposal recipient does not match caller"
+          (proposal.recipient == recipient)
+        -- INV-40: re-check the live freeze state at holding-creation time.
+        assertAccountsNotFrozen frozenAccounts [recipient]
+        archive proposalCid
+        cid <- create SimpleHolding with
+          admin
+          owner = recipient
+          instrumentId = proposal.instrumentId
+          amount = proposal.amount
+          meta = proposal.meta
+        pure (toInterfaceContractId @Holding cid)
+
     interface instance TransferFactory for SimpleTokenRules where
       view = TransferFactoryView with
         admin
@@ -351,11 +390,11 @@ template SimpleTokenRules
       transferFactory_transferImpl selfCid arg = do
         -- INV-25: Pausable guard (V2 path)
         assertNotPaused paused
-        -- INV-40: account-freeze guard — check the owning principals of both accounts
-        -- (`accountPrincipal` resolves basic and provider-managed accounts alike).
+        -- INV-40: account-freeze guard — check ALL parties of both accounts
+        -- (`accountParties` = owner + provider), so a hold on either the account
+        -- owner or its acting provider blocks the flow on provider-managed accounts.
         assertAccountsNotFrozen frozenAccounts
-          [ accountPrincipal admin arg.transfer.sender
-          , accountPrincipal admin arg.transfer.receiver ]
+          (accountParties admin arg.transfer.sender <> accountParties admin arg.transfer.receiver)
         if isBasicAccount arg.transfer.sender && isBasicAccount arg.transfer.receiver
           then do
             let sender = TokenStandard.accountPrincipal arg.transfer.instrumentId.admin arg.transfer.sender
@@ -478,9 +517,10 @@ template SimpleTokenRules
         assertNotPaused paused
         let allocation = arg.allocation
         -- INV-40: account-freeze guard — the authorizer and every leg counterparty
+        -- (owner + provider for each, via `accountParties`)
         assertAccountsNotFrozen frozenAccounts
-          (accountPrincipal admin allocation.authorizer
-            :: map (\s -> accountPrincipal admin s.otherside) allocation.transferLegSides)
+          (accountParties admin allocation.authorizer
+            <> concatMap (\s -> accountParties admin s.otherside) allocation.transferLegSides)
         assertMsg "V2 allocation admin must match factory admin"
           (allocation.admin == admin)
         now <- getTime
@@ -535,7 +575,7 @@ template SimpleTokenRules
         -- completion is out of scope for freeze, as for pause — see §4 of the docs).
         assertAccountsNotFrozen frozenAccounts
           (concatMap
-            (\leg -> [accountPrincipal admin leg.sender, accountPrincipal admin leg.receiver])
+            (\leg -> accountParties admin leg.sender <> accountParties admin leg.receiver)
             arg.transferLegs)
         assertMsg v2SettlementFactoryActorFailureMsg
           (samePartySet arg.settlement.executors arg.actors)

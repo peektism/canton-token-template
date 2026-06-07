@@ -181,10 +181,14 @@ gating open questions (§4) are resolved.**
   `SimpleTokenRules`** — the same non-spoofable shape as `paused` (a field on the
   contract being exercised, not a caller-supplied lookup; keyless LF 2.1 has no global
   registry — correction C2). `assertAccountsNotFrozen` is checked at **all five
-  origination chokepoints** (V1 + V2 transfer, V1 + V2 allocation, batch settlement)
-  **plus mint**, against sender / receiver / recipient (V2 principals resolved via
-  `accountPrincipal`). The hold is realized by the registry admin **withholding its
-  required signature** at the factory — no public on-ledger blocklist
+  origination chokepoints** (V1 + V2 transfer, V1 + V2 allocation, batch settlement),
+  at **direct mint**, and at **cold-path mint acceptance** — the latter via
+  `Rules_AcceptMintProposal`, a factory-mediated accept that re-checks the live freeze
+  at holding-creation, so a recipient frozen in the propose→accept window cannot be
+  credited new supply. V2 chokepoints check **`accountParties`** (the account owner
+  **and** its provider), so freezing either the owner or the acting custody provider
+  blocks a provider-managed flow. The hold is realized by the registry admin
+  **withholding its required signature** at the factory — no public on-ledger blocklist
   (privacy-preserving, GDPR-compatible). Maintained by `ComplianceAdmin`-gated
   `Rules_FreezeAccount`/`Rules_UnfreezeAccount` (non-idempotent; admin unfreezable),
   with a read-only `Rules_GetFrozenAccounts` for wallet/audit observability. The
@@ -193,9 +197,11 @@ gating open questions (§4) are resolved.**
   path). `LegalAdmin`/`EmergencyOps` were added **reserved** in the same enum edit
   (OQ-4), graduated by AL-11/AL-13.
 - **OQs honored:** OQ-2 (manual-only, single officer — freeze is reversible),
-  OQ-4 (roles live here). **Invariants:** INV-40 (refused at every chokepoint),
-  INV-41 (registry-wide `ComplianceAdmin` gate), INV-42 (non-idempotent; admin
-  unfreezable). **Tests:** `Test/Freeze.daml`, 9 scripts, **suite 146→155 green**.
+  OQ-4 (roles live here). **Invariants:** INV-40 (refused at every origination
+  chokepoint incl. mint-proposal accept), INV-41 (registry-wide `ComplianceAdmin`
+  gate), INV-42 (non-idempotent; admin unfreezable). **Tests:** `Test/Freeze.daml`,
+  12 scripts incl. V2 basic, provider-managed (provider frozen), and mint-proposal
+  accept — **suite 158 green**.
 - **Documented coverage boundary:** freeze is *origination* control like pause —
   it gates new transfer legs in a settlement batch but does **not** reach into
   already-committed `allocations` (seizing committed funds is the distinct
