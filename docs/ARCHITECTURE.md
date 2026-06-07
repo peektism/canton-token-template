@@ -410,4 +410,63 @@ explicitly **not** recommended.
 > Open follow-up for the library: if several real consumers turn out to need a
 > generic scope, consider an optional `scope : Optional Text` on `RoleGrant` — but
 > only when driven by ≥2 consumers, to avoid speculative generality.
-```
+
+---
+
+## 10. Toward OZ-parity breadth (slices AL-8 / AL-9)
+
+AL-7 established the decoupled *substrate*. The next two slices push it toward the
+full **breadth** of the OZ Solidity contract library, prioritized for US-FI usage —
+maximal coverage, but demand-driven, not speculative.
+
+### AL-8 — full role delegability via a role-admin hierarchy
+
+The token's current delegation policy is a flat boolean (`delegableRole : Role -> Bool`,
+only `Pauser` delegable) — a deliberate MVP simplification, **narrower than OZ
+`AccessControl`**, which gives every role a configurable *admin role*
+(`getRoleAdmin` / `_setRoleAdmin`). AL-8 closes that gap so **every role is
+delegable through its admin role**, enabling the separation-of-duties hierarchies
+US financial institutions expect (treasury vs compliance vs ops; a `MinterAdmin`
+distinct from the default admin).
+
+Consistent with §3–§4, this is **library-first and layered**. The design decisions
+are locked in [PLAN.md §17.7](PLAN.md):
+
+- **The role→admin relation is a compiled pure function**, not runtime-mutable state.
+  `roleAdmin : Role -> Role` in the token (flat default: every role's admin is `Admin`),
+  reconfigured by a deliberate package upgrade rather than a live `setRoleAdmin`
+  transaction. This keeps the exhaustiveness guarantee (`-Werror=incomplete-patterns`)
+  and avoids a `RoleAdminConfig` contract that every gated grant would have to disclose
+  — at the cost of OZ's runtime reconfigurability, a trade we accept for safety/simplicity.
+- **Layer A (`oz-access-control`)** stays *mechanism-only and generic*: grant/revoke
+  require the caller to present a grant for a supplied `adminRole : Text`, plus
+  `renounceRole`. The library hard-codes **no** role graph; the consumer computes the
+  required admin role from its compiled `roleAdmin` and maps it through `roleId`. So the
+  Text-role genericity of §5 is preserved end-to-end.
+- **`Admin` / `DEFAULT_ADMIN_ROLE` stays root-managed, *not* self-administered** — we
+  keep the C9 safety (no free re-delegation of root). For handoff, AL-8 adds an
+  `AccessControlDefaultAdminRules`-style **two-step + timelocked** transfer, composing
+  the `oz-ownable` handshake primitive with a time gate — a concrete example of the
+  decoupled packages composing, and the safer posture US-FI usage favors.
+
+The DAML-specific caveat from §2 recurs: `AccessControlEnumerable` (global role-member
+enumeration) is **not expressible keyless** — there is no global lookup — so it stays
+an off-ledger indexing concern, documented rather than built.
+
+### AL-9 — parity-gap review of the planning docs
+
+AL-8 exposed a pattern worth auditing for: a feature filed under "out of scope /
+named extension seam / MVP" that is really an **OZ-parity gap we want**. AL-9 is a
+structured pass over every planning doc that reclassifies such items by
+*(OZ-parity coverage) × (US-FI demand) × (DAML feasibility)*, producing a prioritized
+**parity-gap register**. The `[permanent]` vs `[AL-9: re-examine]` tags now in
+[PLAN.md §17.4](PLAN.md#174-explicitly-excluded-with-rationale) and
+[ADMIN-LAYER-PLAN.md §10](ADMIN-LAYER-PLAN.md#10-out-of-scope-named-seams-not-gaps)
+are the starting inventory. Candidate re-examinations: two-step/timelocked admin,
+per-account freeze/seize (sanctions/compliance), allowlist/blocklist (KYC/AML),
+role enumeration, custody roles. Per [PLAN.md §17.7](PLAN.md), the decisions are
+locked: **AL-9's first artifact is a US-FI usage-expectations research summary**
+(OCC/NYDFS, OFAC freeze-seize, BSA/AML allowlist, SOC/audit) that weights the
+register, and the **breadth ceiling includes token transfer restrictions**
+(ERC-1404-style restrictions, freeze/seize, allow/blocklist) on top of OZ
+`access/` + `governance`.

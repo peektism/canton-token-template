@@ -217,13 +217,19 @@ This composes with the standard institutional pattern at zero extra code: a cold
 root party (the genesis `admin`, backed by an offline multisig via Canton
 topology) plus a hot governance party holding a live `Admin` capability.
 
-Extension seams (intentionally not built, named for maintainability):
-- **Per-role admins** (who may grant role X): generalize `Admin_DelegatedIssueRole`'s
-  `requireRole … Admin …` check to a role→role admin map.
-- **Two-step / timelocked issuance**: wrap issuance in a `RoleOffer` the assignee
-  accepts, or a time-gated wrapper.
+Extension seams — **two of these are now promoted to slice AL-8** (see
+[PLAN.md §17.5](PLAN.md), [ARCHITECTURE.md §10](ARCHITECTURE.md)); they were a
+deferred *MVP* simplification, not a permanent boundary, and matching OZ
+`AccessControl` breadth for US-FI separation-of-duties motivates building them:
+- **Per-role admins** (who may grant role X) — **→ AL-8.** Generalize the flat
+  `delegableRole : Role -> Bool` to a role→role admin relation
+  (`getRoleAdmin`/`setRoleAdmin`), so every role is delegable through its admin
+  role. Built generically in `oz-access-control`, consumed by the token.
+- **Two-step / timelocked issuance** — **→ AL-8 (parity candidate).** A
+  `RoleOffer`/handshake (the `oz-ownable` two-step primitive already models this)
+  and/or `AccessControlDefaultAdminRules`-style timelock for default-admin handoff.
 - **Multisig owner**: back the `Admin`-cap holder party with a multi-hosted Canton
-  party — no Daml change.
+  party — no Daml change (remains a topology concern).
 
 ---
 
@@ -308,14 +314,23 @@ cap), `test_delegatedCannotRevokeAdmin` (delegate cannot revoke an `Admin` cap).
 
 ## 10. Out of scope (named seams, not gaps)
 
-- Per-role admin hierarchy (`getRoleAdmin`) — seam in `Admin_DelegatedIssueRole`.
-- Two-step / timelocked issuance — optional `RoleOffer` wrapper.
-- Multisig / threshold owner — Canton topology (multi-hosted party), no code.
-- Per-asset emergency **freeze** distinct from pause — future capability (§4).
-- On-ledger reassignment of the instrument `admin` party — impossible by design
-  (C9); operator key handoff is a Canton topology operation.
-- CDP / custody / bridge roles — sibling stablecoin & bridge plans consume the
-  generic `Role` primitive.
+> ⚠️ **Under AL-9 review.** This list is being audited for items that were
+> deferred as "MVP seam" but are actually **OZ-parity gaps we want** given US-FI
+> usage. Items below are tagged accordingly; see [PLAN.md §17.4/§17.5](PLAN.md).
+
+- **→ AL-8 (now in scope).** Per-role admin hierarchy (`getRoleAdmin`/`setRoleAdmin`)
+  — generalizes the flat `delegableRole` so every role is delegable through its
+  admin role (OZ `AccessControl` parity).
+- **→ AL-8 parity candidate.** Two-step / timelocked issuance — `RoleOffer`
+  handshake (`oz-ownable` primitive) / `AccessControlDefaultAdminRules` timelock.
+- **[permanent]** Multisig / threshold owner — Canton topology (multi-hosted
+  party), no code.
+- **[AL-9: re-examine]** Per-asset emergency **freeze**/seize distinct from pause —
+  high US-FI (sanctions/compliance) relevance; future capability (§4).
+- **[permanent]** On-ledger reassignment of the instrument `admin` party —
+  impossible by design (C9); operator key handoff is a Canton topology operation.
+- **[AL-9: re-examine]** CDP / custody / bridge roles — today deferred to sibling
+  stablecoin & bridge plans; AL-9 reassesses which belong here for US-FI use.
 
 ---
 
