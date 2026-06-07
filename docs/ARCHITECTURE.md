@@ -469,9 +469,15 @@ an off-ledger indexing concern, documented rather than built.
 >   `roleAdmin : Role -> Role` (flat default all → `Admin`); the delegated
 >   issue/revoke choices now require holding `roleAdmin(targetRole)` (A1–A3 delegated
 >   to the library via `Capability.requireRole`) and **refuse `Admin`** (the
->   DefaultAdminRules posture, C9); a `PendingDefaultAdminTransfer` template wires the
->   timelocked handoff (reusing the library's `requireTimelockElapsed` — logic, not
->   storage, per §9); a self-only `RoleCapability_Renounce`. Suite 141→146.
+>   DefaultAdminRules posture, C9). The `Admin` carve-out is a single-source
+>   per-constructor predicate `delegableViaRoleAdmin : Role -> Bool` (next to
+>   `roleAdmin`, exhaustiveness-checked) enforced once in the shared
+>   `requireRoleAdmin` chokepoint — so it cannot drift between the issue and revoke
+>   paths or be forgotten by a future delegated choice, and `roleAdmin` stays the
+>   faithful, total OZ relation (`Admin` self-administers) without a contradicting
+>   `/= Admin` literal. A `PendingDefaultAdminTransfer` template wires the timelocked
+>   handoff (reusing the library's `requireTimelockElapsed` — logic, not storage, per
+>   §9); a self-only `RoleCapability_Renounce`. Suite 141→146.
 > This vindicates §9 once more: the token reuses the library's *gate/timelock logic*
 > while keeping its richer `RoleCapability` storage — the minimal `RoleGrant` cannot
 > carry scope/allowance, and templates are monomorphic. **Remaining:** the daml-verify
@@ -480,17 +486,19 @@ an off-ledger indexing concern, documented rather than built.
 ### AL-9 — parity-gap review of the planning docs
 
 AL-8 exposed a pattern worth auditing for: a feature filed under "out of scope /
-named extension seam / MVP" that is really an **OZ-parity gap we want**. AL-9 is a
-structured pass over every planning doc that reclassifies such items by
+named extension seam / MVP" that is really an **OZ-parity gap we want**. AL-9 was a
+structured pass over every planning doc that reclassified such items by
 *(OZ-parity coverage) × (US-FI demand) × (DAML feasibility)*, producing a prioritized
-**parity-gap register**. The `[permanent]` vs `[AL-9: re-examine]` tags now in
+**parity-gap register**. ✅ **Delivered → [AL-9-PARITY-GAP-REVIEW.md](AL-9-PARITY-GAP-REVIEW.md)**:
+the US-FI usage-expectations research summary (OCC/NYDFS, OFAC freeze-seize, BSA/AML
+allowlist, SOC/audit) weights the register, and the breadth ceiling includes token
+transfer restrictions (ERC-1404/3643, freeze/seize, allow/blocklist) on top of OZ
+`access/` + `governance`. **Outcome:** the `[AL-9: re-examine]` tags in
 [PLAN.md §17.4](PLAN.md#174-explicitly-excluded-with-rationale) and
 [ADMIN-LAYER-PLAN.md §10](ADMIN-LAYER-PLAN.md#10-out-of-scope-named-seams-not-gaps)
-are the starting inventory. Candidate re-examinations: two-step/timelocked admin,
-per-account freeze/seize (sanctions/compliance), allowlist/blocklist (KYC/AML),
-role enumeration, custody roles. Per [PLAN.md §17.7](PLAN.md), the decisions are
-locked: **AL-9's first artifact is a US-FI usage-expectations research summary**
-(OCC/NYDFS, OFAC freeze-seize, BSA/AML allowlist, SOC/audit) that weights the
-register, and the **breadth ceiling includes token transfer restrictions**
-(ERC-1404-style restrictions, freeze/seize, allow/blocklist) on top of OZ
-`access/` + `governance`.
+are resolved — the freeze/seize/transfer-restriction gaps became prioritized slices
+**AL-10/11/12** (Must-Have) and **AL-13** (Strong); role enumeration, on-chain
+governance, single-key ownership, and custody/CDP/bridge roles are confirmed
+classified-out (off-ledger / anti-pattern / siblings). Six open questions
+(OQ-1..OQ-6, [PLAN.md §17.7](PLAN.md#177-resolved-decisions--al-8--al-9)) gate the
+emitted slices.

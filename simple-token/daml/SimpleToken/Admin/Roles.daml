@@ -54,11 +54,15 @@ data Role
 -- every operational role — matching OZ `AccessControl` breadth and the
 -- separation-of-duties US FIs expect. Intermediate admin roles are opt-in later.
 --
---   * `Admin`'s admin is `Admin` (it self-administers in OZ). But re-delegating
---     root is **not** allowed through the delegated path: `SimpleToken.Admin.Authority`
---     refuses to issue/revoke `Admin` there (the `AccessControlDefaultAdminRules`
---     posture, preserving safety decision C9). `Admin` moves only via the genesis
---     root or the two-step + timelocked default-admin handoff.
+--   * `Admin`'s admin is `Admin` — it self-administers, exactly as OZ's
+--     `getRoleAdmin(DEFAULT_ADMIN_ROLE) == DEFAULT_ADMIN_ROLE`. This relation is
+--     deliberately *total* and faithful to OZ; the separate carve-out that the
+--     *delegated path* may not manage `Admin` lives in `delegableViaRoleAdmin`
+--     below (mirroring OZ's `AccessControlEnforcedDefaultAdminRules`, which keeps
+--     the relation yet overrides `grantRole`/`revokeRole` to reject the root role).
+--     Keeping the two concerns separate — "who administers R" (`roleAdmin`) vs.
+--     "may the delegated path touch R at all" (`delegableViaRoleAdmin`) — is what
+--     lets the gate stay a single chokepoint instead of a scattered `/= Admin`.
 --   * `Minter`/`Burner`/`BatchProcessor` are administered by `Admin`, so an `Admin`
 --     delegate may now appoint them (broader than the old root-only policy). Point
 --     a case at a narrower admin role to scope that authority.
@@ -73,6 +77,28 @@ roleAdmin Burner = Admin
 roleAdmin Pauser = Admin
 roleAdmin BatchProcessor = Admin
 roleAdmin Admin = Admin
+
+-- | The single, authoritative carve-out policy (AL-8): may `role` be granted or
+-- revoked through the **delegated** role-admin path
+-- (`Admin_DelegatedIssueRole`/`Admin_DelegatedRevokeRole`), or is it reserved to
+-- the genesis root? This is the `AccessControlDefaultAdminRules` posture expressed
+-- as one predicate: the `Admin`/`DEFAULT_ADMIN_ROLE` is **root-managed** — never
+-- delegable (no free re-delegation of root; safety decision C9), moved only by the
+-- genesis root (`Admin_IssueRole`/`Admin_RevokeRole`) or the two-step + timelocked
+-- handoff — and every other role is delegable through its `roleAdmin`.
+--
+-- It is enforced in exactly one place — `SimpleToken.Admin.Authority.requireRoleAdmin`,
+-- the chokepoint *both* delegated choices already share — so the carve-out cannot
+-- be omitted from one path or forgotten by a future delegated choice that gates
+-- through `requireRoleAdmin`. Co-locating it here (next to `roleAdmin`) and keeping
+-- it per-constructor (no wildcard) means a new `Role` must declare its policy or the
+-- build fails (`-Werror=incomplete-patterns`) — there is no silent default.
+delegableViaRoleAdmin : Role -> Bool
+delegableViaRoleAdmin Admin          = False  -- DEFAULT_ADMIN_ROLE: root-managed only (C9)
+delegableViaRoleAdmin Minter         = True
+delegableViaRoleAdmin Burner         = True
+delegableViaRoleAdmin Pauser         = True
+delegableViaRoleAdmin BatchProcessor = True
 
 -- | The typed-wrapper bridge (AL-7): map this token's closed, exhaustive `Role`
 -- sum to the `Text` role ids the generic `OpenZeppelin.AccessControl` library

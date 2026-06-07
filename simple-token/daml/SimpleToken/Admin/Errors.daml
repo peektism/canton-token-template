@@ -39,8 +39,10 @@ eCapabilityNotIssuedByThisAdmin = "simple-token: capability was not issued by th
 -- `Admin` holder (the `AccessControlDefaultAdminRules` posture; preserves safety
 -- decision C9: no free re-delegation of root). `Admin` moves only via the genesis
 -- root (`Admin_IssueRole`/`Admin_RevokeRole`) or the two-step + timelocked
--- default-admin handoff. Every other role is administered through its
--- `SimpleToken.Admin.Roles.roleAdmin`.
+-- default-admin handoff. The carve-out is the single-source
+-- `SimpleToken.Admin.Roles.delegableViaRoleAdmin` predicate, enforced once in the
+-- shared `SimpleToken.Admin.Authority.requireRoleAdmin` chokepoint; every other
+-- role is administered through its `roleAdmin`.
 eDefaultAdminRoleRootManaged : Text
 eDefaultAdminRoleRootManaged = "simple-token: the Admin role is root-managed and cannot be delegated (use the timelocked handoff)"
 

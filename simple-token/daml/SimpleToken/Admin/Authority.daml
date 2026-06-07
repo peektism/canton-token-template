@@ -26,7 +26,7 @@ import qualified OpenZeppelin.AccessControl as AC
 
 import SimpleToken.Admin.Capability (RoleCapability(..), requireRole)
 import SimpleToken.Admin.Errors
-import SimpleToken.Admin.Roles (Role(..), roleAdmin)
+import SimpleToken.Admin.Roles (Role(..), roleAdmin, delegableViaRoleAdmin)
 
 -- | Mint a capability anchored to this registry. Shared by root and delegated
 -- issuance so the create site is single-sourced.
@@ -45,15 +45,24 @@ revokeIssuedCapability admin capCid = do
   assertMsg eCapabilityNotIssuedByThisAdmin (cap.admin == admin)
   archive capCid
 
--- | Assert `caller` holds the admin role of `role` (its `roleAdmin`),
--- registry-wide — the role-admin gate (AL-8) shared by the delegated issue and
--- revoke choices, single-sourced so the two paths cannot drift. The required
--- admin role is computed from the compiled `roleAdmin` relation; the
+-- | The single chokepoint for the delegated role-admin path (AL-8). Asserts, in
+-- one place shared by the delegated issue and revoke choices (and any future
+-- delegated choice), that:
+--   1. `role` is delegable at all — the `Admin`/`DEFAULT_ADMIN_ROLE` is
+--      root-managed and rejected here (`delegableViaRoleAdmin`, the single-source
+--      carve-out in `SimpleToken.Admin.Roles`; the `AccessControlDefaultAdminRules`
+--      posture, decision C9); and
+--   2. `caller` holds the admin role of `role` (its `roleAdmin`), registry-wide.
+-- The required admin role is computed from the compiled `roleAdmin` relation; the
 -- admin/assignee/role checks (A1–A3) are delegated to the `oz-access-control`
--- library via `Capability.requireRole`. Returns the validated capability
--- (callers discard it).
+-- library via `Capability.requireRole`. Folding the carve-out into this one gate
+-- (rather than a `role /= Admin` literal repeated at each choice) means the policy
+-- cannot drift between paths or be forgotten by a new delegated choice. Returns the
+-- validated admin capability (callers discard it).
 requireRoleAdmin : Party -> Party -> Role -> ContractId RoleCapability -> Update RoleCapability
-requireRoleAdmin caller admin role adminCap = requireRole caller (roleAdmin role) admin None adminCap
+requireRoleAdmin caller admin role adminCap = do
+  assertMsg eDefaultAdminRoleRootManaged (delegableViaRoleAdmin role)
+  requireRole caller (roleAdmin role) admin None adminCap
 
 -- | The genesis governance anchor for a registry. `admin` is the immutable
 -- instrument root party (equals `SimpleTokenRules.admin`). One instance per
@@ -116,12 +125,12 @@ template TokenAdministrator
     -- posture, decision C9): re-delegating root would let a delegate mint another
     -- root. The genesis root issues `Admin` via `Admin_IssueRole`, and the
     -- two-step + timelocked `Admin_BeginDefaultAdminTransfer` is the safe handoff.
-    -- The required admin role is computed from the compiled `roleAdmin` relation;
-    -- the admin/assignee/role gate is delegated to `oz-access-control`. See
+    -- Both the root-role carve-out and the admin/assignee/role/scope gate are
+    -- enforced by the single `requireRoleAdmin` chokepoint. See
     -- docs/ADMIN-LAYER-PLAN.md §5.
     --
     -- # Invariants enforced:
-    -- - INV-31: caller must hold the registry-wide admin role of `role`; `Admin` is never delegable here
+    -- - INV-31: caller must hold the registry-wide admin role of `role`; `Admin` is never delegable here (both via `requireRoleAdmin`)
     nonconsuming choice Admin_DelegatedIssueRole : ContractId RoleCapability
       with
         caller : Party                       -- ^ The delegate exercising the choice.
@@ -131,7 +140,6 @@ template TokenAdministrator
         scope : Optional InstrumentId         -- ^ None = registry-wide; Some = single instrument.
       controller caller
       do
-        assertMsg eDefaultAdminRoleRootManaged (role /= Admin)
         _ <- requireRoleAdmin caller admin role adminCap
         mkRoleCapability admin assignee role scope
 
@@ -143,7 +151,7 @@ template TokenAdministrator
     -- un-revocable `TokenAdministrator`.
     --
     -- # Invariants enforced:
-    -- - INV-31: caller must hold the registry-wide admin role of the revoked role; `Admin` is never revocable here
+    -- - INV-31: caller must hold the registry-wide admin role of the revoked role; `Admin` is never revocable here (both via `requireRoleAdmin`)
     -- - INV-32: revoked capability becomes inactive
     nonconsuming choice Admin_DelegatedRevokeRole : ()
       with
@@ -153,7 +161,6 @@ template TokenAdministrator
       controller caller
       do
         target <- fetch capCid
-        assertMsg eDefaultAdminRoleRootManaged (target.role /= Admin)
         _ <- requireRoleAdmin caller admin target.role adminCap
         revokeIssuedCapability admin capCid
 
