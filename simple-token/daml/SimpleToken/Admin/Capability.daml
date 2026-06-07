@@ -52,6 +52,19 @@ template RoleCapability
     -- INV-36: a capped allowance is non-negative (only meaningful for Minter caps).
     ensure optional True (>= 0.0) mintAllowance
 
+    -- | The assignee renounces its own capability (AL-8, the `renounceRole`
+    -- analogue), archiving it. Self-only by construction: `assignee` is the
+    -- controller, so a party can only ever renounce a capability that names it,
+    -- mirroring `oz-access-control`'s `RoleGrant_Renounce`. The archive is
+    -- authorized by `admin`'s signatory authority carried by the contract, so the
+    -- assignee needs no admin key. Safe even for an `Admin` capability: the
+    -- genesis root retains ultimate authority through the un-revocable
+    -- `TokenAdministrator`, so renouncing an Admin capability cannot brick
+    -- governance.
+    choice RoleCapability_Renounce : ()
+      controller assignee
+      do pure ()
+
 -- | Does a capability's scope authorize an operation requiring `requiredScope`?
 --
 -- A registry-wide capability (`None`) authorizes any operation. An

@@ -34,13 +34,15 @@ eCapabilityScopeMismatch = "simple-token: capability scope does not authorize th
 eCapabilityNotIssuedByThisAdmin : Text
 eCapabilityNotIssuedByThisAdmin = "simple-token: capability was not issued by this registry administrator"
 
--- | INV-31: a governance delegate may only issue/revoke roles for which
--- `SimpleToken.Admin.Roles.delegableRole` is `True`. `Admin` and (until their
--- slice lands) the reserved roles are root-only — capping the hierarchy at one
--- level and preventing re-delegation escalation and delegate-vs-delegate /
--- delegate-vs-root governance changes.
-eRoleNotDelegable : Text
-eRoleNotDelegable = "simple-token: this role can only be managed by the genesis root"
+-- | INV-31 (AL-8): the `Admin`/`DEFAULT_ADMIN_ROLE` is root-managed and is NOT
+-- issuable or revocable through the delegated role-admin path — even by another
+-- `Admin` holder (the `AccessControlDefaultAdminRules` posture; preserves safety
+-- decision C9: no free re-delegation of root). `Admin` moves only via the genesis
+-- root (`Admin_IssueRole`/`Admin_RevokeRole`) or the two-step + timelocked
+-- default-admin handoff. Every other role is administered through its
+-- `SimpleToken.Admin.Roles.roleAdmin`.
+eDefaultAdminRoleRootManaged : Text
+eDefaultAdminRoleRootManaged = "simple-token: the Admin role is root-managed and cannot be delegated (use the timelocked handoff)"
 
 -- Supply management (mint / burn — AL-5/AL-6)
 ----------------------------------------------

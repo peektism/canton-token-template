@@ -3,6 +3,7 @@
 module SimpleToken.Testing.SimpleRegistry where
 
 import DA.TextMap qualified as TextMap
+import DA.Time (RelTime)
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV1
@@ -20,8 +21,12 @@ import SimpleToken.Admin.Authority
   , Admin_IssueCappedMinter(..)
   , Admin_DelegatedIssueRole(..)
   , Admin_DelegatedRevokeRole(..)
+  , Admin_BeginDefaultAdminTransfer(..)
+  , PendingDefaultAdminTransfer
+  , PendingDefaultAdminTransfer_Accept(..)
+  , PendingDefaultAdminTransfer_Cancel(..)
   )
-import SimpleToken.Admin.Capability (RoleCapability)
+import SimpleToken.Admin.Capability (RoleCapability, RoleCapability_Renounce(..))
 import SimpleToken.Admin.Roles (Role)
 import SimpleToken.Supply
 
@@ -245,6 +250,31 @@ delegatedRevokeRole registry adminCid caller adminCap capCid = do
   submitWithDisc caller (adminDisc <> capDisc) $
     exerciseCmd adminCid Admin_DelegatedRevokeRole with
       caller; adminCap; capCid
+
+-- | The assignee renounces its own capability (AL-8, the `renounceRole`
+-- analogue). The assignee observes its own capability, so no disclosure is
+-- needed.
+renounceCapability : Party -> ContractId RoleCapability -> Script ()
+renounceCapability assignee capCid =
+  submit assignee $ exerciseCmd capCid RoleCapability_Renounce
+
+-- | The genesis root begins a two-step + timelocked default-admin handoff to
+-- `newAdmin`, effective `delay` after now.
+beginDefaultAdminTransfer : SimpleRegistry -> ContractId TokenAdministrator -> Party -> RelTime -> Script (ContractId PendingDefaultAdminTransfer)
+beginDefaultAdminTransfer registry adminCid newAdmin delay =
+  submit registry.admin $ exerciseCmd adminCid Admin_BeginDefaultAdminTransfer with
+    newAdmin; delay
+
+-- | The nominee accepts a pending default-admin handoff (must be at/after the
+-- timelock). `newAdmin` observes the pending transfer, so no disclosure needed.
+acceptDefaultAdminTransfer : Party -> ContractId PendingDefaultAdminTransfer -> Script (ContractId RoleCapability)
+acceptDefaultAdminTransfer newAdmin pendingCid =
+  submit newAdmin $ exerciseCmd pendingCid PendingDefaultAdminTransfer_Accept
+
+-- | The genesis root cancels a pending default-admin handoff.
+cancelDefaultAdminTransfer : SimpleRegistry -> ContractId PendingDefaultAdminTransfer -> Script ()
+cancelDefaultAdminTransfer registry pendingCid =
+  submit registry.admin $ exerciseCmd pendingCid PendingDefaultAdminTransfer_Cancel
 
 -- | The current factory contract id together with a disclosure for it.
 currentRules : SimpleRegistry -> Script (ContractId SimpleTokenRules, Disclosures)

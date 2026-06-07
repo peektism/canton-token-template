@@ -12,17 +12,19 @@
 --
 -- The intended failure is one of two kinds, depending on the test:
 --   * an `assertMsg` guard — e.g. `eRegistryPaused`, `eCapability*`,
---     `eRoleNotDelegable`, `eRedundantPauseChange`; or
+--     `eDefaultAdminRoleRootManaged`, `eRedundantPauseChange`; or
 --   * a structural ledger failure — `NotActive` when the gated contract or a
 --     capability was already archived (e.g. `test_revokeRole`,
 --     `test_revokedAdminCannotDelegate`).
 module SimpleToken.Test.Admin where
 
+import DA.Time (days)
+
 import Splice.Api.Token.TransferInstructionV1
 
 import SimpleToken.Rules (Rules_SetPaused(..), Rules_GetPaused(..))
 import SimpleToken.Admin.Authority
-import SimpleToken.Admin.Capability (RoleCapability)
+import SimpleToken.Admin.Capability (RoleCapability, RoleCapability_Renounce(..))
 import SimpleToken.Admin.Roles (Role(..))
 import SimpleToken.Testing.SimpleRegistry
 import SimpleToken.Testing.WalletClient
@@ -329,3 +331,95 @@ test_delegatedCannotRevokeAdmin = do
   submitWithDiscMustFail alice (adminDisc <> charlieAdminDisc) $
     exerciseCmd adminCid Admin_DelegatedRevokeRole with
       caller = alice; adminCap = aliceAdmin; capCid = charlieAdmin
+
+-- Role-admin hierarchy (AL-8) — every role delegable through its admin role
+----------------------------------------------------------------------------
+
+-- | AL-8 breadth: an `Admin` delegate may now appoint an operational role
+-- (`Minter`) through the role-admin path — `roleAdmin Minter = Admin`. This is
+-- strictly broader than the old flat `delegableRole` policy (which let a delegate
+-- issue only `Pauser`). The delegate-issued Minter is real: it mints supply.
+test_roleAdminDelegatesOperationalRole : Script ()
+test_roleAdminDelegatesOperationalRole = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice      -- governance delegate (Admin)
+      bob = parties.bob          -- minter appointed by the delegate
+      charlie = parties.charlie  -- mint recipient
+  adminCid <- createTokenAdministrator registry
+  adminCap <- issueRole registry adminCid alice Admin
+  -- alice (an Admin delegate, not the root) appoints bob as Minter.
+  minterCap <- delegatedIssueRole registry adminCid alice adminCap bob Minter
+  _ <- createPreapproval registry charlie None
+  _ <- mintTo registry bob minterCap charlie 250.0
+  checkBalance charlie registry.instrumentId 250.0
+
+-- | INV-31: granting a role requires holding ITS admin role. A `Pauser` holder
+-- is not the admin of `Minter` (`roleAdmin Minter = Admin`), so it cannot appoint
+-- a Minter. The anchor is disclosed so the failure is the role-admin gate (A3),
+-- not contract visibility.
+test_nonAdminOfRoleCannotGrant : Script ()
+test_nonAdminOfRoleCannotGrant = do
+  TestEnv{..} <- setupTestEnv
+  let bob = parties.bob
+      charlie = parties.charlie
+  adminCid <- createTokenAdministrator registry
+  -- bob holds a Pauser capability, which does not administer Minter.
+  bobPauser <- issueRole registry adminCid bob Pauser
+  adminDisc <- queryDisc @TokenAdministrator registry.admin adminCid
+  submitWithDiscMustFail bob adminDisc $
+    exerciseCmd adminCid Admin_DelegatedIssueRole with
+      caller = bob; adminCap = bobPauser; assignee = charlie; role = Minter; scope = None
+
+-- | INV-32 (AL-8 renounceRole): renounce is self-only. A non-assignee cannot
+-- renounce another party's capability (the target is disclosed, so the failure
+-- is the controller check, not visibility); the assignee can renounce its own,
+-- after which the capability no longer authorizes.
+test_renounceRoleSelfOnly : Script ()
+test_renounceRoleSelfOnly = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  bobCap <- issueRole registry adminCid bob Pauser
+  -- alice cannot renounce bob's capability even when it is disclosed to her.
+  capDisc <- queryDisc @RoleCapability registry.admin bobCap
+  submitWithDiscMustFail alice capDisc $ exerciseCmd bobCap RoleCapability_Renounce
+  -- bob renounces its own capability; it is archived.
+  renounceCapability bob bobCap
+  (rulesCid, disc) <- currentRules registry
+  submitWithDiscMustFail bob disc $
+    exerciseCmd rulesCid Rules_SetPaused with
+      actor = bob; pauserCap = bobCap; newPaused = True
+
+-- | INV-31 (AL-8 default-admin handoff): the timelocked `Admin` transfer cannot
+-- complete before its delay; after the delay the nominee accepts and the
+-- handed-off `Admin` capability is fully operational (it can delegate roles).
+test_defaultAdminTimelockNotBeforeDelay : Script ()
+test_defaultAdminTimelockNotBeforeDelay = do
+  TestEnv{..} <- setupTestEnv
+  let bob = parties.bob          -- nominee for the default-admin handoff
+      charlie = parties.charlie
+  adminCid <- createTokenAdministrator registry
+  pending <- beginDefaultAdminTransfer registry adminCid bob (days 7)
+  -- Before the timelock elapses, the nominee cannot accept.
+  submitMustFail bob $ exerciseCmd pending PendingDefaultAdminTransfer_Accept
+  -- After the delay, acceptance succeeds and bob receives an Admin capability.
+  passTime (days 7)
+  bobAdminCap <- acceptDefaultAdminTransfer bob pending
+  -- The handed-off Admin role works: bob can now delegate a Pauser to charlie.
+  pauserCap <- delegatedIssueRole registry adminCid bob bobAdminCap charlie Pauser
+  _ <- setPaused registry charlie pauserCap True
+  pure ()
+
+-- | INV-31: the genesis root can cancel a pending default-admin handoff within
+-- the window; the nominee can then no longer accept (the offer is archived),
+-- even after the delay elapses.
+test_defaultAdminTransferCancellable : Script ()
+test_defaultAdminTransferCancellable = do
+  TestEnv{..} <- setupTestEnv
+  let bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  pending <- beginDefaultAdminTransfer registry adminCid bob (days 7)
+  cancelDefaultAdminTransfer registry pending
+  passTime (days 7)
+  submitMustFail bob $ exerciseCmd pending PendingDefaultAdminTransfer_Accept

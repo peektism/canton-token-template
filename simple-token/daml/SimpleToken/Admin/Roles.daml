@@ -32,35 +32,47 @@ data Role
   | Admin           -- ^ Root governance: may issue/revoke capabilities (owner analogue). Enforced.
   deriving (Eq, Show)
 
--- | Single source of truth for the delegation policy: whether a holder of an
--- `Admin` capability (a governance delegate) may issue or revoke this role.
+-- | The role-admin relation (AL-8): which role administers each role — the
+-- OpenZeppelin `getRoleAdmin` analogue, replacing the flat
+-- `delegableRole : Role -> Bool` MVP policy. A holder of `roleAdmin R`
+-- (registry-wide) may issue/revoke role `R` through the delegated
+-- `TokenAdministrator` choices; the genesis root may still manage every role
+-- directly. Used by BOTH the delegated-issue and delegated-revoke paths so the
+-- hierarchy cannot drift between them (see SimpleToken.Admin.Authority).
 --
--- The genesis root may manage every role; delegates may manage only roles for
--- which this returns `True`. This caps the governance hierarchy at one level —
---   root → Admin delegates → delegable operational roles —
--- and is used by BOTH the delegated-issue and delegated-revoke paths so the
--- policy cannot drift between them (see SimpleToken.Admin.Authority).
+-- TT-Q-008a — **compiled pure function, not runtime-mutable state.** Reconfiguring
+-- the hierarchy (e.g. introducing a `MinterAdmin` distinct from the default admin)
+-- is a deliberate package upgrade that edits a case below, NOT a live
+-- `setRoleAdmin` transaction — so there is no `RoleAdminConfig` contract for every
+-- gated grant to disclose, and exhaustiveness is preserved. The generic
+-- `oz-access-control` side stays mechanism-only: its role-admin-aware grant/revoke
+-- take the required admin role as a `Text` the consumer supplies, computed here
+-- and mapped through `roleId` — so the library hard-codes no role graph.
 --
---   * `Admin` is root-only: no re-delegation, no delegate-vs-delegate or
---     delegate-vs-root governance changes.
---   * `Minter` / `Burner` are enforced (AL-5/6) but kept root-only by deliberate
---     governance policy: appointing who may create or force-burn supply is a
---     root-level decision, not something an `Admin` delegate can hand out. Flip a
---     case to `True` to make that role delegable.
---   * A *reserved* role (no enforcement yet) is root-only so a delegate cannot
---     pre-mint one and retroactively gain power when its slice starts gating on
---     it.
+-- TT-Q-008c — **flat default.** Every role's admin is `Admin` (the
+-- `DEFAULT_ADMIN_ROLE` analogue), so by default an `Admin` holder may delegate
+-- every operational role — matching OZ `AccessControl` breadth and the
+-- separation-of-duties US FIs expect. Intermediate admin roles are opt-in later.
+--
+--   * `Admin`'s admin is `Admin` (it self-administers in OZ). But re-delegating
+--     root is **not** allowed through the delegated path: `SimpleToken.Admin.Authority`
+--     refuses to issue/revoke `Admin` there (the `AccessControlDefaultAdminRules`
+--     posture, preserving safety decision C9). `Admin` moves only via the genesis
+--     root or the two-step + timelocked default-admin handoff.
+--   * `Minter`/`Burner`/`BatchProcessor` are administered by `Admin`, so an `Admin`
+--     delegate may now appoint them (broader than the old root-only policy). Point
+--     a case at a narrower admin role to scope that authority.
 --
 -- The explicit per-constructor cases are deliberate (no wildcard): adding a new
--- `Role` forces a deliberate delegation decision here. The package builds with
+-- `Role` forces a deliberate admin assignment here. The package builds with
 -- `-Werror=incomplete-patterns` (see simple-token/daml.yaml), so a missing clause
 -- is a compile error, not a runtime pattern-match crash.
-delegableRole : Role -> Bool
-delegableRole Pauser = True
-delegableRole Admin = False
-delegableRole Minter = False          -- enforced (AL-5), root-managed by policy
-delegableRole Burner = False          -- enforced (AL-6), root-managed by policy
-delegableRole BatchProcessor = False  -- reserved (V2-10)
+roleAdmin : Role -> Role
+roleAdmin Minter = Admin
+roleAdmin Burner = Admin
+roleAdmin Pauser = Admin
+roleAdmin BatchProcessor = Admin
+roleAdmin Admin = Admin
 
 -- | The typed-wrapper bridge (AL-7): map this token's closed, exhaustive `Role`
 -- sum to the `Text` role ids the generic `OpenZeppelin.AccessControl` library

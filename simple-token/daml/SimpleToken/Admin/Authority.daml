@@ -18,11 +18,15 @@
 -- admin-signed capabilities without holding the root key.
 module SimpleToken.Admin.Authority where
 
+import DA.Time (RelTime, addRelTime)
+
 import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import qualified OpenZeppelin.AccessControl as AC
 
 import SimpleToken.Admin.Capability (RoleCapability(..), requireRole)
 import SimpleToken.Admin.Errors
-import SimpleToken.Admin.Roles (Role(..), delegableRole)
+import SimpleToken.Admin.Roles (Role(..), roleAdmin)
 
 -- | Mint a capability anchored to this registry. Shared by root and delegated
 -- issuance so the create site is single-sourced.
@@ -30,26 +34,26 @@ mkRoleCapability : Party -> Party -> Role -> Optional InstrumentId -> Update (Co
 mkRoleCapability admin assignee role scope =
   create RoleCapability with admin; assignee; role; scope; mintAllowance = None
 
--- | Archive a capability issued by this registry. Shared by root and delegated
--- revocation. `mayRevokeRole` decides which roles the caller is allowed to
--- revoke: the root passes `const True` (any role); a delegate passes
--- `delegableRole` so it can revoke only delegable roles (see
--- `SimpleToken.Admin.Roles.delegableRole`). Single-sourcing the fetch +
--- admin-match + role-policy + archive keeps both revoke paths from drifting, and
--- routes the policy through the same `delegableRole` predicate as issuance.
-revokeIssuedCapability : Party -> (Role -> Bool) -> ContractId RoleCapability -> Update ()
-revokeIssuedCapability admin mayRevokeRole capCid = do
+-- | Archive a capability issued by this registry. Shared by the root and the
+-- delegated revoke paths so the fetch + admin-match + archive cannot drift. The
+-- *role policy* differs per path and is applied by the caller before this:
+-- the root may revoke any role; a delegate must first pass the role-admin gate
+-- (`requireRoleAdmin`) and the `Admin`-is-root-managed guard.
+revokeIssuedCapability : Party -> ContractId RoleCapability -> Update ()
+revokeIssuedCapability admin capCid = do
   cap <- fetch capCid
   assertMsg eCapabilityNotIssuedByThisAdmin (cap.admin == admin)
-  assertMsg eRoleNotDelegable (mayRevokeRole cap.role)
   archive capCid
 
--- | Assert `caller` is a governance delegate of this registry: holds a
--- registry-wide `Admin` capability. Single-sources the precondition shared by
--- the delegated issue and revoke choices. Returns the validated capability
+-- | Assert `caller` holds the admin role of `role` (its `roleAdmin`),
+-- registry-wide — the role-admin gate (AL-8) shared by the delegated issue and
+-- revoke choices, single-sourced so the two paths cannot drift. The required
+-- admin role is computed from the compiled `roleAdmin` relation; the
+-- admin/assignee/role checks (A1–A3) are delegated to the `oz-access-control`
+-- library via `Capability.requireRole`. Returns the validated capability
 -- (callers discard it).
-requireAdminDelegate : Party -> Party -> ContractId RoleCapability -> Update RoleCapability
-requireAdminDelegate caller admin adminCap = requireRole caller Admin admin None adminCap
+requireRoleAdmin : Party -> Party -> Role -> ContractId RoleCapability -> Update RoleCapability
+requireRoleAdmin caller admin role adminCap = requireRole caller (roleAdmin role) admin None adminCap
 
 -- | The genesis governance anchor for a registry. `admin` is the immutable
 -- instrument root party (equals `SimpleTokenRules.admin`). One instance per
@@ -99,51 +103,120 @@ template TokenAdministrator
     nonconsuming choice Admin_RevokeRole : ()
       with capCid : ContractId RoleCapability  -- ^ Capability to revoke.
       controller admin
-      do revokeIssuedCapability admin (const True) capCid
+      do revokeIssuedCapability admin capCid
 
-    -- | Delegated issuance: a holder of a registry-wide `Admin` capability mints a
-    -- further capability for a **delegable** role. This is the ownership-handoff
-    -- mechanism — grant a governance party an `Admin` capability and it can
-    -- administer the registry's delegable operational roles immediately; revoke
-    -- it to hand control back. The new capability is admin-signed because the
-    -- choice runs with this contract's admin authority.
+    -- | Delegated issuance (AL-8, role-admin-aware): a holder of the **admin role
+    -- of `role`** (`roleAdmin role`, registry-wide) mints a capability for `role`.
+    -- With the flat default (`roleAdmin _ = Admin`) any `Admin` holder may delegate
+    -- every operational role — matching OZ `AccessControl` breadth. The new
+    -- capability is admin-signed because the choice runs with this contract's
+    -- admin authority, so a delegate appoints roles without holding the root key.
     --
-    -- Which roles a delegate may manage is decided solely by `delegableRole`
-    -- (`Admin` and reserved roles are root-only), so governance cannot be
-    -- re-delegated past one level. See docs/ADMIN-LAYER-PLAN.md §5.
+    -- `Admin` itself is **not** issuable here (the `AccessControlDefaultAdminRules`
+    -- posture, decision C9): re-delegating root would let a delegate mint another
+    -- root. The genesis root issues `Admin` via `Admin_IssueRole`, and the
+    -- two-step + timelocked `Admin_BeginDefaultAdminTransfer` is the safe handoff.
+    -- The required admin role is computed from the compiled `roleAdmin` relation;
+    -- the admin/assignee/role gate is delegated to `oz-access-control`. See
+    -- docs/ADMIN-LAYER-PLAN.md §5.
     --
     -- # Invariants enforced:
-    -- - INV-31: caller must hold a registry-wide `Admin` capability, and the granted role must be delegable
+    -- - INV-31: caller must hold the registry-wide admin role of `role`; `Admin` is never delegable here
     nonconsuming choice Admin_DelegatedIssueRole : ContractId RoleCapability
       with
         caller : Party                       -- ^ The delegate exercising the choice.
-        adminCap : ContractId RoleCapability  -- ^ The caller's Admin capability.
+        adminCap : ContractId RoleCapability  -- ^ The caller's capability for `roleAdmin role`.
         assignee : Party                      -- ^ Party to receive the role.
-        role : Role                           -- ^ Role to grant (must be delegable).
+        role : Role                           -- ^ Role to grant (not `Admin`).
         scope : Optional InstrumentId         -- ^ None = registry-wide; Some = single instrument.
       controller caller
       do
-        requireAdminDelegate caller admin adminCap
-        assertMsg eRoleNotDelegable (delegableRole role)
+        assertMsg eDefaultAdminRoleRootManaged (role /= Admin)
+        _ <- requireRoleAdmin caller admin role adminCap
         mkRoleCapability admin assignee role scope
 
-    -- | Delegated revocation: a registry-wide `Admin` capability holder revokes a
-    -- capability for a **delegable** role. Delegates manage only delegable roles
-    -- (so they cannot revoke `Admin` or reserved-role capabilities held by the
-    -- root or peers). They CAN revoke delegable operational capabilities issued by
-    -- the root or other delegates — that is shared operational-role management;
-    -- the genesis root remains the sole governance authority and always recovers
-    -- via the un-revocable `TokenAdministrator`.
+    -- | Delegated revocation (AL-8, role-admin-aware): a holder of the admin role
+    -- of the revoked capability's role revokes it. Delegates can manage every role
+    -- administered by a role they hold — shared operational-role management —
+    -- but never `Admin` (root-managed; see `Admin_DelegatedIssueRole`). The genesis
+    -- root remains the sole governance authority and always recovers via the
+    -- un-revocable `TokenAdministrator`.
     --
     -- # Invariants enforced:
-    -- - INV-31: caller must hold a registry-wide `Admin` capability, and the revoked role must be delegable
+    -- - INV-31: caller must hold the registry-wide admin role of the revoked role; `Admin` is never revocable here
     -- - INV-32: revoked capability becomes inactive
     nonconsuming choice Admin_DelegatedRevokeRole : ()
       with
         caller : Party                        -- ^ The delegate exercising the choice.
-        adminCap : ContractId RoleCapability  -- ^ The caller's Admin capability.
-        capCid : ContractId RoleCapability    -- ^ Delegable-role capability to revoke.
+        adminCap : ContractId RoleCapability  -- ^ The caller's capability for the target role's admin.
+        capCid : ContractId RoleCapability    -- ^ Capability to revoke (not an `Admin` capability).
       controller caller
       do
-        requireAdminDelegate caller admin adminCap
-        revokeIssuedCapability admin delegableRole capCid
+        target <- fetch capCid
+        assertMsg eDefaultAdminRoleRootManaged (target.role /= Admin)
+        _ <- requireRoleAdmin caller admin target.role adminCap
+        revokeIssuedCapability admin capCid
+
+    -- | Begin a two-step, timelocked handoff of the `Admin`/`DEFAULT_ADMIN_ROLE`
+    -- to `newAdmin` — the `AccessControlDefaultAdminRules` analogue and the only
+    -- delegated route to the otherwise root-managed `Admin` role (decision C9).
+    -- The root sets a `delay`; `newAdmin` cannot accept before it elapses, and the
+    -- root may cancel within the window. On acceptance `newAdmin` receives a
+    -- registry-wide `Admin` capability (it does NOT revoke any existing `Admin`
+    -- holder — the root revokes the prior holder separately if exclusive handoff
+    -- is wanted, and always retains ultimate authority via this anchor).
+    --
+    -- # Invariants enforced:
+    -- - INV-31: only the genesis root initiates a default-admin handoff; nominee must differ from the root
+    nonconsuming choice Admin_BeginDefaultAdminTransfer : ContractId PendingDefaultAdminTransfer
+      with
+        newAdmin : Party    -- ^ The nominee who must accept after the timelock.
+        delay : RelTime     -- ^ How long after now the nominee may accept.
+      controller admin
+      do
+        assertMsg AC.eDefaultAdminSameParty (newAdmin /= admin)
+        now <- getTime
+        create PendingDefaultAdminTransfer with
+          admin; newAdmin; effectiveTime = addRelTime now delay
+
+-- | A pending, timelocked transfer of the `Admin`/`DEFAULT_ADMIN_ROLE` to
+-- `newAdmin` — the token's `AccessControlDefaultAdminRules` handoff. It mirrors
+-- the generic `oz-access-control` `DefaultAdminTransferOffer` (offer → accept,
+-- with cancel + a ledger-time gate) but creates the token's richer
+-- `RoleCapability` on acceptance rather than the library's minimal `RoleGrant`
+-- (the AL-7 finding: reuse the library's *logic* — here its `requireTimelockElapsed`
+-- gate and error — not its storage, since templates are monomorphic).
+--
+-- Signatories: admin. Observers: newAdmin (must see the pending handoff to
+--   accept). Controllers: newAdmin accepts; admin cancels.
+-- Choices: PendingDefaultAdminTransfer_Accept, PendingDefaultAdminTransfer_Cancel.
+-- Disclosed parties: admin and newAdmin are stakeholders.
+-- Privacy expectations: limited to the two parties to the handshake.
+-- Authorization assumptions: only newAdmin may accept (root never lands on a
+--   party that has not claimed it); only admin (the genesis root) may cancel.
+-- Archival behavior: both choices consuming; accept creates the Admin capability,
+--   cancel creates nothing.
+-- Failure modes: accepting before effectiveTime fails (eDefaultAdminTimelockNotElapsed).
+-- Upgrade and migration assumptions: 0.x; reconfiguration is a package upgrade.
+template PendingDefaultAdminTransfer
+  with
+    admin : Party          -- ^ The genesis root initiating the handoff.
+    newAdmin : Party       -- ^ The nominee who must accept after the timelock.
+    effectiveTime : Time   -- ^ Earliest ledger time the nominee may accept.
+  where
+    signatory admin
+    observer newAdmin
+
+    -- | Accept the handoff once the timelock elapses; grants `newAdmin` a
+    -- registry-wide `Admin` capability. The time gate is delegated to the
+    -- `oz-access-control` library's `requireTimelockElapsed`.
+    choice PendingDefaultAdminTransfer_Accept : ContractId RoleCapability
+      controller newAdmin
+      do
+        AC.requireTimelockElapsed effectiveTime
+        mkRoleCapability admin newAdmin Admin None
+
+    -- | Cancel the pending handoff before acceptance (root only).
+    choice PendingDefaultAdminTransfer_Cancel : ()
+      controller admin
+      do pure ()

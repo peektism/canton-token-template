@@ -453,6 +453,30 @@ The DAML-specific caveat from §2 recurs: `AccessControlEnumerable` (global role
 enumeration) is **not expressible keyless** — there is no global lookup — so it stays
 an off-ledger indexing concern, documented rather than built.
 
+> **Status (AL-8 core landed, green).** Built and tested across both repos:
+> - **`oz-access-control` (Layer A), mechanism-only and still independent** — added
+>   role-admin-aware grant/revoke (`RoleAdmin_GrantRoleAs`/`RoleAdmin_RevokeRoleAs`,
+>   the caller presents a grant for a supplied `adminRole : Text`; no role graph
+>   hard-coded), `renounceRole` (`RoleGrant_Renounce`, self-only by controller), and
+>   a timelocked two-step default-admin handoff (`DefaultAdminTransferOffer` +
+>   `RoleAdmin_BeginDefaultAdminTransfer` + a reusable `requireTimelockElapsed` gate).
+>   The handoff is **self-contained** — it re-expresses the `oz-ownable` two-step
+>   shape plus a `getTime` gate rather than taking a dependency on it, preserving the
+>   "three independent packages, no cross-deps" guarantee of §3/§8 (exactly as OZ's
+>   `AccessControlDefaultAdminRules` reimplements its own two-step instead of
+>   inheriting `Ownable2Step`). +8 test scripts.
+> - **Token (Layer B)** — `delegableRole : Role -> Bool` replaced by the compiled
+>   `roleAdmin : Role -> Role` (flat default all → `Admin`); the delegated
+>   issue/revoke choices now require holding `roleAdmin(targetRole)` (A1–A3 delegated
+>   to the library via `Capability.requireRole`) and **refuse `Admin`** (the
+>   DefaultAdminRules posture, C9); a `PendingDefaultAdminTransfer` template wires the
+>   timelocked handoff (reusing the library's `requireTimelockElapsed` — logic, not
+>   storage, per §9); a self-only `RoleCapability_Renounce`. Suite 141→146.
+> This vindicates §9 once more: the token reuses the library's *gate/timelock logic*
+> while keeping its richer `RoleCapability` storage — the minimal `RoleGrant` cannot
+> carry scope/allowance, and templates are monomorphic. **Remaining:** the daml-verify
+> rows and daml-props role-admin-graph machine are separate branch-pinned sub-PRs.
+
 ### AL-9 — parity-gap review of the planning docs
 
 AL-8 exposed a pattern worth auditing for: a feature filed under "out of scope /
