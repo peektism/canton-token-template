@@ -303,14 +303,14 @@ freezeAccount : SimpleRegistry -> Party -> ContractId RoleCapability -> Party ->
 freezeAccount registry actor complianceCap account reason = do
   (rulesCid, disc) <- currentRules registry
   submitWithDisc actor disc $
-    exerciseCmd rulesCid Rules_FreezeAccount with actor; complianceCap; account; reason
+    exerciseCmd rulesCid Rules_SetAccountFrozen with actor; complianceCap; account; frozen = True; reason
 
 -- | Lift a compliance hold on `account` as `actor` (AL-10).
 unfreezeAccount : SimpleRegistry -> Party -> ContractId RoleCapability -> Party -> Text -> Script (ContractId SimpleTokenRules)
 unfreezeAccount registry actor complianceCap account reason = do
   (rulesCid, disc) <- currentRules registry
   submitWithDisc actor disc $
-    exerciseCmd rulesCid Rules_UnfreezeAccount with actor; complianceCap; account; reason
+    exerciseCmd rulesCid Rules_SetAccountFrozen with actor; complianceCap; account; frozen = False; reason
 
 -- | Read the registry's frozen-account set (AL-10).
 getFrozenAccounts : SimpleRegistry -> Party -> Script [Party]

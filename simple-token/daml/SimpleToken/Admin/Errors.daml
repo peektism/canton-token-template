@@ -32,14 +32,12 @@ eRedundantPauseChange = "simple-token: registry already in the requested pause s
 eAccountFrozen : Text
 eAccountFrozen = "simple-token: account is frozen (compliance hold)"
 
--- | INV-42: freezing an already-frozen account is rejected (non-idempotent, like
--- `eRedundantPauseChange`), so the frozen-set stays duplicate-free.
-eAccountAlreadyFrozen : Text
-eAccountAlreadyFrozen = "simple-token: account is already frozen"
-
--- | INV-42: unfreezing an account that is not frozen is rejected.
-eAccountNotFrozen : Text
-eAccountNotFrozen = "simple-token: account is not frozen"
+-- | INV-42: `Rules_SetAccountFrozen` must change the hold state — freezing an
+-- already-frozen account or unfreezing one that is not held is rejected (the OZ
+-- Pausable non-idempotency, mirroring `eRedundantPauseChange`). This keeps the
+-- frozen-set duplicate-free without a separate membership guard.
+eRedundantFreezeChange : Text
+eRedundantFreezeChange = "simple-token: account already in the requested freeze state"
 
 -- | INV-42: the registry administrator party cannot be frozen — freezing the root
 -- would brick every gated flow (it co-signs every holding and originates supply).

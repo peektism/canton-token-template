@@ -162,11 +162,13 @@ registries behave. A per-**account** compliance **freeze** is a *separate*
 capability — deliberately not conflated with the registry-wide pause — **delivered
 in [AL-10](AL-9-PARITY-GAP-REVIEW.md#al-10--account-level-freeze--compliance-hold-must-have)**:
 a `frozenAccounts : [Party]` field on `SimpleTokenRules` (the same non-spoofable shape
-as `paused`), maintained by `ComplianceAdmin`-gated `Rules_FreezeAccount`/
-`Rules_UnfreezeAccount`, checked at the same origination chokepoints as pause against
-sender / receiver / mint-recipient (INV-40..42). Like pause, freeze is origination
-control — it does not reach into committed flows (seizing committed funds is the
-distinct forced-transfer capability, AL-11). The docs (§6 below,
+as `paused`), maintained by the `ComplianceAdmin`-gated `Rules_SetAccountFrozen` choice
+(a `Bool`-parameterised freeze/unfreeze mirroring `Rules_SetPaused`). Pause and freeze
+are unified into one `assertCanOriginate` gate checked at every origination chokepoint
+against sender, receiver, and mint-recipient (INV-40..42), so a new chokepoint cannot
+enable one control and forget the other. Like pause, freeze is origination control — it
+does not reach into committed flows (seizing committed funds is the distinct
+forced-transfer capability, AL-11). The docs (§6 below,
 [AUDIT.md](AUDIT.md) INV-25) now state exactly this.
 
 ---
@@ -348,8 +350,8 @@ cap), `test_delegatedCannotRevokeAdmin` (delegate cannot revoke an `Admin` cap).
   from pause — high US-FI (sanctions/compliance) relevance. Reclassified Must-Have and
   split: **[AL-10](AL-9-PARITY-GAP-REVIEW.md#al-10--account-level-freeze--compliance-hold-must-have)
   (account freeze) is delivered** (`frozenAccounts` on `SimpleTokenRules`,
-  `ComplianceAdmin`-gated `Rules_FreezeAccount`/`Rules_UnfreezeAccount`, INV-40..42, §4
-  above); [AL-11](AL-9-PARITY-GAP-REVIEW.md#al-11--forced-transfer--seize-and-reallocate-must-have)
+  `ComplianceAdmin`-gated `Rules_SetAccountFrozen`, unified `assertCanOriginate` gate,
+  INV-40..42, §4 above); [AL-11](AL-9-PARITY-GAP-REVIEW.md#al-11--forced-transfer--seize-and-reallocate-must-have)
   (forced transfer/seize-reallocate) and [AL-13](AL-9-PARITY-GAP-REVIEW.md#al-13--reference-contract-global-halt-strong)
   (global halt, runbook-only) remain slated. AL-9's open questions are resolved
   (manual-only, dual-control for irreversible seize, AL-13 runbook-only); see

@@ -190,7 +190,8 @@ gating open questions (§4) are resolved.**
   blocks a provider-managed flow. The hold is realized by the registry admin
   **withholding its required signature** at the factory — no public on-ledger blocklist
   (privacy-preserving, GDPR-compatible). Maintained by `ComplianceAdmin`-gated
-  `Rules_FreezeAccount`/`Rules_UnfreezeAccount` (non-idempotent; admin unfreezable),
+  `Rules_SetAccountFrozen` (a `Bool`-parameterised freeze/unfreeze mirroring
+  `Rules_SetPaused`; redundant-change rejected, admin never freezable),
   with a read-only `Rules_GetFrozenAccounts` for wallet/audit observability. The
   `reason` choice argument is recorded immutably in the exercise node (audit trail).
 - **New role:** `ComplianceAdmin` (`roleAdmin = Admin`, delegable through the AL-8

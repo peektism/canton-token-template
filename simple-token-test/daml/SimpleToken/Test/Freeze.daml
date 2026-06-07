@@ -8,14 +8,14 @@
 -- discloses exactly the contracts the failing choice must fetch (the factory, a
 -- capability the caller is not the assignee of) so the failure lands on the guard
 -- under test — an `assertMsg` (`eAccountFrozen`, `eCannotFreezeAdmin`,
--- `eAccountAlreadyFrozen`, `eAccountNotFrozen`) or the capability gate — not on
--- contract visibility. These disclosures are load-bearing.
+-- `eRedundantFreezeChange`) or the capability gate — not on contract visibility.
+-- These disclosures are load-bearing.
 module SimpleToken.Test.Freeze where
 
 import Splice.Api.Token.TransferInstructionV1
 import Splice.Api.Token.TransferInstructionV2 qualified as TransferV2
 
-import SimpleToken.Rules (Rules_FreezeAccount(..), Rules_UnfreezeAccount(..))
+import SimpleToken.Rules (Rules_SetAccountFrozen(..))
 import SimpleToken.Admin.Roles (Role(..))
 import SimpleToken.Experimental.Cip112.Account (providerManagedAccount)
 import SimpleToken.Testing.SimpleRegistry
@@ -128,8 +128,8 @@ test_freezeRequiresComplianceAdmin = do
   minterCap <- issueRole registry adminCid bob Minter
   (rulesCid, disc) <- currentRules registry
   submitWithDiscMustFail bob disc $
-    exerciseCmd rulesCid Rules_FreezeAccount with
-      actor = bob; complianceCap = minterCap; account = alice; reason = "x"
+    exerciseCmd rulesCid Rules_SetAccountFrozen with
+      actor = bob; complianceCap = minterCap; account = alice; frozen = True; reason = "x"
   -- with a real ComplianceAdmin capability, bob (a delegate) can freeze.
   compCap <- issueRole registry adminCid bob ComplianceAdmin
   _ <- freezeAccount registry bob compCap alice "OFAC SDN match"
@@ -146,8 +146,8 @@ test_scopedComplianceAdminCannotFreeze = do
   scoped <- issueScopedRole registry adminCid bob ComplianceAdmin registry.instrumentId
   (rulesCid, disc) <- currentRules registry
   submitWithDiscMustFail bob disc $
-    exerciseCmd rulesCid Rules_FreezeAccount with
-      actor = bob; complianceCap = scoped; account = alice; reason = "x"
+    exerciseCmd rulesCid Rules_SetAccountFrozen with
+      actor = bob; complianceCap = scoped; account = alice; frozen = True; reason = "x"
   wide <- issueRole registry adminCid bob ComplianceAdmin
   _ <- freezeAccount registry bob wide alice "OFAC SDN match"
   pure ()
@@ -155,8 +155,9 @@ test_scopedComplianceAdminCannotFreeze = do
 -- INV-42 — non-idempotent; the registry administrator is unfreezable
 ---------------------------------------------------------------------
 
--- | INV-42: double-freeze is rejected, unfreezing a non-frozen account is
--- rejected, and the registry administrator can never be frozen.
+-- | INV-42: a redundant freeze change is rejected (re-freezing an already-frozen
+-- account or unfreezing one not held), and the registry administrator can never be
+-- frozen — the OZ Pausable non-idempotency, mirroring the redundant-pause guard.
 test_freezeNonIdempotentAndAdminProtected : Script ()
 test_freezeNonIdempotentAndAdminProtected = do
   TestEnv{..} <- setupTestEnv
@@ -165,21 +166,21 @@ test_freezeNonIdempotentAndAdminProtected = do
   adminCid <- createTokenAdministrator registry
   compCap <- issueRole registry adminCid registry.admin ComplianceAdmin
   _ <- freezeAccount registry registry.admin compCap alice "OFAC SDN match"
-  -- freezing alice again is rejected (eAccountAlreadyFrozen)
+  -- freezing alice again is a no-op change → rejected (eRedundantFreezeChange)
   (rc1, d1) <- currentRules registry
   submitWithDiscMustFail registry.admin d1 $
-    exerciseCmd rc1 Rules_FreezeAccount with
-      actor = registry.admin; complianceCap = compCap; account = alice; reason = "again"
-  -- unfreezing bob (never frozen) is rejected (eAccountNotFrozen)
+    exerciseCmd rc1 Rules_SetAccountFrozen with
+      actor = registry.admin; complianceCap = compCap; account = alice; frozen = True; reason = "again"
+  -- unfreezing bob (never frozen) is a no-op change → rejected (eRedundantFreezeChange)
   (rc2, d2) <- currentRules registry
   submitWithDiscMustFail registry.admin d2 $
-    exerciseCmd rc2 Rules_UnfreezeAccount with
-      actor = registry.admin; complianceCap = compCap; account = bob; reason = "x"
+    exerciseCmd rc2 Rules_SetAccountFrozen with
+      actor = registry.admin; complianceCap = compCap; account = bob; frozen = False; reason = "x"
   -- the registry administrator cannot be frozen (eCannotFreezeAdmin)
   (rc3, d3) <- currentRules registry
   submitWithDiscMustFail registry.admin d3 $
-    exerciseCmd rc3 Rules_FreezeAccount with
-      actor = registry.admin; complianceCap = compCap; account = registry.admin; reason = "x"
+    exerciseCmd rc3 Rules_SetAccountFrozen with
+      actor = registry.admin; complianceCap = compCap; account = registry.admin; frozen = True; reason = "x"
 
 -- Role wiring (AL-8 × AL-10) + observability
 ---------------------------------------------

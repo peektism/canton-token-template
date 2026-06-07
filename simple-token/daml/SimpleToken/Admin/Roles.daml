@@ -20,7 +20,7 @@ module SimpleToken.Admin.Roles where
 --   * `Admin`  — enforced by the `TokenAdministrator` delegated choices.
 --   * `Minter` — enforced by `Rules_Mint` (AL-5); carries an optional D3 allowance.
 --   * `Burner` — enforced by `SimpleHolding_ForcedBurn` (AL-6, clawback).
---   * `ComplianceAdmin` — enforced by `Rules_FreezeAccount`/`Rules_UnfreezeAccount`
+--   * `ComplianceAdmin` — enforced by `Rules_SetAccountFrozen`
 --     (AL-10, account-level compliance hold). The generic regulated-token compliance
 --     role (OFAC/AML), distinct from product-specific custody roles (which stay in
 --     sibling repos — AL-9 §3 R10 / OQ-4).
@@ -43,7 +43,7 @@ data Role
   = Minter          -- ^ May create holdings via `Rules_Mint` (AL-5). Enforced; instrument-scopable.
   | Burner          -- ^ May force-burn holdings via `SimpleHolding_ForcedBurn` (AL-6). Enforced.
   | Pauser          -- ^ May flip the registry pause flag (see SimpleToken.Rules). Enforced.
-  | ComplianceAdmin -- ^ May freeze/unfreeze accounts (`Rules_FreezeAccount`, AL-10). Enforced.
+  | ComplianceAdmin -- ^ May set account holds via `Rules_SetAccountFrozen` (AL-10). Enforced.
   | BatchProcessor  -- ^ (reserved) Delegated SettlementFactory_SettleBatch — future slice (V2-10).
   | LegalAdmin      -- ^ (reserved) Seize / forced transfer / court orders — future slice (AL-11).
   | EmergencyOps    -- ^ (reserved) Emergency-halt authority — AL-13 (runbook-first today).
