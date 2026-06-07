@@ -34,16 +34,21 @@ mkRoleCapability : Party -> Party -> Role -> Optional InstrumentId -> Update (Co
 mkRoleCapability admin assignee role scope =
   create RoleCapability with admin; assignee; role; scope; mintAllowance = None
 
--- | Archive a capability issued by this registry. Shared by the root and the
--- delegated revoke paths so the fetch + admin-match + archive cannot drift. The
--- *role policy* differs per path and is applied by the caller before this:
--- the root may revoke any role; a delegate must first pass the role-admin gate
--- (`requireRoleAdmin`) and the `Admin`-is-root-managed guard.
-revokeIssuedCapability : Party -> ContractId RoleCapability -> Update ()
-revokeIssuedCapability admin capCid = do
+-- | Fetch a capability and assert it was issued by this registry, returning the
+-- authoritative on-ledger record. Shared by the root and the delegated revoke
+-- paths so the issued-by-this-admin check cannot drift. It deliberately fetches
+-- (rather than trusting a caller-supplied record) so the value it checks is the
+-- value the caller then archives by the same `capCid` — sound by construction.
+-- The caller archives after this returns; the delegated path also reuses the
+-- returned `.role` for its role-admin gate, so neither path fetches twice. The
+-- *role policy* differs per path: the root may revoke any role; a delegate must
+-- first pass `requireRoleAdmin` (which enforces the `Admin`-is-root-managed
+-- carve-out).
+requireIssuedByThisAdmin : Party -> ContractId RoleCapability -> Update RoleCapability
+requireIssuedByThisAdmin admin capCid = do
   cap <- fetch capCid
   assertMsg eCapabilityNotIssuedByThisAdmin (cap.admin == admin)
-  archive capCid
+  pure cap
 
 -- | The single chokepoint for the delegated role-admin path (AL-8). Asserts, in
 -- one place shared by the delegated issue and revoke choices (and any future
@@ -112,7 +117,9 @@ template TokenAdministrator
     nonconsuming choice Admin_RevokeRole : ()
       with capCid : ContractId RoleCapability  -- ^ Capability to revoke.
       controller admin
-      do revokeIssuedCapability admin capCid
+      do
+        _ <- requireIssuedByThisAdmin admin capCid
+        archive capCid
 
     -- | Delegated issuance (AL-8, role-admin-aware): a holder of the **admin role
     -- of `role`** (`roleAdmin role`, registry-wide) mints a capability for `role`.
@@ -160,9 +167,9 @@ template TokenAdministrator
         capCid : ContractId RoleCapability    -- ^ Capability to revoke (not an `Admin` capability).
       controller caller
       do
-        target <- fetch capCid
+        target <- requireIssuedByThisAdmin admin capCid
         _ <- requireRoleAdmin caller admin target.role adminCap
-        revokeIssuedCapability admin capCid
+        archive capCid
 
     -- | Begin a two-step, timelocked handoff of the `Admin`/`DEFAULT_ADMIN_ROLE`
     -- to `newAdmin` — the `AccessControlDefaultAdminRules` analogue and the only
