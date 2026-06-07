@@ -330,7 +330,7 @@ hybrid compliance validation, cross-domain identity deferred.*
 - [x] **Every "[AL-9: re-examine]" item reclassified** (§3): 3 → Must-Have slices (AL-10/11/12), 1 → Strong slice (AL-13), 4 confirmed classified-out.
 - [x] **Open questions surfaced and resolved** (§4): OQ-1…OQ-6 — OQ-2/4/5/6 closed, OQ-1/3 decided-with-posture (validate OQ-1 w/ compliance+infra; cross-domain deferred).
 - [x] **PLAN.md §17.4 / §17.5 / §17.7 + ADMIN-LAYER-PLAN §10 updated** to point here and carry the new slice IDs.
-- [x] **AL-10 ✅ delivered** (§3 above) — `frozenAccounts` freeze, `ComplianceAdmin` role, INV-40..42, suite 146→155. `LegalAdmin`/`EmergencyOps` added reserved.
+- [x] **AL-10 ✅ delivered + review-hardened + formally verified** (§3 above) — `frozenAccounts` freeze, `ComplianceAdmin` role, unified `assertCanOriginate` gate, INV-40..42, suite 146→158. Code-review fixes #1–#8 (`c2e61f3`/`f062f16`); formal rows **daml-verify A14–A18 ([#6](https://github.com/OpenZeppelin/daml-verify/pull/6))** + **daml-props `Freeze` ([#4](https://github.com/OpenZeppelin/daml-props/pull/4))**. `LegalAdmin`/`EmergencyOps` added reserved.
 - [ ] **AL-11 ready** — manual-only + dual-control (propose + approve) for irreversible seize/forced-transfer; `LegalAdmin` graduates from reserved.
 - [ ] **AL-13 → runbook/doc-only** unless per-instrument on-ledger halt is later requested. **AL-12** proceeds on single-domain v1 once the OQ-1 hybrid SLA is confirmed with stakeholders.
 
