@@ -22,8 +22,10 @@ module SimpleToken.Admin.Capability where
 
 import Splice.Api.Token.HoldingV1 (InstrumentId)
 
+import qualified OpenZeppelin.AccessControl as AC
+
 import SimpleToken.Admin.Errors
-import SimpleToken.Admin.Roles (Role(..))
+import SimpleToken.Admin.Roles (Role(..), roleId)
 
 -- | A capability granting `assignee` a single `role` over the registry governed
 -- by `admin`, optionally narrowed to one instrument via `scope`.
@@ -83,11 +85,28 @@ scopeAuthorizes capScope requiredScope = case capScope of
 requireRole : Party -> Role -> Party -> Optional InstrumentId -> ContractId RoleCapability -> Update RoleCapability
 requireRole caller role expectedAdmin requiredScope capCid = do
   cap <- fetch capCid
-  assertMsg eCapabilityAdminMismatch (cap.admin == expectedAdmin)
-  assertMsg eCapabilityAssigneeMismatch (cap.assignee == caller)
-  assertMsg eCapabilityRoleMismatch (cap.role == role)
+  -- AL-7: delegate the admin (A1), assignee/anti-impersonation (A2), and role
+  -- (A3) gates to the decoupled OpenZeppelin AccessControl library — a single
+  -- source of truth for capability-gate semantics, shared with every other
+  -- consumer of the library. We pass a `RoleGrant` *view* of this capability
+  -- (the generic primitive carries no scope/allowance), then enforce the
+  -- token-specific scope gate (A4) here, since instrument scoping is a Layer-B
+  -- concern the minimal primitive intentionally omits (docs/ARCHITECTURE.md §9).
+  AC.requireRole caller (roleId role) expectedAdmin (roleGrantView cap)
   assertMsg eCapabilityScopeMismatch (scopeAuthorizes cap.scope requiredScope)
   pure cap
+
+-- | A generic `OpenZeppelin.AccessControl.RoleGrant` view of a token
+-- `RoleCapability`, used only to delegate the admin/assignee/role gates to the
+-- library's `requireRole`. It is constructed in-memory, never created on-ledger
+-- (the on-ledger credential is the richer `RoleCapability`, which the library's
+-- minimal `RoleGrant` cannot represent because Daml templates are monomorphic
+-- and cannot be extended with the token's `scope`/`mintAllowance` fields).
+roleGrantView : RoleCapability -> AC.RoleGrant
+roleGrantView cap = AC.RoleGrant with
+  admin = cap.admin
+  account = cap.assignee
+  role = roleId cap.role
 
 -- | Authorize a mint of `amount` for `requiredScope` by `caller`'s `Minter`
 -- capability, and consume its D3 allowance. Validates the capability as a

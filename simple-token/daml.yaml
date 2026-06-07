@@ -28,3 +28,8 @@ data-dependencies:
   - ../dars/splice-api-token-allocation-request-v2-1.0.0.dar
   - ../dars/splice-api-token-transfer-events-v2-1.0.0.dar
   - ../dars/splice-token-standard-utils-2.0.0.dar
+  # AL-7: consume the decoupled OpenZeppelin AccessControl library
+  # (oz-daml-contracts). Only this one package is pulled in — Ownable and
+  # Pausable are deliberately NOT consumed (see SimpleToken.Admin.Capability and
+  # docs/ARCHITECTURE.md §9), demonstrating "import only what you need".
+  - ../dars/oz-access-control-0.1.0.dar

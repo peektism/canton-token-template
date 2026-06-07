@@ -61,3 +61,18 @@ delegableRole Admin = False
 delegableRole Minter = False          -- enforced (AL-5), root-managed by policy
 delegableRole Burner = False          -- enforced (AL-6), root-managed by policy
 delegableRole BatchProcessor = False  -- reserved (V2-10)
+
+-- | The typed-wrapper bridge (AL-7): map this token's closed, exhaustive `Role`
+-- sum to the `Text` role ids the generic `OpenZeppelin.AccessControl` library
+-- uses (the `bytes32` analogue — a generic, monomorphic library cannot store a
+-- closed sum; see docs/ARCHITECTURE.md §5). The token keeps compile-time
+-- exhaustiveness in its own API and only crosses to `Text` at the library
+-- boundary in `SimpleToken.Admin.Capability.requireRole`. Per-constructor (no
+-- wildcard) so a new `Role` must be given an id deliberately, enforced by
+-- `-Werror=incomplete-patterns`.
+roleId : Role -> Text
+roleId Minter = "MINTER_ROLE"
+roleId Burner = "BURNER_ROLE"
+roleId Pauser = "PAUSER_ROLE"
+roleId BatchProcessor = "BATCH_PROCESSOR_ROLE"
+roleId Admin = "DEFAULT_ADMIN_ROLE"

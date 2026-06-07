@@ -20,17 +20,11 @@ eRedundantPauseChange = "simple-token: registry already in the requested pause s
 -- AccessControl (capabilities)
 --------------------------------
 
--- | INV-27: a capability is only honored for its issuing registry admin.
-eCapabilityAdminMismatch : Text
-eCapabilityAdminMismatch = "simple-token: capability admin does not match registry admin"
-
--- | INV-28: a capability is only honored for the caller it names (anti-impersonation).
-eCapabilityAssigneeMismatch : Text
-eCapabilityAssigneeMismatch = "simple-token: capability assignee does not match caller"
-
--- | INV-29: a capability is only honored for the role it carries.
-eCapabilityRoleMismatch : Text
-eCapabilityRoleMismatch = "simple-token: capability role does not match required role"
+-- INV-27 (admin gate), INV-28 (assignee / anti-impersonation), and INV-29 (role
+-- gate) are now enforced by the decoupled OpenZeppelin AccessControl library
+-- (`OpenZeppelin.AccessControl.requireRole`), which owns their messages — see
+-- SimpleToken.Admin.Capability.requireRole (AL-7). The token retains only the
+-- gates the minimal primitive does not cover.
 
 -- | INV-30: a capability is only honored when its scope authorizes the operation.
 eCapabilityScopeMismatch : Text

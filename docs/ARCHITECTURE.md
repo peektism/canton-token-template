@@ -328,10 +328,86 @@ not from bundling more into the token.
 
 The actionable form of this section lives in [PLAN.md §17.5 / slice AL-7](PLAN.md).
 
-> **Status (AL-7, step 2 done).** The decoupled library is built and tested on a
-> branch: `oz-access-control` / `oz-ownable` / `oz-pausable` — three independent
-> DARs, no cross-dependencies, `daml-script`-free, 16 passing scripts including the
-> typed-wrapper bridge — in [peektism/oz-daml-contracts#1](https://github.com/peektism/oz-daml-contracts/pull/1).
-> Steps 4–5 (token consumes them via a branch-pinned `data-dependency`; reduce the
-> in-token modules to the Layer-B composition; compare) are next.
+> **Status (AL-7, step 2 done; steps 4–5 done on a branch).** The decoupled
+> library is built, tested, and **merged**: `oz-access-control` / `oz-ownable` /
+> `oz-pausable` — three independent DARs, no cross-dependencies, `daml-script`-free,
+> 16 passing scripts including the typed-wrapper bridge
+> ([peektism/oz-daml-contracts#1](https://github.com/peektism/oz-daml-contracts/pull/1)).
+> The token-consumption experiment is on branch `al7-token-consumes-library`; the
+> empirical findings are §9 below.
+
+---
+
+## 9. AL-7 consumption findings (empirical)
+
+The token-consumption experiment (branch `al7-token-consumes-library`) wired the
+token to the merged library and let the compiler and test suite report what
+actually fits. The result is more interesting than "it all moved out."
+
+### What was consumed
+
+- **`oz-access-control` only.** The token's `daml.yaml` gains exactly one new
+  `data-dependency` (`oz-access-control`); Ownable and Pausable are deliberately
+  *not* pulled in — a live demonstration of "import only what you need."
+- **The role gate (A1–A3) now delegates to the library.**
+  `SimpleToken.Admin.Capability.requireRole` constructs a `RoleGrant` *view* of the
+  token capability and calls `OpenZeppelin.AccessControl.requireRole` for the
+  admin / assignee / role checks, then enforces the token's scope gate (A4) itself.
+  The library's `requireRole` is genuinely importable as a *function* via
+  `data-dependencies` (confirmed at build).
+- **The typed-wrapper bridge is real, not hypothetical.**
+  `SimpleToken.Admin.Roles.roleId : Role -> Text` maps the token's closed,
+  exhaustive `Role` sum to the library's `Text` ids at the boundary. The token
+  keeps full compile-time exhaustiveness (`-Werror=incomplete-patterns` still
+  applies to `roleId`); only the library call crosses to `Text`. This is exactly
+  the pattern §5 recommended, now exercised.
+
+### What stayed token-specific — and why (the substantive finding)
+
+- **Scope + mint allowance stay on `RoleCapability`.** Daml templates are
+  monomorphic and have **no inheritance/extension**, so the token's richer
+  credential cannot *be* a library `RoleGrant` with extra fields. The token keeps
+  its own template and passes an in-memory `RoleGrant` view only to reuse the gate
+  logic. So the minimal primitive is reused for its *logic*, not its *storage*.
+- **Pause stays an embedded `Bool` on `SimpleTokenRules`**, not the library's
+  standalone `PauseState` contract. The token's flag is atomic with the registry
+  contract every origination choice already reads; adopting `PauseState` would add
+  a separate contract that must be disclosed to all five origination chokepoints
+  for no behavioural gain. The library primitive is the right *generic* shape; the
+  token's embedded flag is the right *consumer* shape.
+- **Ownership stays the `Admin` role**, not the library's `Ownership`/
+  `OwnershipOffer`. The token's admin party is baked into every `InstrumentId` and
+  cannot move (correction C9), so it deliberately models ownership as a role grant;
+  adopting the generic two-step Ownable would reintroduce exactly the
+  `OwnershipOffer` desync the token rejected.
+
+### Measured cost / benefit
+
+- **Behavioural equivalence:** `simple-token` builds and the **full 141-test suite
+  passes unchanged** — the delegation is observably identical to the inlined gate.
+- **In-token footprint:** net **+43 / −15** source lines across 4 files (the new
+  dependency, the `roleId` bridge, the delegation, and three now-dead error strings
+  removed). The token did **not** get materially smaller — most of the admin layer
+  (scope, allowance, pause, governance/delegation, supply) is Layer-B logic that
+  was never generic.
+- **Where the payoff actually is:** the library's value is **reuse by *other*,
+  simpler consumers** (the C7 siblings — stablecoin / custody / bridge — that want
+  plain RBAC without instrument scope), plus a **single source of truth for the
+  gate semantics** shared across all of them. It is *not* shrinking this token.
+
+### Recommendation
+
+Adopt **Option 3 (§4)** as confirmed: keep the decoupled library at Layer A, and
+keep the token's enriched capability, embedded pause, and role-based ownership as
+the thin Layer-B composition that consumes the library where it genuinely fits.
+The experiment **vindicates both the review and the hybrid**: the substrate
+belongs in a decoupled library (review), and the token's composition is the
+correct consumer wiring, not a candidate for wholesale replacement (hybrid). A
+destructive cutover that forced scope/pause/ownership into the minimal primitives
+would *lose* type-safety and behavioural fit for no reuse gain — so it is
+explicitly **not** recommended.
+
+> Open follow-up for the library: if several real consumers turn out to need a
+> generic scope, consider an optional `scope : Optional Text` on `RoleGrant` — but
+> only when driven by ≥2 consumers, to avoid speculative generality.
 ```
