@@ -158,11 +158,15 @@ in-flight DvP" — overstated coverage. In a keyless UTXO ledger:
 
 So pause stops **new exposure** (originations) and leaves committed flows and
 recovery (withdraw/reject/cancel, INV-33) open. This matches how production
-registries behave. A true per-asset **freeze** (e.g. the admin neutralizing a
-specific suspect allocation via its lock-holder authority) is a *separate*
-capability — deliberately not conflated with pause — now **slated as
-[AL-10](AL-9-PARITY-GAP-REVIEW.md#al-10--account-level-freeze--compliance-hold-must-have)**
-(account-level compliance hold) by the AL-9 parity review. The docs (§6 below,
+registries behave. A per-**account** compliance **freeze** is a *separate*
+capability — deliberately not conflated with the registry-wide pause — **delivered
+in [AL-10](AL-9-PARITY-GAP-REVIEW.md#al-10--account-level-freeze--compliance-hold-must-have)**:
+a `frozenAccounts : [Party]` field on `SimpleTokenRules` (the same non-spoofable shape
+as `paused`), maintained by `ComplianceAdmin`-gated `Rules_FreezeAccount`/
+`Rules_UnfreezeAccount`, checked at the same origination chokepoints as pause against
+sender / receiver / mint-recipient (INV-40..42). Like pause, freeze is origination
+control — it does not reach into committed flows (seizing committed funds is the
+distinct forced-transfer capability, AL-11). The docs (§6 below,
 [AUDIT.md](AUDIT.md) INV-25) now state exactly this.
 
 ---
@@ -340,14 +344,16 @@ cap), `test_delegatedCannotRevokeAdmin` (delegate cannot revoke an `Admin` cap).
   the token's `PendingDefaultAdminTransfer`; plus `renounceRole`.
 - **[permanent]** Multisig / threshold owner — Canton topology (multi-hosted
   party), no code.
-- **[✅ AL-9 → slated AL-10/AL-11/AL-13]** Per-asset emergency **freeze**/seize
-  distinct from pause — high US-FI (sanctions/compliance) relevance. Reclassified
-  Must-Have and split into [AL-10](AL-9-PARITY-GAP-REVIEW.md#al-10--account-level-freeze--compliance-hold-must-have)
-  (account freeze), [AL-11](AL-9-PARITY-GAP-REVIEW.md#al-11--forced-transfer--seize-and-reallocate-must-have)
-  (forced transfer/seize-reallocate), [AL-13](AL-9-PARITY-GAP-REVIEW.md#al-13--reference-contract-global-halt-strong)
-  (global halt). AL-9's open questions are resolved (manual-only, dual-control for
-  irreversible seize, AL-13 runbook-only); see [AL-9 §4](AL-9-PARITY-GAP-REVIEW.md#4-open-questions--resolved-2026-06-07)
-  and §4 below for the pause boundary.
+- **[✅ AL-10 delivered; AL-11/AL-13 slated]** Per-account **freeze**/seize distinct
+  from pause — high US-FI (sanctions/compliance) relevance. Reclassified Must-Have and
+  split: **[AL-10](AL-9-PARITY-GAP-REVIEW.md#al-10--account-level-freeze--compliance-hold-must-have)
+  (account freeze) is delivered** (`frozenAccounts` on `SimpleTokenRules`,
+  `ComplianceAdmin`-gated `Rules_FreezeAccount`/`Rules_UnfreezeAccount`, INV-40..42, §4
+  above); [AL-11](AL-9-PARITY-GAP-REVIEW.md#al-11--forced-transfer--seize-and-reallocate-must-have)
+  (forced transfer/seize-reallocate) and [AL-13](AL-9-PARITY-GAP-REVIEW.md#al-13--reference-contract-global-halt-strong)
+  (global halt, runbook-only) remain slated. AL-9's open questions are resolved
+  (manual-only, dual-control for irreversible seize, AL-13 runbook-only); see
+  [AL-9 §4](AL-9-PARITY-GAP-REVIEW.md#4-open-questions--resolved-2026-06-07).
 - **[permanent]** On-ledger reassignment of the instrument `admin` party —
   impossible by design (C9); operator key handoff is a Canton topology operation.
 - **[✅ AL-9 → siblings]** CDP / custody / bridge roles — **AL-9 confirms** these

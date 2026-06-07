@@ -17,6 +17,31 @@ eRegistryPaused = "simple-token: registry is paused"
 eRedundantPauseChange : Text
 eRedundantPauseChange = "simple-token: registry already in the requested pause state"
 
+-- Account freeze / compliance hold (AL-10)
+-------------------------------------------
+
+-- | INV-40: a frozen account is refused at every origination chokepoint — it can
+-- neither send nor receive (nor be minted to). The per-account analogue of
+-- `eRegistryPaused`; freeze is origination control like pause (it does not reach
+-- into committed flows). The compliance hold is enforced by withholding the
+-- registry admin's required signature at the factory, not via a public blocklist.
+eAccountFrozen : Text
+eAccountFrozen = "simple-token: account is frozen (compliance hold)"
+
+-- | INV-42: freezing an already-frozen account is rejected (non-idempotent, like
+-- `eRedundantPauseChange`), so the frozen-set stays duplicate-free.
+eAccountAlreadyFrozen : Text
+eAccountAlreadyFrozen = "simple-token: account is already frozen"
+
+-- | INV-42: unfreezing an account that is not frozen is rejected.
+eAccountNotFrozen : Text
+eAccountNotFrozen = "simple-token: account is not frozen"
+
+-- | INV-42: the registry administrator party cannot be frozen — freezing the root
+-- would brick every gated flow (it co-signs every holding and originates supply).
+eCannotFreezeAdmin : Text
+eCannotFreezeAdmin = "simple-token: the registry administrator cannot be frozen"
+
 -- AccessControl (capabilities)
 --------------------------------
 

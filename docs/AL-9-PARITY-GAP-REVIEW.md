@@ -172,19 +172,34 @@ Each emitted slice is one self-contained, independently-reviewable unit that kee
 the suite green and consumes the AL-7/AL-8 library; **none should build until its
 gating open questions (§4) are resolved.**
 
-### AL-10 — Account-level freeze / compliance hold *(Must-Have)*
+### AL-10 — Account-level freeze / compliance hold *(Must-Have)* — ✅ DELIVERED
 
 - **Driver:** OFAC strict liability; BSA/AML; GENIUS Act "freeze … or prevent the
   transfer." Distinct from AL-1 *origination* pause (registry-wide) — this is a
-  **per-holder / per-account** compliance hold.
-- **Daml mechanics:** the issuer is already a co-signatory on every holding
-  ([C9](ADMIN-LAYER-PLAN.md#1-corrections-to-the-source-research-still-load-bearing)).
-  A freeze is a `ComplianceAdmin`-gated choice that flags a holder's holdings (or a
-  `FrozenAccount` marker the transfer chokepoints consult) so transfers are refused
-  — i.e. the issuer **withholds its required signature**, no public blocklist needed
-  (privacy-preserving, GDPR-compatible).
-- **New role:** `ComplianceAdmin` (under `Admin` in the `roleAdmin` graph).
-- **Gating OQs:** OQ-2 (human-in-loop), OQ-4 (role placement).
+  **per-account** compliance hold.
+- **Daml mechanics (as built):** a **`frozenAccounts : [Party]` field on
+  `SimpleTokenRules`** — the same non-spoofable shape as `paused` (a field on the
+  contract being exercised, not a caller-supplied lookup; keyless LF 2.1 has no global
+  registry — correction C2). `assertAccountsNotFrozen` is checked at **all five
+  origination chokepoints** (V1 + V2 transfer, V1 + V2 allocation, batch settlement)
+  **plus mint**, against sender / receiver / recipient (V2 principals resolved via
+  `accountPrincipal`). The hold is realized by the registry admin **withholding its
+  required signature** at the factory — no public on-ledger blocklist
+  (privacy-preserving, GDPR-compatible). Maintained by `ComplianceAdmin`-gated
+  `Rules_FreezeAccount`/`Rules_UnfreezeAccount` (non-idempotent; admin unfreezable),
+  with a read-only `Rules_GetFrozenAccounts` for wallet/audit observability. The
+  `reason` choice argument is recorded immutably in the exercise node (audit trail).
+- **New role:** `ComplianceAdmin` (`roleAdmin = Admin`, delegable through the AL-8
+  path). `LegalAdmin`/`EmergencyOps` were added **reserved** in the same enum edit
+  (OQ-4), graduated by AL-11/AL-13.
+- **OQs honored:** OQ-2 (manual-only, single officer — freeze is reversible),
+  OQ-4 (roles live here). **Invariants:** INV-40 (refused at every chokepoint),
+  INV-41 (registry-wide `ComplianceAdmin` gate), INV-42 (non-idempotent; admin
+  unfreezable). **Tests:** `Test/Freeze.daml`, 9 scripts, **suite 146→155 green**.
+- **Documented coverage boundary:** freeze is *origination* control like pause —
+  it gates new transfer legs in a settlement batch but does **not** reach into
+  already-committed `allocations` (seizing committed funds is the distinct
+  forced-transfer capability, AL-11).
 
 ### AL-11 — Forced transfer / seize-and-reallocate *(Must-Have)*
 
@@ -308,7 +323,9 @@ hybrid compliance validation, cross-domain identity deferred.*
 - [x] **Every "[AL-9: re-examine]" item reclassified** (§3): 3 → Must-Have slices (AL-10/11/12), 1 → Strong slice (AL-13), 4 confirmed classified-out.
 - [x] **Open questions surfaced and resolved** (§4): OQ-1…OQ-6 — OQ-2/4/5/6 closed, OQ-1/3 decided-with-posture (validate OQ-1 w/ compliance+infra; cross-domain deferred).
 - [x] **PLAN.md §17.4 / §17.5 / §17.7 + ADMIN-LAYER-PLAN §10 updated** to point here and carry the new slice IDs.
-- [x] **AL-10/AL-11 unblocked** — manual-only controls, `ComplianceAdmin`/`LegalAdmin`/`EmergencyOps` roles (flat `roleAdmin`), dual-control for irreversible seize/forced-transfer. **AL-13 → runbook/doc-only** unless per-instrument on-ledger halt is later requested. **AL-12** proceeds on single-domain v1 once the OQ-1 hybrid SLA is confirmed with stakeholders.
+- [x] **AL-10 ✅ delivered** (§3 above) — `frozenAccounts` freeze, `ComplianceAdmin` role, INV-40..42, suite 146→155. `LegalAdmin`/`EmergencyOps` added reserved.
+- [ ] **AL-11 ready** — manual-only + dual-control (propose + approve) for irreversible seize/forced-transfer; `LegalAdmin` graduates from reserved.
+- [ ] **AL-13 → runbook/doc-only** unless per-instrument on-ledger halt is later requested. **AL-12** proceeds on single-domain v1 once the OQ-1 hybrid SLA is confirmed with stakeholders.
 
 AL-9 is a review/planning slice — it adds **no on-ledger surface**. Its output is
 this register and the four emitted slices, gated on the six open questions above.

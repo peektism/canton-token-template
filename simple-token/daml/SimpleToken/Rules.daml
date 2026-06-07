@@ -28,12 +28,17 @@ import SimpleToken.Reporting (recordHoldingsChangeEvent)
 import SimpleToken.Experimental.Cip112.Account
   ( accountAuthority
   , accountObservers
+  , accountPrincipal
   , assertSupportedRegularAccount
   , isBasicAccount
   , isSupportedRegularAccount
   )
 import SimpleToken.Admin.Capability (RoleCapability, requireRole, consumeMintAllowance)
-import SimpleToken.Admin.Errors (eRegistryPaused, eRedundantPauseChange, eMintAmountNotPositive, eCappedMinterRequiresPreapproval)
+import SimpleToken.Admin.Errors
+  ( eRegistryPaused, eRedundantPauseChange, eMintAmountNotPositive
+  , eCappedMinterRequiresPreapproval
+  , eAccountFrozen, eAccountAlreadyFrozen, eAccountNotFrozen, eCannotFreezeAdmin
+  )
 import SimpleToken.Admin.Roles (Role(..))
 
 -- | Result of `Rules_Mint`. Exactly one of `mintedHoldingCids` (direct path, via
@@ -56,10 +61,26 @@ data Rules_MintResult = Rules_MintResult with
 -- counterparty semantics, and in a keyless UTXO ledger their contracts cannot
 -- read the factory flag without a spoofable context hop anyway. Recovery
 -- (withdraw / reject / cancel) also stays open so funds are never frozen
--- (INV-33). A per-asset emergency *freeze* is a separate capability, not pause.
--- See docs/ADMIN-LAYER-PLAN.md §4 and §6.
+-- (INV-33). A per-account compliance *freeze* is a separate capability (AL-10,
+-- `assertAccountsNotFrozen` + `Rules_FreezeAccount`), deliberately not conflated
+-- with the registry-wide pause. See docs/ADMIN-LAYER-PLAN.md §4 and §6.
 assertNotPaused : Bool -> Update ()
 assertNotPaused paused = assertMsg eRegistryPaused (not paused)
+
+-- | Account-freeze guard (AL-10): the per-account analogue of `assertNotPaused`.
+-- Fails the transaction if ANY of the given parties is on the registry's
+-- `frozenAccounts` list. Checked at the same origination chokepoints as pause,
+-- against sender AND receiver (and the mint recipient), so a frozen account can
+-- neither send nor receive — the OFAC/AML compliance hold (INV-40).
+--
+-- It is non-spoofable for the same reason pause is: `frozenAccounts` is a field on
+-- the `SimpleTokenRules` contract being exercised, not a caller-supplied lookup
+-- (Daml LF 2.1 has no global registry; a caller-passed blocklist would be omittable
+-- — correction C2). The freeze is realized by the registry admin withholding its
+-- required signature at the factory, never a public on-ledger blocklist (privacy).
+assertAccountsNotFrozen : [Party] -> [Party] -> Update ()
+assertAccountsNotFrozen frozenAccounts parties =
+  assertMsg eAccountFrozen (all (`notElem` frozenAccounts) parties)
 
 -- | Experimental V2 actor guard marker used before delegating into the V1 factory.
 v2TransferFactoryActorFailureMsg : Text
@@ -92,6 +113,11 @@ template SimpleTokenRules
     admin : Party
     supportedInstruments : [Text]
     paused : Bool  -- ^ Pausable flag; when True all gated factory choices revert.
+    frozenAccounts : [Party]
+      -- ^ AL-10 account-level compliance hold: parties on this list are refused at
+      -- every origination chokepoint (as sender, receiver, or mint recipient).
+      -- Maintained by `Rules_FreezeAccount`/`Rules_UnfreezeAccount` (registry-wide
+      -- `ComplianceAdmin`-gated); duplicate-free by the non-idempotent guards.
   where
     signatory admin
 
@@ -124,6 +150,62 @@ template SimpleTokenRules
       controller actor
       do pure paused
 
+    -- | Place an account on a compliance hold (AL-10). The actor must present a
+    -- registry-wide `ComplianceAdmin` capability issued by this registry's admin —
+    -- freeze is registry-wide (a sanctioned party is held across every instrument),
+    -- so an instrument-scoped capability cannot freeze, exactly as pause requires a
+    -- registry-wide `Pauser`. Recreates the factory with `account` added to
+    -- `frozenAccounts`.
+    --
+    -- This is a MANUAL administrative action (AL-9 OQ-2): the controller is a human
+    -- holding the capability; nothing here fires automatically from an oracle, claim
+    -- expiry, or timer. Freeze is reversible, so a single `ComplianceAdmin` officer
+    -- suffices (irreversible seizure — AL-11 — will require two-person control). The
+    -- `reason` is recorded in the exercise node, giving an immutable on-ledger audit
+    -- trail of why the hold was placed.
+    --
+    -- # Invariants enforced:
+    -- - INV-41: freezing requires a registry-wide ComplianceAdmin capability
+    -- - INV-42: the admin cannot be frozen; an already-frozen account is rejected
+    choice Rules_FreezeAccount : ContractId SimpleTokenRules
+      with
+        actor : Party                            -- ^ The party placing the hold.
+        complianceCap : ContractId RoleCapability -- ^ The actor's registry-wide ComplianceAdmin capability.
+        account : Party                          -- ^ The account to freeze.
+        reason : Text                            -- ^ Audit metadata: why the hold is placed.
+      controller actor
+      do
+        _ <- requireRole actor ComplianceAdmin admin None complianceCap
+        assertMsg eCannotFreezeAdmin (account /= admin)
+        assertMsg eAccountAlreadyFrozen (account `notElem` frozenAccounts)
+        create this with frozenAccounts = account :: frozenAccounts
+
+    -- | Lift a compliance hold (AL-10). Same registry-wide `ComplianceAdmin` gate as
+    -- `Rules_FreezeAccount`; rejects unfreezing an account that is not held. `reason`
+    -- is again recorded for the audit trail.
+    --
+    -- # Invariants enforced:
+    -- - INV-41: unfreezing requires a registry-wide ComplianceAdmin capability
+    -- - INV-42: an account that is not frozen is rejected
+    choice Rules_UnfreezeAccount : ContractId SimpleTokenRules
+      with
+        actor : Party                            -- ^ The party lifting the hold.
+        complianceCap : ContractId RoleCapability -- ^ The actor's registry-wide ComplianceAdmin capability.
+        account : Party                          -- ^ The account to unfreeze.
+        reason : Text                            -- ^ Audit metadata: why the hold is lifted.
+      controller actor
+      do
+        _ <- requireRole actor ComplianceAdmin admin None complianceCap
+        assertMsg eAccountNotFrozen (account `elem` frozenAccounts)
+        create this with frozenAccounts = filter (/= account) frozenAccounts
+
+    -- | Read the frozen-account set without archiving. Read-only and ungated so
+    -- wallets/auditors can display compliance state (the INV-34 analogue for freeze).
+    nonconsuming choice Rules_GetFrozenAccounts : [Party]
+      with actor : Party  -- ^ The querying party.
+      controller actor
+      do pure frozenAccounts
+
     -- | Mint new supply to `recipient` (AL-5). Gated by the caller's `Minter`
     -- capability (instrument-scoped) and its D3 allowance. Mint is origination, so
     -- it is `whenNotPaused`. A3 dispatch: if `recipient` has a `TransferPreapproval`
@@ -147,6 +229,8 @@ template SimpleTokenRules
       controller minter
       do
         assertNotPaused paused
+        -- INV-40: cannot mint into a frozen account (compliance hold on the recipient)
+        assertAccountsNotFrozen frozenAccounts [recipient]
         assertMsg eMintAmountNotPositive (amount > 0.0)
         assertMsg "instrumentId.admin must match factory admin"
           (instrumentId.admin == admin)
@@ -203,6 +287,8 @@ template SimpleTokenRules
         -- INV-25: Pausable guard, before any validation or state mutation
         assertNotPaused paused
         let transfer = arg.transfer
+        -- INV-40: account-freeze guard — neither sender nor receiver may be on a hold
+        assertAccountsNotFrozen frozenAccounts [transfer.sender, transfer.receiver]
         -- Invariant #1: expectedAdmin matches admin
         assertMsg "expectedAdmin does not match factory admin"
           (arg.expectedAdmin == admin)
@@ -265,6 +351,11 @@ template SimpleTokenRules
       transferFactory_transferImpl selfCid arg = do
         -- INV-25: Pausable guard (V2 path)
         assertNotPaused paused
+        -- INV-40: account-freeze guard — check the owning principals of both accounts
+        -- (`accountPrincipal` resolves basic and provider-managed accounts alike).
+        assertAccountsNotFrozen frozenAccounts
+          [ accountPrincipal admin arg.transfer.sender
+          , accountPrincipal admin arg.transfer.receiver ]
         if isBasicAccount arg.transfer.sender && isBasicAccount arg.transfer.receiver
           then do
             let sender = TokenStandard.accountPrincipal arg.transfer.instrumentId.admin arg.transfer.sender
@@ -296,6 +387,8 @@ template SimpleTokenRules
         assertNotPaused paused
         let leg = arg.allocation.transferLeg
             settlement = arg.allocation.settlement
+        -- INV-40: account-freeze guard — neither sender nor receiver may be on a hold
+        assertAccountsNotFrozen frozenAccounts [leg.sender, leg.receiver]
         -- Invariant #1: expectedAdmin matches admin
         assertMsg "expectedAdmin does not match factory admin"
           (arg.expectedAdmin == admin)
@@ -384,6 +477,10 @@ template SimpleTokenRules
         -- INV-25: Pausable guard (V2 allocation path)
         assertNotPaused paused
         let allocation = arg.allocation
+        -- INV-40: account-freeze guard — the authorizer and every leg counterparty
+        assertAccountsNotFrozen frozenAccounts
+          (accountPrincipal admin allocation.authorizer
+            :: map (\s -> accountPrincipal admin s.otherside) allocation.transferLegSides)
         assertMsg "V2 allocation admin must match factory admin"
           (allocation.admin == admin)
         now <- getTime
@@ -432,6 +529,14 @@ template SimpleTokenRules
       settlementFactory_settleBatchImpl selfCid arg = do
         -- INV-25: Pausable guard (V2 settlement path)
         assertNotPaused paused
+        -- INV-40: account-freeze guard — every transfer-leg principal being settled.
+        -- Like pause, this gates batch ORIGINATION (the new direct transfer legs); it
+        -- does not reach into already-committed `arg.allocations` (committed-flow
+        -- completion is out of scope for freeze, as for pause — see §4 of the docs).
+        assertAccountsNotFrozen frozenAccounts
+          (concatMap
+            (\leg -> [accountPrincipal admin leg.sender, accountPrincipal admin leg.receiver])
+            arg.transferLegs)
         assertMsg v2SettlementFactoryActorFailureMsg
           (samePartySet arg.settlement.executors arg.actors)
         assertMsg "V2 settlement transfer legs or allocations must not be empty"

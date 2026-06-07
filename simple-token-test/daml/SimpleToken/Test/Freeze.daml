@@ -1,0 +1,202 @@
+-- | Account-level freeze / compliance hold tests (AL-10). Covers PLAN.md §17
+-- slice AL-10 and invariants #40–#42 (the OFAC/AML per-account hold). Freeze is
+-- the per-account analogue of pause: a `ComplianceAdmin`-gated, manual,
+-- registry-wide hold checked at the factory origination chokepoints, so a frozen
+-- account can neither send nor receive nor be minted to.
+--
+-- Negative-test discipline mirrors SimpleToken.Test.Admin: each `submitMustFail`
+-- discloses exactly the contracts the failing choice must fetch (the factory, a
+-- capability the caller is not the assignee of) so the failure lands on the guard
+-- under test — an `assertMsg` (`eAccountFrozen`, `eCannotFreezeAdmin`,
+-- `eAccountAlreadyFrozen`, `eAccountNotFrozen`) or the capability gate — not on
+-- contract visibility. These disclosures are load-bearing.
+module SimpleToken.Test.Freeze where
+
+import Splice.Api.Token.TransferInstructionV1
+
+import SimpleToken.Rules (Rules_FreezeAccount(..), Rules_UnfreezeAccount(..))
+import SimpleToken.Admin.Roles (Role(..))
+import SimpleToken.Testing.SimpleRegistry
+import SimpleToken.Testing.WalletClient
+import SimpleToken.Test.Setup
+import SimpleToken.Test.Transfer (mkTransfer)
+import SimpleToken.Test.Allocation (mkAllocationArgs)
+
+import Daml.Script
+
+-- INV-40 — a frozen account is refused at the origination chokepoints
+----------------------------------------------------------------------
+
+-- | INV-40: a frozen SENDER cannot originate a transfer.
+test_freezeBlocksTransferSender : Script ()
+test_freezeBlocksTransferSender = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  compCap <- issueRole registry adminCid registry.admin ComplianceAdmin
+  [h1] <- fundParty registry alice 100.0
+  _ <- createPreapproval registry bob None
+  _ <- freezeAccount registry registry.admin compCap alice "OFAC SDN match"
+  let transfer = mkTransfer registry alice bob 70.0 [h1]
+  enriched <- getTransferFactory registry transfer emptyExtraArgs
+  submitWithDiscMustFail alice enriched.disclosures $
+    exerciseCmd enriched.factoryCid enriched.arg
+
+-- | INV-40: a frozen RECEIVER cannot be sent to (you cannot transfer to a
+-- sanctioned party either).
+test_freezeBlocksTransferReceiver : Script ()
+test_freezeBlocksTransferReceiver = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  compCap <- issueRole registry adminCid registry.admin ComplianceAdmin
+  [h1] <- fundParty registry alice 100.0
+  _ <- createPreapproval registry bob None
+  _ <- freezeAccount registry registry.admin compCap bob "OFAC SDN match"
+  let transfer = mkTransfer registry alice bob 70.0 [h1]
+  enriched <- getTransferFactory registry transfer emptyExtraArgs
+  submitWithDiscMustFail alice enriched.disclosures $
+    exerciseCmd enriched.factoryCid enriched.arg
+
+-- | INV-40: a frozen account cannot originate an allocation.
+test_freezeBlocksAllocation : Script ()
+test_freezeBlocksAllocation = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      exec = parties.executor
+  adminCid <- createTokenAdministrator registry
+  compCap <- issueRole registry adminCid registry.admin ComplianceAdmin
+  [h1] <- fundParty registry alice 100.0
+  _ <- freezeAccount registry registry.admin compCap alice "OFAC SDN match"
+  let args = mkAllocationArgs registry alice bob exec 70.0 [h1]
+  enriched <- getAllocationFactory registry args
+  submitWithDiscMustFail alice enriched.disclosures $
+    exerciseCmd enriched.factoryCid enriched.arg
+
+-- | INV-40: a frozen account cannot be minted into.
+test_freezeBlocksMint : Script ()
+test_freezeBlocksMint = do
+  TestEnv{..} <- setupTestEnv
+  let charlie = parties.charlie
+  adminCid <- createTokenAdministrator registry
+  compCap <- issueRole registry adminCid registry.admin ComplianceAdmin
+  minterCap <- issueRole registry adminCid registry.admin Minter
+  _ <- createPreapproval registry charlie None
+  _ <- freezeAccount registry registry.admin compCap charlie "OFAC SDN match"
+  mintToMustFail registry registry.admin minterCap charlie 50.0
+
+-- | Lifting the hold restores normal operation (the transfer then completes).
+test_unfreezeRestoresTransfer : Script ()
+test_unfreezeRestoresTransfer = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  compCap <- issueRole registry adminCid registry.admin ComplianceAdmin
+  [h1] <- fundParty registry alice 100.0
+  _ <- createPreapproval registry bob None
+  _ <- freezeAccount registry registry.admin compCap alice "review"
+  _ <- unfreezeAccount registry registry.admin compCap alice "cleared"
+  let transfer = mkTransfer registry alice bob 70.0 [h1]
+  enriched <- getTransferFactory registry transfer emptyExtraArgs
+  result <- submitWithDisc alice enriched.disclosures $
+    exerciseCmd enriched.factoryCid enriched.arg
+  case result.output of
+    TransferInstructionResult_Completed _ -> pure ()
+    _ -> fail "Expected Completed after unfreeze"
+  checkBalance bob registry.instrumentId 70.0
+
+-- INV-41 — freeze requires a registry-wide ComplianceAdmin capability
+----------------------------------------------------------------------
+
+-- | INV-41: freezing requires a `ComplianceAdmin` capability. A holder of a
+-- different role (Minter) cannot freeze; a genuine ComplianceAdmin delegate can.
+test_freezeRequiresComplianceAdmin : Script ()
+test_freezeRequiresComplianceAdmin = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  -- bob holds only a Minter capability — it cannot freeze.
+  minterCap <- issueRole registry adminCid bob Minter
+  (rulesCid, disc) <- currentRules registry
+  submitWithDiscMustFail bob disc $
+    exerciseCmd rulesCid Rules_FreezeAccount with
+      actor = bob; complianceCap = minterCap; account = alice; reason = "x"
+  -- with a real ComplianceAdmin capability, bob (a delegate) can freeze.
+  compCap <- issueRole registry adminCid bob ComplianceAdmin
+  _ <- freezeAccount registry bob compCap alice "OFAC SDN match"
+  pure ()
+
+-- | INV-41 (least privilege): freeze is registry-wide and rejects an
+-- instrument-scoped ComplianceAdmin capability; a registry-wide one succeeds.
+test_scopedComplianceAdminCannotFreeze : Script ()
+test_scopedComplianceAdminCannotFreeze = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  scoped <- issueScopedRole registry adminCid bob ComplianceAdmin registry.instrumentId
+  (rulesCid, disc) <- currentRules registry
+  submitWithDiscMustFail bob disc $
+    exerciseCmd rulesCid Rules_FreezeAccount with
+      actor = bob; complianceCap = scoped; account = alice; reason = "x"
+  wide <- issueRole registry adminCid bob ComplianceAdmin
+  _ <- freezeAccount registry bob wide alice "OFAC SDN match"
+  pure ()
+
+-- INV-42 — non-idempotent; the registry administrator is unfreezable
+---------------------------------------------------------------------
+
+-- | INV-42: double-freeze is rejected, unfreezing a non-frozen account is
+-- rejected, and the registry administrator can never be frozen.
+test_freezeNonIdempotentAndAdminProtected : Script ()
+test_freezeNonIdempotentAndAdminProtected = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  adminCid <- createTokenAdministrator registry
+  compCap <- issueRole registry adminCid registry.admin ComplianceAdmin
+  _ <- freezeAccount registry registry.admin compCap alice "OFAC SDN match"
+  -- freezing alice again is rejected (eAccountAlreadyFrozen)
+  (rc1, d1) <- currentRules registry
+  submitWithDiscMustFail registry.admin d1 $
+    exerciseCmd rc1 Rules_FreezeAccount with
+      actor = registry.admin; complianceCap = compCap; account = alice; reason = "again"
+  -- unfreezing bob (never frozen) is rejected (eAccountNotFrozen)
+  (rc2, d2) <- currentRules registry
+  submitWithDiscMustFail registry.admin d2 $
+    exerciseCmd rc2 Rules_UnfreezeAccount with
+      actor = registry.admin; complianceCap = compCap; account = bob; reason = "x"
+  -- the registry administrator cannot be frozen (eCannotFreezeAdmin)
+  (rc3, d3) <- currentRules registry
+  submitWithDiscMustFail registry.admin d3 $
+    exerciseCmd rc3 Rules_FreezeAccount with
+      actor = registry.admin; complianceCap = compCap; account = registry.admin; reason = "x"
+
+-- Role wiring (AL-8 × AL-10) + observability
+---------------------------------------------
+
+-- | AL-8 × AL-10: `roleAdmin ComplianceAdmin = Admin`, so an `Admin` delegate may
+-- appoint a ComplianceAdmin officer, who then freezes a party. The frozen set is
+-- observable (the audit/SOC analogue of `Rules_GetPaused`), and a frozen party can
+-- no longer be minted to — proving the appointed role is live, not nominal.
+test_complianceAdminDelegableAndObservable : Script ()
+test_complianceAdminDelegableAndObservable = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice     -- governance delegate (Admin)
+      bob = parties.bob         -- compliance officer appointed by the delegate
+      charlie = parties.charlie -- frozen party
+  adminCid <- createTokenAdministrator registry
+  adminCap <- issueRole registry adminCid alice Admin
+  bobComp <- delegatedIssueRole registry adminCid alice adminCap bob ComplianceAdmin
+  _ <- freezeAccount registry bob bobComp charlie "sanctions screening hit"
+  frozen <- getFrozenAccounts registry alice
+  assert (charlie `elem` frozen)
+  -- the hold is live: charlie can no longer be minted to.
+  minterCap <- issueRole registry adminCid registry.admin Minter
+  _ <- createPreapproval registry charlie None
+  mintToMustFail registry registry.admin minterCap charlie 10.0

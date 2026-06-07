@@ -81,6 +81,7 @@ initialize adminName instrumentName = do
     admin
     supportedInstruments = [instrumentName]
     paused = False
+    frozenAccounts = []
   pure SimpleRegistry with admin; instrumentId
 
 -- | Initialize a multi-instrument registry.
@@ -95,6 +96,7 @@ initializeMulti adminName instrumentNames = do
     admin
     supportedInstruments = instrumentNames
     paused = False
+    frozenAccounts = []
   pure SimpleRegistry with admin; instrumentId
 
 -- | Create a holding for a party (admin + owner must sign).
@@ -292,6 +294,30 @@ setPaused registry pauser pauserCap newPaused = do
   (rulesCid, disc) <- currentRules registry
   submitWithDisc pauser disc $
     exerciseCmd rulesCid Rules_SetPaused with actor = pauser; pauserCap; newPaused
+
+-- | Place a compliance hold on `account` as `actor`, presenting their registry-wide
+-- `ComplianceAdmin` capability (AL-10). Like `setPaused`, works whether `actor` is
+-- the admin or a delegate: the factory is disclosed and its admin authority performs
+-- the recreate while the capability check gates who may trigger it.
+freezeAccount : SimpleRegistry -> Party -> ContractId RoleCapability -> Party -> Text -> Script (ContractId SimpleTokenRules)
+freezeAccount registry actor complianceCap account reason = do
+  (rulesCid, disc) <- currentRules registry
+  submitWithDisc actor disc $
+    exerciseCmd rulesCid Rules_FreezeAccount with actor; complianceCap; account; reason
+
+-- | Lift a compliance hold on `account` as `actor` (AL-10).
+unfreezeAccount : SimpleRegistry -> Party -> ContractId RoleCapability -> Party -> Text -> Script (ContractId SimpleTokenRules)
+unfreezeAccount registry actor complianceCap account reason = do
+  (rulesCid, disc) <- currentRules registry
+  submitWithDisc actor disc $
+    exerciseCmd rulesCid Rules_UnfreezeAccount with actor; complianceCap; account; reason
+
+-- | Read the registry's frozen-account set (AL-10).
+getFrozenAccounts : SimpleRegistry -> Party -> Script [Party]
+getFrozenAccounts registry actor = do
+  (rulesCid, disc) <- currentRules registry
+  submitWithDisc actor disc $
+    exerciseCmd rulesCid Rules_GetFrozenAccounts with actor
 
 -- Supply management helpers (mint / burn — AL-5/AL-6)
 ------------------------------------------------------

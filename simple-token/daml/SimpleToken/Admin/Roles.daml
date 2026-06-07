@@ -20,15 +20,33 @@ module SimpleToken.Admin.Roles where
 --   * `Admin`  — enforced by the `TokenAdministrator` delegated choices.
 --   * `Minter` — enforced by `Rules_Mint` (AL-5); carries an optional D3 allowance.
 --   * `Burner` — enforced by `SimpleHolding_ForcedBurn` (AL-6, clawback).
+--   * `ComplianceAdmin` — enforced by `Rules_FreezeAccount`/`Rules_UnfreezeAccount`
+--     (AL-10, account-level compliance hold). The generic regulated-token compliance
+--     role (OFAC/AML), distinct from product-specific custody roles (which stay in
+--     sibling repos — AL-9 §3 R10 / OQ-4).
 --   * `BatchProcessor` — RESERVED: defined so capabilities are mintable ahead of
 --     the slice that consumes it (V2-10 delegated settlement). No choice gates on
 --     it yet, so granting it authorizes nothing today. Do not treat it as live
 --     access control until its slice lands.
+--   * `LegalAdmin` — RESERVED (AL-11): the seize / forced-transfer / court-order
+--     role. Manual-only + two-person control by decision (AL-9 OQ-2); no choice
+--     gates on it until AL-11 lands.
+--   * `EmergencyOps` — RESERVED (AL-13): the intended holder of emergency-halt
+--     authority. AL-13 is runbook/doc-first (AL-9 OQ-5: AL-1 pause + AL-10 freeze +
+--     sync-domain suspension cover it), so no choice gates on it today.
+--
+-- AL-9 (OQ-4) added `ComplianceAdmin`/`LegalAdmin`/`EmergencyOps` as the generic
+-- regulated-token roles a US-FI-ready RI ships with. Only `ComplianceAdmin` is live
+-- in AL-10; the other two follow the `BatchProcessor` reserved-role pattern until
+-- their slices graduate them. See docs/AL-9-PARITY-GAP-REVIEW.md §3.
 data Role
   = Minter          -- ^ May create holdings via `Rules_Mint` (AL-5). Enforced; instrument-scopable.
   | Burner          -- ^ May force-burn holdings via `SimpleHolding_ForcedBurn` (AL-6). Enforced.
   | Pauser          -- ^ May flip the registry pause flag (see SimpleToken.Rules). Enforced.
+  | ComplianceAdmin -- ^ May freeze/unfreeze accounts (`Rules_FreezeAccount`, AL-10). Enforced.
   | BatchProcessor  -- ^ (reserved) Delegated SettlementFactory_SettleBatch — future slice (V2-10).
+  | LegalAdmin      -- ^ (reserved) Seize / forced transfer / court orders — future slice (AL-11).
+  | EmergencyOps    -- ^ (reserved) Emergency-halt authority — AL-13 (runbook-first today).
   | Admin           -- ^ Root governance: may issue/revoke capabilities (owner analogue). Enforced.
   deriving (Eq, Show)
 
@@ -75,7 +93,10 @@ roleAdmin : Role -> Role
 roleAdmin Minter = Admin
 roleAdmin Burner = Admin
 roleAdmin Pauser = Admin
+roleAdmin ComplianceAdmin = Admin  -- AL-9 OQ-4: flat default; opt into a narrower admin later
 roleAdmin BatchProcessor = Admin
+roleAdmin LegalAdmin = Admin        -- AL-9 OQ-4: flat default (reserved, AL-11)
+roleAdmin EmergencyOps = Admin      -- AL-9 OQ-4: flat default (reserved, AL-13)
 roleAdmin Admin = Admin
 
 -- | The single, authoritative carve-out policy (AL-8): may `role` be granted or
@@ -94,11 +115,14 @@ roleAdmin Admin = Admin
 -- it per-constructor (no wildcard) means a new `Role` must declare its policy or the
 -- build fails (`-Werror=incomplete-patterns`) — there is no silent default.
 delegableViaRoleAdmin : Role -> Bool
-delegableViaRoleAdmin Admin          = False  -- DEFAULT_ADMIN_ROLE: root-managed only (C9)
-delegableViaRoleAdmin Minter         = True
-delegableViaRoleAdmin Burner         = True
-delegableViaRoleAdmin Pauser         = True
-delegableViaRoleAdmin BatchProcessor = True
+delegableViaRoleAdmin Admin           = False  -- DEFAULT_ADMIN_ROLE: root-managed only (C9)
+delegableViaRoleAdmin Minter          = True
+delegableViaRoleAdmin Burner          = True
+delegableViaRoleAdmin Pauser          = True
+delegableViaRoleAdmin ComplianceAdmin = True   -- operational compliance role, delegable through Admin (AL-10)
+delegableViaRoleAdmin BatchProcessor  = True
+delegableViaRoleAdmin LegalAdmin      = True   -- reserved (AL-11); delegable through Admin
+delegableViaRoleAdmin EmergencyOps    = True   -- reserved (AL-13); delegable through Admin
 
 -- | The typed-wrapper bridge (AL-7): map this token's closed, exhaustive `Role`
 -- sum to the `Text` role ids the generic `OpenZeppelin.AccessControl` library
@@ -112,5 +136,8 @@ roleId : Role -> Text
 roleId Minter = "MINTER_ROLE"
 roleId Burner = "BURNER_ROLE"
 roleId Pauser = "PAUSER_ROLE"
+roleId ComplianceAdmin = "COMPLIANCE_ADMIN_ROLE"
 roleId BatchProcessor = "BATCH_PROCESSOR_ROLE"
+roleId LegalAdmin = "LEGAL_ADMIN_ROLE"
+roleId EmergencyOps = "EMERGENCY_OPS_ROLE"
 roleId Admin = "DEFAULT_ADMIN_ROLE"
