@@ -159,8 +159,10 @@ in-flight DvP" — overstated coverage. In a keyless UTXO ledger:
 So pause stops **new exposure** (originations) and leaves committed flows and
 recovery (withdraw/reject/cancel, INV-33) open. This matches how production
 registries behave. A true per-asset **freeze** (e.g. the admin neutralizing a
-specific suspect allocation via its lock-holder authority) is a *separate* future
-capability — deliberately not conflated with pause. The docs (§6 below,
+specific suspect allocation via its lock-holder authority) is a *separate*
+capability — deliberately not conflated with pause — now **slated as
+[AL-10](AL-9-PARITY-GAP-REVIEW.md#al-10--account-level-freeze--compliance-hold-must-have)**
+(account-level compliance hold) by the AL-9 parity review. The docs (§6 below,
 [AUDIT.md](AUDIT.md) INV-25) now state exactly this.
 
 ---
@@ -323,9 +325,10 @@ cap), `test_delegatedCannotRevokeAdmin` (delegate cannot revoke an `Admin` cap).
 
 ## 10. Out of scope (named seams, not gaps)
 
-> ⚠️ **Under AL-9 review.** This list is being audited for items that were
-> deferred as "MVP seam" but are actually **OZ-parity gaps we want** given US-FI
-> usage. Items below are tagged accordingly; see [PLAN.md §17.4/§17.5](PLAN.md).
+> ✅ **AL-9 review complete** → [AL-9-PARITY-GAP-REVIEW.md](AL-9-PARITY-GAP-REVIEW.md).
+> Items deferred as "MVP seam" that were actually **OZ-parity gaps** have been
+> reclassified into prioritized slices (AL-10/11/12/13); the rest are confirmed
+> classified-out. Tags below updated accordingly; see [PLAN.md §17.4/§17.7](PLAN.md).
 
 - **✅ AL-8 delivered.** Per-role admin hierarchy (`getRoleAdmin` analogue) —
   `delegableRole` replaced by the compiled `roleAdmin : Role -> Role`, so every role
@@ -337,12 +340,20 @@ cap), `test_delegatedCannotRevokeAdmin` (delegate cannot revoke an `Admin` cap).
   the token's `PendingDefaultAdminTransfer`; plus `renounceRole`.
 - **[permanent]** Multisig / threshold owner — Canton topology (multi-hosted
   party), no code.
-- **[AL-9: re-examine]** Per-asset emergency **freeze**/seize distinct from pause —
-  high US-FI (sanctions/compliance) relevance; future capability (§4).
+- **[✅ AL-9 → slated AL-10/AL-11/AL-13]** Per-asset emergency **freeze**/seize
+  distinct from pause — high US-FI (sanctions/compliance) relevance. Reclassified
+  Must-Have and split into [AL-10](AL-9-PARITY-GAP-REVIEW.md#al-10--account-level-freeze--compliance-hold-must-have)
+  (account freeze), [AL-11](AL-9-PARITY-GAP-REVIEW.md#al-11--forced-transfer--seize-and-reallocate-must-have)
+  (forced transfer/seize-reallocate), [AL-13](AL-9-PARITY-GAP-REVIEW.md#al-13--reference-contract-global-halt-strong)
+  (global halt). AL-9's open questions are resolved (manual-only, dual-control for
+  irreversible seize, AL-13 runbook-only); see [AL-9 §4](AL-9-PARITY-GAP-REVIEW.md#4-open-questions--resolved-2026-06-07)
+  and §4 below for the pause boundary.
 - **[permanent]** On-ledger reassignment of the instrument `admin` party —
   impossible by design (C9); operator key handoff is a Canton topology operation.
-- **[AL-9: re-examine]** CDP / custody / bridge roles — today deferred to sibling
-  stablecoin & bridge plans; AL-9 reassesses which belong here for US-FI use.
+- **[✅ AL-9 → siblings]** CDP / custody / bridge roles — **AL-9 confirms** these
+  stay in the sibling stablecoin & bridge plans; only the compliance/legal admin
+  roles (`ComplianceAdmin`/`LegalAdmin`/`EmergencyOps`) the freeze/seize slices need
+  belong here (OQ-4).
 
 ---
 
