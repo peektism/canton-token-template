@@ -1,0 +1,149 @@
+-- | Ownable-as-Admin-role: the governance anchor for a registry.
+--
+-- Design (docs/ADMIN-LAYER-PLAN.md §5): on Canton the instrument `admin` party is
+-- baked into every `InstrumentId` and co-signs every holding, so it is the
+-- permanent cryptographic root and cannot be reassigned without re-issuing
+-- assets. Rather than fake an "ownership transfer" of that party, the admin
+-- layer collapses Ownable into AccessControl: the `Admin` role *is* the owner
+-- (`DEFAULT_ADMIN_ROLE`). The genesis `admin` party always retains ultimate
+-- authority; operational governance is delegated by issuing an `Admin`
+-- capability to another party and revoked by archiving it. That delegation —
+-- not a party swap — is the ownership-handoff analogue, and it works
+-- immediately because every capability is anchored to the same fixed `admin`.
+--
+-- `TokenAdministrator` is the genesis issuer. It exposes direct issuance/
+-- revocation (controlled by the root `admin`) and delegated issuance/revocation
+-- (controlled by any holder of a registry-wide `Admin` capability). Delegated
+-- choices carry the contract's admin authority, so a delegate can mint/revoke
+-- admin-signed capabilities without holding the root key.
+module SimpleToken.Admin.Authority where
+
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import SimpleToken.Admin.Capability (RoleCapability(..), requireRole)
+import SimpleToken.Admin.Errors
+import SimpleToken.Admin.Roles (Role(..), delegableRole)
+
+-- | Mint a capability anchored to this registry. Shared by root and delegated
+-- issuance so the create site is single-sourced.
+mkRoleCapability : Party -> Party -> Role -> Optional InstrumentId -> Update (ContractId RoleCapability)
+mkRoleCapability admin assignee role scope =
+  create RoleCapability with admin; assignee; role; scope; mintAllowance = None
+
+-- | Archive a capability issued by this registry. Shared by root and delegated
+-- revocation. `mayRevokeRole` decides which roles the caller is allowed to
+-- revoke: the root passes `const True` (any role); a delegate passes
+-- `delegableRole` so it can revoke only delegable roles (see
+-- `SimpleToken.Admin.Roles.delegableRole`). Single-sourcing the fetch +
+-- admin-match + role-policy + archive keeps both revoke paths from drifting, and
+-- routes the policy through the same `delegableRole` predicate as issuance.
+revokeIssuedCapability : Party -> (Role -> Bool) -> ContractId RoleCapability -> Update ()
+revokeIssuedCapability admin mayRevokeRole capCid = do
+  cap <- fetch capCid
+  assertMsg eCapabilityNotIssuedByThisAdmin (cap.admin == admin)
+  assertMsg eRoleNotDelegable (mayRevokeRole cap.role)
+  archive capCid
+
+-- | Assert `caller` is a governance delegate of this registry: holds a
+-- registry-wide `Admin` capability. Single-sources the precondition shared by
+-- the delegated issue and revoke choices. Returns the validated capability
+-- (callers discard it).
+requireAdminDelegate : Party -> Party -> ContractId RoleCapability -> Update RoleCapability
+requireAdminDelegate caller admin adminCap = requireRole caller Admin admin None adminCap
+
+-- | The genesis governance anchor for a registry. `admin` is the immutable
+-- instrument root party (equals `SimpleTokenRules.admin`). One instance per
+-- registry by convention; nothing depends on uniqueness, because every consumer
+-- validates the full capability tuple via `requireRole`.
+template TokenAdministrator
+  with
+    admin : Party  -- ^ The registry root party (== SimpleTokenRules.admin), fixed.
+  where
+    signatory admin
+
+    -- | Root issues a capability directly. Nonconsuming so the root can issue
+    -- unboundedly without churning the anchor.
+    --
+    -- # Invariants enforced:
+    -- - INV-31: only the root admin can create capabilities here (controller + signatory)
+    nonconsuming choice Admin_IssueRole : ContractId RoleCapability
+      with
+        assignee : Party                -- ^ Party to receive the role.
+        role : Role                     -- ^ Role to grant (the root may grant any role, incl. Admin).
+        scope : Optional InstrumentId   -- ^ None = registry-wide; Some = single instrument.
+      controller admin
+      do mkRoleCapability admin assignee role scope
+
+    -- | Root issues a capped `Minter` capability with a D3 mint allowance.
+    -- (`Admin_IssueRole … Minter` issues an *unlimited* minter, `mintAllowance =
+    -- None`; this choice issues a *bounded* one.) Minter is root-managed, so this
+    -- lives only on the root anchor, controlled by `admin`.
+    --
+    -- # Invariants enforced:
+    -- - INV-36: a capped allowance is non-negative (also enforced by RoleCapability `ensure`)
+    nonconsuming choice Admin_IssueCappedMinter : ContractId RoleCapability
+      with
+        assignee : Party                -- ^ Party to receive the Minter capability.
+        scope : Optional InstrumentId   -- ^ None = registry-wide; Some = single instrument.
+        allowance : Decimal             -- ^ Initial remaining mint allowance.
+      controller admin
+      do
+        assertMsg eMintAllowanceNegative (allowance >= 0.0)
+        create RoleCapability with
+          admin; assignee; role = Minter; scope; mintAllowance = Some allowance
+
+    -- | Root revokes a capability by archiving it (any role, including Admin).
+    --
+    -- # Invariants enforced:
+    -- - INV-32: a revoked capability is inactive; later `requireRole` fails (NotActive)
+    nonconsuming choice Admin_RevokeRole : ()
+      with capCid : ContractId RoleCapability  -- ^ Capability to revoke.
+      controller admin
+      do revokeIssuedCapability admin (const True) capCid
+
+    -- | Delegated issuance: a holder of a registry-wide `Admin` capability mints a
+    -- further capability for a **delegable** role. This is the ownership-handoff
+    -- mechanism — grant a governance party an `Admin` capability and it can
+    -- administer the registry's delegable operational roles immediately; revoke
+    -- it to hand control back. The new capability is admin-signed because the
+    -- choice runs with this contract's admin authority.
+    --
+    -- Which roles a delegate may manage is decided solely by `delegableRole`
+    -- (`Admin` and reserved roles are root-only), so governance cannot be
+    -- re-delegated past one level. See docs/ADMIN-LAYER-PLAN.md §5.
+    --
+    -- # Invariants enforced:
+    -- - INV-31: caller must hold a registry-wide `Admin` capability, and the granted role must be delegable
+    nonconsuming choice Admin_DelegatedIssueRole : ContractId RoleCapability
+      with
+        caller : Party                       -- ^ The delegate exercising the choice.
+        adminCap : ContractId RoleCapability  -- ^ The caller's Admin capability.
+        assignee : Party                      -- ^ Party to receive the role.
+        role : Role                           -- ^ Role to grant (must be delegable).
+        scope : Optional InstrumentId         -- ^ None = registry-wide; Some = single instrument.
+      controller caller
+      do
+        requireAdminDelegate caller admin adminCap
+        assertMsg eRoleNotDelegable (delegableRole role)
+        mkRoleCapability admin assignee role scope
+
+    -- | Delegated revocation: a registry-wide `Admin` capability holder revokes a
+    -- capability for a **delegable** role. Delegates manage only delegable roles
+    -- (so they cannot revoke `Admin` or reserved-role capabilities held by the
+    -- root or peers). They CAN revoke delegable operational capabilities issued by
+    -- the root or other delegates — that is shared operational-role management;
+    -- the genesis root remains the sole governance authority and always recovers
+    -- via the un-revocable `TokenAdministrator`.
+    --
+    -- # Invariants enforced:
+    -- - INV-31: caller must hold a registry-wide `Admin` capability, and the revoked role must be delegable
+    -- - INV-32: revoked capability becomes inactive
+    nonconsuming choice Admin_DelegatedRevokeRole : ()
+      with
+        caller : Party                        -- ^ The delegate exercising the choice.
+        adminCap : ContractId RoleCapability  -- ^ The caller's Admin capability.
+        capCid : ContractId RoleCapability    -- ^ Delegable-role capability to revoke.
+      controller caller
+      do
+        requireAdminDelegate caller admin adminCap
+        revokeIssuedCapability admin delegableRole capCid

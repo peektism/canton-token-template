@@ -67,7 +67,7 @@ VERIFY_DIR="$TOOLS_DIR/daml-verify"
 if [ -d "$VERIFY_DIR" ] && [ -f "$VERIFY_DIR/.venv/bin/python" ]; then
   cd "$VERIFY_DIR"
   if .venv/bin/python main.py; then
-    info "daml-verify: PASS (all 9 properties proved)"
+    info "daml-verify: PASS (all properties proved)"
     PASS=$((PASS + 1))
   else
     warn "daml-verify: verification failures"

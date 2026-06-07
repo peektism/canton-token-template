@@ -4,6 +4,7 @@
 module SimpleToken.Rules where
 
 import DA.TextMap qualified as TextMap
+import DA.Optional (isNone)
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV1
@@ -21,6 +22,7 @@ import SimpleToken.Holding
 import SimpleToken.Preapproval
 import SimpleToken.TransferInstruction
 import SimpleToken.Allocation
+import SimpleToken.Supply (MintProposal(..))
 import SimpleToken.ContextUtils
 import SimpleToken.Reporting (recordHoldingsChangeEvent)
 import SimpleToken.Experimental.Cip112.Account
@@ -30,6 +32,34 @@ import SimpleToken.Experimental.Cip112.Account
   , isBasicAccount
   , isSupportedRegularAccount
   )
+import SimpleToken.Admin.Capability (RoleCapability, requireRole, consumeMintAllowance)
+import SimpleToken.Admin.Errors (eRegistryPaused, eRedundantPauseChange, eMintAmountNotPositive, eCappedMinterRequiresPreapproval)
+import SimpleToken.Admin.Roles (Role(..))
+
+-- | Result of `Rules_Mint`. Exactly one of `mintedHoldingCids` (direct path, via
+-- the recipient's preapproval) or `pendingProposalCid` (cold-recipient path, via
+-- a `MintProposal` the recipient accepts) is populated. `minterCapCid` is the
+-- caller's `Minter` capability, possibly rotated if its D3 allowance was decremented.
+data Rules_MintResult = Rules_MintResult with
+    mintedHoldingCids : [ContractId Holding]
+    pendingProposalCid : Optional (ContractId MintProposal)
+    minterCapCid : ContractId RoleCapability
+
+-- | Pausable guard: the OpenZeppelin `whenNotPaused` analogue. Fails the
+-- transaction when the registry is paused.
+--
+-- Pause is ORIGINATION control: it is checked at the factory chokepoints that
+-- *originate* value movement (new transfers, new allocations, factory-driven
+-- batch settlement) before any state mutation. It deliberately does NOT gate
+-- completion of already-committed flows (accepting a pending transfer, settling
+-- a committed allocation) — those are protected by committed-settlement /
+-- counterparty semantics, and in a keyless UTXO ledger their contracts cannot
+-- read the factory flag without a spoofable context hop anyway. Recovery
+-- (withdraw / reject / cancel) also stays open so funds are never frozen
+-- (INV-33). A per-asset emergency *freeze* is a separate capability, not pause.
+-- See docs/ADMIN-LAYER-PLAN.md §4 and §6.
+assertNotPaused : Bool -> Update ()
+assertNotPaused paused = assertMsg eRegistryPaused (not paused)
 
 -- | Experimental V2 actor guard marker used before delegating into the V1 factory.
 v2TransferFactoryActorFailureMsg : Text
@@ -61,8 +91,108 @@ template SimpleTokenRules
   with
     admin : Party
     supportedInstruments : [Text]
+    paused : Bool  -- ^ Pausable flag; when True all gated factory choices revert.
   where
     signatory admin
+
+    -- | Flip the pause flag. The actor must present a registry-wide `Pauser`
+    -- capability issued by this registry's admin. Recreates the factory with the
+    -- new flag; the contract's own admin authority lets a non-admin pauser
+    -- perform the recreate, while the capability check gates who may do so.
+    --
+    -- # Invariants enforced:
+    -- - INV-26: pausing/unpausing requires a registry-wide Pauser capability
+    choice Rules_SetPaused : ContractId SimpleTokenRules
+      with
+        actor : Party                       -- ^ The party flipping the flag.
+        pauserCap : ContractId RoleCapability -- ^ The actor's registry-wide Pauser capability.
+        newPaused : Bool                    -- ^ Target pause state.
+      controller actor
+      do
+        -- Pausing is registry-wide, so it requires a registry-wide (scope None)
+        -- Pauser capability; an instrument-scoped Pauser cannot halt the registry.
+        requireRole actor Pauser admin None pauserCap
+        -- INV-26: must change state (OZ Pausable semantics), avoiding no-op churn.
+        assertMsg eRedundantPauseChange (newPaused /= paused)
+        create this with paused = newPaused
+
+    -- | Read the pause flag without archiving. Read-only and ungated so wallets
+    -- can display registry state even while paused (INV-34). The actor must have
+    -- the factory disclosed to exercise it (the off-ledger service provides this).
+    nonconsuming choice Rules_GetPaused : Bool
+      with actor : Party  -- ^ The querying party.
+      controller actor
+      do pure paused
+
+    -- | Mint new supply to `recipient` (AL-5). Gated by the caller's `Minter`
+    -- capability (instrument-scoped) and its D3 allowance. Mint is origination, so
+    -- it is `whenNotPaused`. A3 dispatch: if `recipient` has a `TransferPreapproval`
+    -- (supplied in `extraArgs.context`), the holding is created directly; otherwise
+    -- a `MintProposal` is emitted for the recipient to accept (Canton requires the
+    -- recipient's authority to create their holding). The advisory `TotalSupply`
+    -- (D2) is reconciled off-ledger from the resulting create event, not here.
+    --
+    -- # Invariants enforced:
+    -- - INV-25: blocked while paused
+    -- - INV-35: positive amount, supported instrument, instrument admin == registry admin
+    -- - INV-36: D3 allowance enforced + decremented via `consumeMintAllowance`
+    nonconsuming choice Rules_Mint : Rules_MintResult
+      with
+        minter : Party                        -- ^ The Minter-capability holder.
+        minterCap : ContractId RoleCapability -- ^ The caller's Minter capability.
+        recipient : Party                     -- ^ Party to receive the minted holding.
+        amount : Decimal                      -- ^ Amount to mint.
+        instrumentId : InstrumentId           -- ^ Instrument to mint.
+        extraArgs : ExtraArgs                 -- ^ Carries the recipient preapproval (if any) + meta.
+      controller minter
+      do
+        assertNotPaused paused
+        assertMsg eMintAmountNotPositive (amount > 0.0)
+        assertMsg "instrumentId.admin must match factory admin"
+          (instrumentId.admin == admin)
+        assertMsg "Instrument not supported by this factory"
+          (instrumentId.id `elem` supportedInstruments)
+        -- A3 dispatch: direct mint via the recipient's preapproval, else propose.
+        optPreapprovalCid <- lookupFromContextU @(ContractId TransferPreapproval)
+          extraArgs.context transferPreapprovalContextKey
+        case optPreapprovalCid of
+          Some preapprovalCid -> do
+            -- Direct path: the holding is created atomically in THIS transaction, so
+            -- the D3 allowance can be enforced and decremented atomically here.
+            newCapCid <- consumeMintAllowance minter admin (Some instrumentId) amount minterCap
+            preapproval <- fetch preapprovalCid
+            assertMsg "Preapproval admin does not match factory admin"
+              (preapproval.admin == admin)
+            assertMsg "Preapproval receiver does not match mint recipient"
+              (preapproval.receiver == recipient)
+            holdingCid <- exercise preapprovalCid TransferPreapproval_MintInto with
+              mintInstrumentId = instrumentId
+              amount
+              holdingMeta = extraArgs.meta
+            pure Rules_MintResult with
+              mintedHoldingCids = [holdingCid]
+              pendingProposalCid = None
+              minterCapCid = newCapCid
+          None -> do
+            -- Proposal (cold-recipient) path: the holding is created later, in the
+            -- recipient's accept transaction. Because that splits the mint across two
+            -- transactions controlled by different parties, the D3 allowance cannot be
+            -- enforced/decremented atomically — so this path is restricted to
+            -- UNLIMITED minters (no allowance to enforce or leak). A capped minter
+            -- must mint atomically via the recipient's preapproval. The Minter
+            -- capability is still validated; it is not consumed (None ⇒ no rotation).
+            cap <- requireRole minter Minter admin (Some instrumentId) minterCap
+            assertMsg eCappedMinterRequiresPreapproval (isNone cap.mintAllowance)
+            proposalCid <- create MintProposal with
+              admin
+              recipient
+              instrumentId
+              amount
+              meta = extraArgs.meta
+            pure Rules_MintResult with
+              mintedHoldingCids = []
+              pendingProposalCid = Some proposalCid
+              minterCapCid = minterCap
 
     interface instance TransferFactory for SimpleTokenRules where
       view = TransferFactoryView with
@@ -70,6 +200,8 @@ template SimpleTokenRules
         meta = emptyMetadata
 
       transferFactory_transferImpl _selfCid arg = do
+        -- INV-25: Pausable guard, before any validation or state mutation
+        assertNotPaused paused
         let transfer = arg.transfer
         -- Invariant #1: expectedAdmin matches admin
         assertMsg "expectedAdmin does not match factory admin"
@@ -131,6 +263,8 @@ template SimpleTokenRules
         TokenStandard.transferFactoryV2_privateAsset_transferExtraObserversDefaultImpl
 
       transferFactory_transferImpl selfCid arg = do
+        -- INV-25: Pausable guard (V2 path)
+        assertNotPaused paused
         if isBasicAccount arg.transfer.sender && isBasicAccount arg.transfer.receiver
           then do
             let sender = TokenStandard.accountPrincipal arg.transfer.instrumentId.admin arg.transfer.sender
@@ -158,6 +292,8 @@ template SimpleTokenRules
         meta = emptyMetadata
 
       allocationFactory_allocateImpl _selfCid arg = do
+        -- INV-25: Pausable guard (V1 allocation path)
+        assertNotPaused paused
         let leg = arg.allocation.transferLeg
             settlement = arg.allocation.settlement
         -- Invariant #1: expectedAdmin matches admin
@@ -245,6 +381,8 @@ template SimpleTokenRules
         TokenStandard.allocationFactoryV2_privateAsset_allocateExtraObserversDefaultImpl
 
       allocationFactory_allocateImpl _selfCid arg = do
+        -- INV-25: Pausable guard (V2 allocation path)
+        assertNotPaused paused
         let allocation = arg.allocation
         assertMsg "V2 allocation admin must match factory admin"
           (allocation.admin == admin)
@@ -292,6 +430,8 @@ template SimpleTokenRules
         TokenStandard.settlementFactoryV2_privateAsset_settleBatchExtraObserversDefaultImpl
 
       settlementFactory_settleBatchImpl selfCid arg = do
+        -- INV-25: Pausable guard (V2 settlement path)
+        assertNotPaused paused
         assertMsg v2SettlementFactoryActorFailureMsg
           (samePartySet arg.settlement.executors arg.actors)
         assertMsg "V2 settlement transfer legs or allocations must not be empty"

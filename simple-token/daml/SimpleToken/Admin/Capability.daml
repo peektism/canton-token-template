@@ -1,0 +1,132 @@
+-- | AccessControl capability contracts — the substrate of the whole admin layer.
+--
+-- A `RoleCapability` is a bearer credential, co-signed by the registry
+-- administrator, that grants one `Role` to one `assignee`, optionally scoped to
+-- a single instrument. Possession of a valid capability *is* the authorization:
+-- a gated choice fetches the capability the caller presents and asserts it is
+-- admin-signed, names the caller, carries the required role, and is in scope.
+-- This replaces EVM's runtime role-map lookups with a cryptographic signatory
+-- check (docs/ADMIN-LAYER-PLAN.md §3).
+--
+-- Ownable and Pausable are not separate mechanisms: the `Admin` role is the
+-- owner / `DEFAULT_ADMIN_ROLE`, and pause is gated on a `Pauser` capability.
+--
+-- Keyless by necessity — Daml LF 2.1 dropped contract keys. The caller presents
+-- their own capability by `ContractId` as an **explicit choice argument** (the
+-- caller is the controller, so it supplies its own credential), with the contract
+-- disclosed where the caller is not already a stakeholder. (A `ChoiceContext`
+-- channel like `transferPreapprovalContextKey` is unnecessary here: that pattern
+-- is for contracts the off-ledger service injects that the caller does not
+-- directly hold; a capability is always held by its assignee.)
+module SimpleToken.Admin.Capability where
+
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import qualified OpenZeppelin.AccessControl as AC
+
+import SimpleToken.Admin.Errors
+import SimpleToken.Admin.Roles (Role(..), roleId)
+
+-- | A capability granting `assignee` a single `role` over the registry governed
+-- by `admin`, optionally narrowed to one instrument via `scope`.
+--
+-- `admin` is the immutable registry root party (the instrument issuer). Every
+-- instrument on a `SimpleTokenRules` shares that admin, so a `scope = None`
+-- capability is registry-wide; `scope = Some iid` is least-privilege, valid only
+-- for that instrument. Operational "ownership" is the `Admin` role; handing it
+-- to a new governance party (and revoking the old) is the ownership-transfer
+-- analogue — no party reassignment, no rebind. See docs/ADMIN-LAYER-PLAN.md §5.
+template RoleCapability
+  with
+    admin : Party                   -- ^ The registry root party that issued this capability.
+    assignee : Party                -- ^ The party granted the role.
+    role : Role                     -- ^ The single role granted.
+    scope : Optional InstrumentId   -- ^ None = registry-wide; Some = limited to that instrument.
+    mintAllowance : Optional Decimal -- ^ D3 quota for `Minter` caps: None = unlimited; Some = remaining.
+  where
+    -- INV-31: only the registry root (or its delegate, via TokenAdministrator)
+    -- can mint a capability; it is admin-signed and therefore unforgeable.
+    signatory admin
+    -- The assignee can see (and present) their own capability, nothing more.
+    observer assignee
+    -- INV-36: a capped allowance is non-negative (only meaningful for Minter caps).
+    ensure optional True (>= 0.0) mintAllowance
+
+-- | Does a capability's scope authorize an operation requiring `requiredScope`?
+--
+-- A registry-wide capability (`None`) authorizes any operation. An
+-- instrument-scoped capability authorizes only operations on that exact
+-- instrument — in particular it does NOT authorize registry-wide operations
+-- (e.g. pausing the whole registry), preserving least privilege.
+scopeAuthorizes : Optional InstrumentId -> Optional InstrumentId -> Bool
+scopeAuthorizes capScope requiredScope = case capScope of
+  None -> True
+  Some s -> requiredScope == Some s
+
+-- | Assert that `caller` holds `role` for the registry governed by
+-- `expectedAdmin`, in scope for `requiredScope`. Fetches the presented
+-- capability and validates it.
+--
+-- `requiredScope = None` denotes a registry-wide operation (e.g. pause, role
+-- management); `requiredScope = Some iid` denotes an operation on instrument
+-- `iid` (e.g. minting that instrument).
+--
+-- # Invariants enforced:
+-- - INV-27: capability admin must equal the registry admin
+-- - INV-28: capability assignee must equal the caller (anti-impersonation)
+-- - INV-29: capability role must equal the required role
+-- - INV-30: capability scope must authorize the operation's scope
+--
+-- Soundness without keys: the capability is admin-signed (unforgeable) and
+-- names a specific assignee, so the worst an adversary can do is present a
+-- capability they do not hold and fail their own authorization.
+-- Returns the validated capability so callers that need its fields (e.g. the
+-- D3 allowance) don't have to fetch it a second time.
+requireRole : Party -> Role -> Party -> Optional InstrumentId -> ContractId RoleCapability -> Update RoleCapability
+requireRole caller role expectedAdmin requiredScope capCid = do
+  cap <- fetch capCid
+  -- AL-7: delegate the admin (A1), assignee/anti-impersonation (A2), and role
+  -- (A3) gates to the decoupled OpenZeppelin AccessControl library — a single
+  -- source of truth for capability-gate semantics, shared with every other
+  -- consumer of the library. We pass a `RoleGrant` *view* of this capability
+  -- (the generic primitive carries no scope/allowance), then enforce the
+  -- token-specific scope gate (A4) here, since instrument scoping is a Layer-B
+  -- concern the minimal primitive intentionally omits (docs/ARCHITECTURE.md §9).
+  AC.requireRole caller (roleId role) expectedAdmin (roleGrantView cap)
+  assertMsg eCapabilityScopeMismatch (scopeAuthorizes cap.scope requiredScope)
+  pure cap
+
+-- | A generic `OpenZeppelin.AccessControl.RoleGrant` view of a token
+-- `RoleCapability`, used only to delegate the admin/assignee/role gates to the
+-- library's `requireRole`. It is constructed in-memory, never created on-ledger
+-- (the on-ledger credential is the richer `RoleCapability`, which the library's
+-- minimal `RoleGrant` cannot represent because Daml templates are monomorphic
+-- and cannot be extended with the token's `scope`/`mintAllowance` fields).
+roleGrantView : RoleCapability -> AC.RoleGrant
+roleGrantView cap = AC.RoleGrant with
+  admin = cap.admin
+  account = cap.assignee
+  role = roleId cap.role
+
+-- | Authorize a mint of `amount` for `requiredScope` by `caller`'s `Minter`
+-- capability, and consume its D3 allowance. Validates the capability as a
+-- `Minter` (admin/assignee/role/scope via `requireRole`), then:
+--   * `mintAllowance = None`  → unlimited: the capability is unchanged, its CID returned.
+--   * `mintAllowance = Some r` → enforced: requires `amount <= r`, then archives and
+--     re-creates the capability with `r - amount` remaining, returning the NEW CID.
+--
+-- Recreation rotates the capability CID (per-minter contention is the intended
+-- D3 cost). The caller (a `Minter`) drives this via a choice on an admin-signed
+-- contract, so the archive/create carry the registry admin's authority.
+--
+-- # Invariants enforced:
+-- - INV-36: a capped minter cannot mint beyond its remaining allowance
+consumeMintAllowance : Party -> Party -> Optional InstrumentId -> Decimal -> ContractId RoleCapability -> Update (ContractId RoleCapability)
+consumeMintAllowance caller expectedAdmin requiredScope amount capCid = do
+  cap <- requireRole caller Minter expectedAdmin requiredScope capCid
+  case cap.mintAllowance of
+    None -> pure capCid
+    Some remaining -> do
+      assertMsg eMintAllowanceExceeded (amount <= remaining)
+      archive capCid
+      create cap with mintAllowance = Some (remaining - amount)

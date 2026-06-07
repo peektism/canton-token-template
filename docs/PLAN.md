@@ -1,6 +1,31 @@
 # PLAN: CIP-056 Simple Token Implementation
 
-Status: on-ledger implementation complete (36/36 tests passing)
+Status:
+- **CIP-056 (V1):** on-ledger implementation complete (36/36 tests passing).
+- **CIP-112 (V2):** experimental, non-conformant prototype landed across
+  Holding, Transfer, Allocation, Settlement, AllocationRequest, iterated
+  settlement, and provider-managed accounts — see
+  [CIP-0112-EXTENSION-PLAN.md](CIP-0112-EXTENSION-PLAN.md).
+- **Admin layer (AccessControl / Ownable / Pausable):** implemented, green, and
+  **converged** (slices AL-0..AL-3) under `SimpleToken/Admin/` plus the Pausable
+  chokepoints on `SimpleTokenRules`. Uses the hybrid **AccessControl-as-substrate**
+  model: the `Admin` role is the Ownable owner; Pausable is `Pauser`-gated
+  origination control; the `Admin` role is root-managed (one-level delegation) via
+  the single-source `delegableRole` policy, which `simple-token` enforces at
+  **compile time** (`-Werror=incomplete-patterns`). Hardened across five
+  `/code-review` → fix rounds (0 correctness defects). Design:
+  [ADMIN-LAYER-PLAN.md](ADMIN-LAYER-PLAN.md).
+- **Supply management (Mint / Burn — AL-5/AL-6):** implemented, green, and
+  **converged** — capability-gated mint and burn on top of the admin layer. Mint =
+  A3 dispatch (preapproval-direct or `MintProposal`); Burn = B3 (owner redemption +
+  `Burner`-gated forced clawback, incl. in-flight/locked funds); supply = D3
+  enforced per-`Minter` allowance + D2 advisory `TotalSupply`. 13 tests in
+  `Test/MintBurn.daml`; hardened across two `/code-review` → fix rounds. See
+  [ADMIN-LAYER-PLAN.md §11](ADMIN-LAYER-PLAN.md#11-supply-management--mint--burn-al-5--al-6).
+- **Test status:** full suite **141/141 passing** and `scripts/verify.sh` **3/3**
+  (daml-lint clean on new source, daml-props, daml-verify 14/14) on SDK 3.4.11 /
+  Java 21. Both AL-0..AL-3 and AL-5/AL-6 have reached a clean `/code-review` pass.
+  Active/next work and sequencing: [§17](#17-active-and-future-slices-admin-layer--cip-112).
 
 Scope: see [SCOPE.md](SCOPE.md) for authoritative scope boundaries, out-of-scope items, and post-MVP backlog.
 
@@ -794,8 +819,10 @@ All post-MVP hardening items (SCOPE.md §9, items 1-7) are now resolved:
 
 ## 15. Deferred (Post-MVP)
 
-- Burn/mint extension APIs
-- Delegation/operator model
+Items below are superseded where they now appear as active slices in [§17](#17-active-and-future-slices-admin-layer--cip-112).
+
+- Burn/mint extension APIs → ✅ **done** as AL-5/AL-6 (capability-gated; [§17](#17-active-and-future-slices-admin-layer--cip-112))
+- Delegation/operator model → partially active via provider-managed accounts (V2) + `BatchProcessor` role (**AL-3**)
 - Multi-step allocation instructions (`AllocationInstruction` with `Update` workflow)
 - Compliance policy contracts and richer settlement orchestration
 - Fee schedule and holding fee decay
@@ -819,3 +846,193 @@ Known Canton Network constraints relevant to this implementation.
 **Disclosure and privacy:** Canton's privacy model means wallets may not see contracts they need to exercise choices against. Our `extraObservers` field on `LockedSimpleHolding` addresses this for on-ledger flows by ensuring receivers and executors can see locked holdings.
 
 **SDK and Canton version pinning:** The ecosystem is evolving rapidly (Polyglot Canton with EVM support announced late 2025, automated fee calculation via oracles proposed). Pinning SDK versions early and tracking the CHANGELOG is essential. Current pin: SDK 3.4.11, LF 2.1.
+
+---
+
+## 17. Active and Future Slices (Admin Layer + CIP-112)
+
+This section is the authoritative slice backlog for everything beyond the
+completed CIP-056 V1 core. It encompasses (a) the new Ownable / AccessControl /
+Pausable administrative layer and (b) the remaining CIP-112 conformance work,
+sequenced so the security perimeter lands and is verified **before** the V2
+throughput surface depends on it.
+
+Conventions: each slice is non-release and locally validated (`dpm build` +
+`dpm test` + `scripts/verify.sh`) unless noted. Design authority for the admin
+layer is [ADMIN-LAYER-PLAN.md](ADMIN-LAYER-PLAN.md); for V2 it is
+[CIP-0112-EXTENSION-PLAN.md](CIP-0112-EXTENSION-PLAN.md). Status legend:
+✅ done · 🔬 experimental prototype landed · 🎯 active/next · 📋 planned.
+
+> **Hard constraint reminder (do not regress):** Daml LF 2.1 has **no contract
+> keys**. No slice below may use `key` / `maintainer` / `lookupByKey` /
+> `fetchByKey`. All admin/capability/pause references go by `ContractId` through
+> `ChoiceContext` + explicit disclosure (the `transferPreapprovalContextKey`
+> idiom). This is why the source research's keyed `TokenAdministrator` /
+> `RoleCapability` / `GlobalPause` designs are **not** implementable as written —
+> see [ADMIN-LAYER-PLAN.md §1](ADMIN-LAYER-PLAN.md#1-corrections-to-the-source-research-read-first).
+
+### 17.1 Admin layer + supply slices (priority — landed first)
+
+Status legend: ✅ implemented, tested & converged · 🎯 active/next · 📋 planned.
+
+Architecture: the hybrid **AccessControl-as-substrate** model — `Admin` role = the
+Ownable owner (`DEFAULT_ADMIN_ROLE`); Pausable = `Pauser`-gated origination control;
+Mint/Burn (AL-5/AL-6) are the first capability-gated consumers.
+See [ADMIN-LAYER-PLAN.md §0](ADMIN-LAYER-PLAN.md) for the per-slice detail and
+**[ARCHITECTURE.md](ARCHITECTURE.md)** for *why* the layer is shaped this way — the
+library-vs-instantiation split, the decoupled-primitives direction, and the DAML
+genericity tradeoff (answering the access-control review). **AL-0..AL-3 and AL-5/AL-6
+are converged** — each reached a clean `/code-review` pass (0 correctness defects),
+across five fix rounds for the admin layer and two for mint/burn. Remaining admin-layer
+items: **AL-4** (formal-verification model — branch-pinned tools) and **AL-7** (extract
+the generic substrate into a decoupled `oz-daml-contracts` library; 🎯 next).
+
+| Slice | Title | Status | Depends on | Deliverables (as built) |
+|---|---|---|---|---|
+| **AL-0** | Module skeleton | ✅ | — | `SimpleToken/Admin/Roles.daml` (closed `Role` sum type incl. `Admin`; `Minter`/`Burner`/`BatchProcessor` reserved for later slices), `SimpleToken/Admin/Errors.daml`. Capabilities are passed as explicit choice args (no `ChoiceContext` key needed). |
+| **AL-1** | Pausable chokepoint | ✅ | AL-0 | `paused : Bool` on `SimpleTokenRules`; `assertNotPaused` injected at the five **origination** impls (transfer V1/V2, allocation V1/V2, settlement-via-factory); `Rules_SetPaused` (registry-wide `Pauser`-gated) + `Rules_GetPaused`. Pause is origination control — committed settlement/completion and recovery stay open ([ADMIN-LAYER-PLAN.md §4](ADMIN-LAYER-PLAN.md#4-pausable--origination-control-simpletokenrules)). Tests: `test_pauseBlocksTransfer`, `test_pauseBlocksAllocation`, `test_unpauseRestores`, `test_publicFetchWhilePaused`, `test_pauseAllowsRecoveryBlocksOrigination` (inv #33), `test_scopedCapabilityCannotPauseRegistry` (inv #30). |
+| **AL-2** | AccessControl capabilities | ✅ | AL-0 | `SimpleToken/Admin/Capability.daml`: `RoleCapability` (with `scope : Optional InstrumentId` for least privilege) + `requireRole` (proof-by-fetch, scope-aware). Tests: `test_capabilityImpersonationFails`, `test_revokeRole`, `test_pauseRequiresPauserCap`. |
+| **AL-3** | Ownable-as-Admin-role + delegated governance | ✅ | AL-2 | `SimpleToken/Admin/Authority.daml`: `TokenAdministrator` (fixed genesis root) with `Admin_IssueRole`/`Admin_RevokeRole` (root) and `Admin_DelegatedIssueRole`/`Admin_DelegatedRevokeRole` (any `Admin`-capability holder). The **`Admin` role is root-managed** — delegates issue/revoke only roles for which the single-source `delegableRole` policy is `True` (today just `Pauser`; `Admin` and reserved roles are root-only — no re-delegation, no reserved-role pre-minting), via single-sourced `mkRoleCapability`/`revokeIssuedCapability` helpers. Ownership handoff = grant/revoke the `Admin` role; **no party reassignment, no `OwnershipOffer`** (resolves the desync, C9). The `delegableRole` policy is enforced at **compile time** (`-Werror=incomplete-patterns` in `simple-token/daml.yaml`): a new `Role` without a delegation decision fails the build. Tests: `test_delegatedAdminGovernance`, `test_revokedAdminCannotDelegate`, `test_nonAdminCannotDelegateIssue`, `test_delegatedRevoke`, `test_delegatedCannotRevokeAdmin`. |
+| **AL-4** | Verification model for the admin/supply layer | 🎯 (PRs open) | AL-1..AL-3, AL-5/6 | ✅ `ChoiceContext`/pause off-ledger semantics in [SCOPE.md §8](SCOPE.md#8-off-ledger-compatibility); ✅ `scripts/verify.sh` runs green (lint/props/verify). ✅ **`daml-verify` capability relation** — 8 Z3 proofs A1–A8 (`requireRole` admin/assignee/role gates, `scopeAuthorizes` least-privilege + completeness, `consumeMintAllowance` decrement + cumulative conservation, `assertNotPaused`) move invariants #25–#39 from Daml-Script-covered to **Z3-proved** ([OpenZeppelin/daml-verify#4](https://github.com/OpenZeppelin/daml-verify/pull/4); 22/22 proved, pytest 22/22). ✅ **`daml-props` rows** — `Examples/AdminLayer/` pure state-machine model with 5 property tests (pause / role-authorization / mint-allowance conservation), fixed + buggy executors mirroring the Amulet pattern; 3 negative tests catch each guard-bypass ([OpenZeppelin/daml-props#2](https://github.com/OpenZeppelin/daml-props/pull/2); `dpm test` green). Both PR HEADs are signed + **Verified**. 🎯 **Remaining:** **branch-pinned** — point `scripts/setup.sh` / local verify at the PR branch refs so the local run reflects the new proofs/properties now; **do not block on upstream merge** (merge is downstream of our validation). Re-pin to `main` once each merges. Extended via branches + PRs upstream — see [§17.6](#176-tooling-workspace-canton_tools_home--contribution-model). |
+| **AL-5** | Capability-gated Mint | ✅ | AL-2 | `Rules_Mint` (instrument-scoped `Minter`, `whenNotPaused`) with **A3 dispatch**: direct via the recipient's `TransferPreapproval` (`TransferPreapproval_MintInto`) or a `MintProposal` (`SimpleToken/Supply.daml`) the recipient accepts. **D3** enforced cap: `RoleCapability.mintAllowance` checked + decremented (`consumeMintAllowance`, atomic on the direct path; the proposal path is unlimited-minters-only — `eCappedMinterRequiresPreapproval`); `Admin_IssueCappedMinter` for bounded minters. **D2** advisory `TotalSupply`, `(admin,instrumentId)`-anchored, service-reconciled via `TotalSupply_AdjustMinted` (not on the hot path). Tests: `test_mint*`, `test_cappedMinterAllowance`, `test_cappedMinterRequiresPreapproval`, `test_totalSupplyObservability`. See [ADMIN-LAYER-PLAN.md §11](ADMIN-LAYER-PLAN.md#11-supply-management--mint--burn-al-5--al-6). |
+| **AL-6** | Capability-gated Burn | ✅ | AL-2 | **B3**: `SimpleHolding_Burn` (owner redemption, no cap, not pause-gated) + `SimpleHolding_ForcedBurn` and `LockedSimpleHolding_ForcedBurn` (instrument-scoped `Burner`-gated clawback, incl. **in-flight/locked** funds — the seized wrapper self-cleans after its deadline). `Minter`/`Burner` are enforced but root-managed (`delegableRole = False`). Tests: `test_ownerRedemptionBurn`, `test_forcedBurn*`, `test_forcedBurnSeizesInFlightTransfer`. |
+| **AL-7** | Decoupled access-control library + branch-based forward dev | 🎯 (PR open) | AL-2, AL-3 | ✅ **Library landed (branch/PR):** three **independent, token-agnostic packages** in `$CANTON_TOOLS_HOME/repos/oz-daml-contracts` — `oz-access-control` (`OpenZeppelin.AccessControl`; `RoleGrant`/`RoleAdmin` + `requireRole`/`hasRole`; Text role ids = Solidity `bytes32` analogue), `oz-ownable` (two-step ownership handshake), `oz-pausable` (`PauseState` + `whenNotPaused`) — each its own DAR, no cross-deps, `daml-script`-free; 16 tests green (`dpm test`); typed-wrapper bridge demoed; every template documents the AGENTS.md checklist ([peektism/oz-daml-contracts#1](https://github.com/peektism/oz-daml-contracts/pull/1), signed + Verified). This resolves the review (generic library, not in canton-token; each module independent + minimal). ✅ **Consumption experiment done** (branch `al7-token-consumes-library`): token `data-depends` on **only** `oz-access-control`; `requireRole` delegates the admin/assignee/role gates (A1–A3) to `OpenZeppelin.AccessControl.requireRole` via a `RoleGrant` view, keeping the scope gate + the closed `Role` sum bridged by `roleId : Role -> Text`; **full 141-test suite green** (behavioural equivalence; net +43/−15 source lines). **Finding:** scope/allowance stay on `RoleCapability` (Daml has no template extension), pause stays an embedded flag, ownership stays the `Admin` role — all by design; the library's payoff is reuse by *other* consumers, not shrinking this token. Empirical comparison + recommendation (adopt Option 3, no destructive cutover) in **[ARCHITECTURE.md §9](ARCHITECTURE.md)**. 🎯 **Remaining:** decide whether to merge the consumption branch (keep the delegation) or hold; vendor the library via `setup.sh` for portable builds. Worked on branches; **does not block on external review/merge** ([§17.6](#176-tooling-workspace-canton_tools_home--contribution-model)). |
+
+> **Build/verify status:** validated on SDK 3.4.11 / DPM 1.0.17 / OpenJDK 21.
+> `cd simple-token && dpm build` then `cd ../simple-token-test && dpm test` →
+> **141/141 passing** (15 in `Test/Admin.daml` + 13 in `Test/MintBurn.daml`).
+> `scripts/verify.sh` → **3/3** (daml-lint clean on the admin/supply source;
+> daml-props; daml-verify 14/14). The `simple-token-test` package consumes the
+> rebuilt `simple-token` DAR, so build the source package first. Standalone tools
+> install via `scripts/setup.sh`.
+
+### 17.2 CIP-112 V2 slices (gated by the admin layer where applicable)
+
+Prototype slices already landed (historical evidence in CIP-0112-EXTENSION-PLAN.md):
+
+| Slice | Title | Status |
+|---|---|---|
+| V2-1 | Account/Holding compile probe + V2 `Holding` interface | 🔬 |
+| V2-2 | V2 `TransferInstruction` / `TransferFactory` (basic accounts) | 🔬 |
+| V2-3 | V2 `AllocationInstruction` / `Allocation` | 🔬 |
+| V2-4 | `SettlementFactory_SettleBatch` + `TransferEvents` (`EventLog`) | 🔬 |
+| V2-5 | Compatibility matrix + negative tests (§5.4/§5.5 subset) | 🔬 |
+| V2-6 | Provider-managed account authority | 🔬 |
+| V2-7 | V2 `AllocationRequest` workflow | 🔬 |
+| V2-8 | Iterated settlement + partial-progress (`numIterations`) | 🔬 |
+
+Active / planned V2 slices:
+
+| Slice | Title | Status | Depends on | Notes |
+|---|---|---|---|---|
+| **V2-9** | Pause the V2 origination chokepoints | ✅ | AL-1 | Done as part of AL-1: `assertNotPaused` sits on the V2 transfer/allocation factories and `SettlementFactory_SettleBatch`. By design, completion of committed flows (`Allocation_Settle`, `TransferInstruction_Accept`) is **not** gated — origination-control semantics ([ADMIN-LAYER-PLAN.md §4](ADMIN-LAYER-PLAN.md#4-pausable--origination-control-simpletokenrules), §6). |
+| **V2-10** | `BatchProcessor`-gated `SettlementFactory_SettleBatch` | 📋 | AL-2 | Optional delegated matching-engine path: a capability holder drives the batch on behalf of executors. Replaces the research's invented `MatchingEngineRole`/`V2BatchTransferFactory` (corrections C5). |
+| **V2-11** | V1/V2-compatible `Allocation` (`SimpleAllocationV1Compat`) | 📋 | V2-3 | CIP-0112 §5.1 dual-implementation. Open question TT-Q-002 (subset vs parallel template). |
+| **V2-12** | Receipt allocations + `extraReceiptAuthorizers` | 📋 | V2-8 | **Blocked**: preview DAR omits the draft field; re-baseline with CIP authors (CIP-0112-EXTENSION-PLAN blocker evidence). |
+| **V2-13** | Reduced-privacy / public-asset observer mode (§4.3.5.3) | 📋 | V2-4 | Opt-in observer expansion; default stays private-asset baseline. |
+| **V2-14** | View-count baselines (§4.3.5: 28/21/25/4-view) + 3-trader batch | 📋 | V2-4 | Privacy-optimization evidence; test-only. |
+| **V2-15** | Broader transfer-event reporting (direct/self/reject/withdraw) | 📋 | V2-4 | Mixed V1/V2 parsing + metadata fallback. |
+| **V2-16** | CIP-0112 conformance matrix (full §5.4/§5.5) | 📋 | V2-9..V2-15 | Source-of-record gate: requires an **accepted** (non-preview) DAR set; currently pinned to `origin/token-standard-v2-daml-preview` `b91de5d4…`. |
+
+### 17.3 Sequencing rationale
+
+1. **AL-0 → AL-1 → AL-2 → AL-3** first: the research's central thesis is
+   "establish the administrative perimeter before enabling V2 throughput." We
+   honor it literally — Pausable and AccessControl land and are tested before
+   any V2 slice takes a dependency on them.
+2. **V2-9** is satisfied by AL-1: the V2 origination chokepoints already carry
+   `assertNotPaused`. Pause is origination control; committed-settlement
+   completion is intentionally ungated (the only robustly enforceable semantic in
+   a keyless UTXO ledger — see [ADMIN-LAYER-PLAN.md §4](ADMIN-LAYER-PLAN.md#4-pausable--origination-control-simpletokenrules)).
+3. Remaining V2 slices (V2-10..V2-16) proceed per CIP-0112-EXTENSION-PLAN, each
+   gated by the now-present admin layer.
+4. **Release gate (all slices):** the preview DAR source-of-record
+   (M1-PF-001 / CIP-112-D-002) and AGPL→MIT extraction boundary (M1-PF-004) must
+   be resolved before any conformance or public-API claim. Nothing in §17
+   changes those gates.
+
+### 17.4 Explicitly excluded (with rationale)
+
+Per [ADMIN-LAYER-PLAN.md §10](ADMIN-LAYER-PLAN.md#10-out-of-scope-for-this-layer)
+and the research corrections:
+
+- **Keyed `GlobalPause` / `TokenAdministrator` / `RoleCapability`** — impossible on LF 2.1 (corrections C1/C2/C3).
+- **On-ledger transfer of the instrument `admin` party (`OwnershipOffer` / a separate transferable `owner` field)** — the admin party is baked into every `InstrumentId`/holding, so it cannot move without re-issuing assets (correction C9). Ownership is the **`Admin` role**: handoff = grant/revoke the `Admin` capability. Operator key handoff is a Canton topology operation.
+- **`V2BatchTransferFactory` (foldlA array dispatch)** — not the real CIP-112 surface (correction C5).
+- **`V2OmnibusAccount`, Memo Pledge, CDP/`SecuritiesIntermediaryRole`/`LiquidatorRole`, `BridgeEscrowRole`** — stablecoin/custody/bridge use-cases; consume the `Role` primitive from sibling repos, not built here (correction C7).
+- **Spoofable pause guards on committed-settlement choices** — pause is origination control; a per-asset emergency *freeze* is a separate future capability (correction: see [ADMIN-LAYER-PLAN.md §4](ADMIN-LAYER-PLAN.md#4-pausable--origination-control-simpletokenrules)).
+- **Per-role admin hierarchy (`getRoleAdmin`) / two-step / timelocked issuance / on-ledger multisig** — named extension seams; the `Admin` role + Canton topology cover the MVP (see [ADMIN-LAYER-PLAN.md §5](ADMIN-LAYER-PLAN.md#5-ownable-as-admin-role-adminauthoritydaml)).
+
+### 17.5 Current status & next steps (roadmap)
+
+**Done & converged** (clean `/code-review`, 141/141, `verify.sh` 3/3): the full
+admin layer **AL-0..AL-3**, the supply layer **AL-5/AL-6**, and V2 pause coverage
+**V2-9**. The remaining `Minter`/`Burner` roles are enforced; only
+`BatchProcessor` is still reserved.
+
+Planned next steps, in recommended order — each is one self-contained slice that
+keeps the suite green and is independently reviewable:
+
+| Order | Slice | Why next / scope | Gating |
+|---|---|---|---|
+| 1 | **AL-7** — decoupled access-control library + branch-based forward dev | **Library merged** ([peektism/oz-daml-contracts#1](https://github.com/peektism/oz-daml-contracts/pull/1)): three independent token-agnostic packages, 16 tests green. **Consumption experiment done** (branch `al7-token-consumes-library`): token `requireRole` delegates A1–A3 to the library via a `RoleGrant` view + `roleId` bridge; **141 tests green**; scope/pause/ownership stay Layer-B by design. Empirical comparison + recommendation (adopt Option 3, no destructive cutover) in **[ARCHITECTURE.md §9](ARCHITECTURE.md)**. **Remaining:** decide merge-vs-hold for the consumption branch; vendor the library in `setup.sh`. | AL-2, AL-3 |
+| 2 | **AL-4** — formal-verification model (**branch-pinned, do not block on merge**) | Both sub-PRs are open and **Verified**: `daml-verify` A1–A8 ([#4](https://github.com/OpenZeppelin/daml-verify/pull/4): 22/22 proved) and `daml-props` `Examples/AdminLayer/` ([#2](https://github.com/OpenZeppelin/daml-props/pull/2): 5 property tests). **Develop/test forward on the PR branches** — point `scripts/setup.sh` / local verify at the branch refs now so the local run reflects the new proofs/properties immediately. Upstream merge is **downstream of our own validation, not a precondition** for it; re-pin to `main` once each merges. | none |
+| 3 | **V2-10** — `BatchProcessor`-gated `SettlementFactory_SettleBatch` | Graduates the last reserved role: a delegated matching engine drives batch settlement on behalf of executors via a `BatchProcessor` capability (the real CIP-112 surface, replacing the research's invented `V2BatchTransferFactory`). Decide whether `BatchProcessor` becomes `delegableRole`. | AL-2 |
+| 4 | **V2 provider-managed clawback** (V2 hardening) | The documented V1-only gap: add forced-burn to `ProviderManagedSimpleHolding`/`ProviderManagedLockedHolding` for parity with AL-6, or keep deferred. | V2 source-of-record |
+| 5 | **V2-11 … V2-16** — CIP-112 conformance | V1/V2-compatible allocations, receipt allocations, reduced-privacy observer mode, view-count baselines, broader transfer events, and the full §5.4/§5.5 conformance matrix (per [CIP-0112-EXTENSION-PLAN.md](CIP-0112-EXTENSION-PLAN.md)). | preview→accepted DAR gate |
+
+**Release gates (unchanged, block conformance/public-API claims, not the slices
+above):** the preview DAR source-of-record (M1-PF-001 / CIP-112-D-002) and the
+AGPL→MIT extraction boundary (M1-PF-004) must be resolved before any CIP-112
+conformance or public-API claim.
+
+**Not yet committed:** AL-0..AL-6 + the supply layer live in the working tree
+(2 new files: `SimpleToken/Supply.daml`, `Test/MintBurn.daml`; plus the new
+`SimpleToken/Admin/` modules and `Test/Admin.daml`). A branch + commit is the
+natural checkpoint before starting AL-4.
+
+### 17.6 Tooling workspace (`CANTON_TOOLS_HOME`) & contribution model
+
+The verification/library tooling that several upcoming slices **extend** lives in
+a shared workspace at `~/canton-tools` (export
+`CANTON_TOOLS_HOME=/Users/amar/canton-tools`; root guide:
+`$CANTON_TOOLS_HOME/AGENTS.md`). Each entry below is an **independent git repo**,
+not part of this repo's history.
+
+| Path under `$CANTON_TOOLS_HOME` | Upstream | Role | Extended by |
+|---|---|---|---|
+| `tools/daml-lint` | `github.com/OpenZeppelin/daml-lint` | Rust static analyzer | AL-4 (optional CIP-112 dual-impl / capability-misuse detectors) |
+| `tools/daml-props` | `github.com/OpenZeppelin/daml-props` | DAML property-testing library | **AL-4** ✅ pause / role-authorization / capped-mint-conservation property rows — `Examples/AdminLayer/` ([#2](https://github.com/OpenZeppelin/daml-props/pull/2)) |
+| `tools/daml-verify` | `github.com/OpenZeppelin/daml-verify` | Python/Z3 symbolic verifier | **AL-4** (add a capability relation → `admin-authorization`, `scopeAuthorizes`, capped-mint conservation proofs; the V2 proof rows in [AUDIT.md](AUDIT.md)) |
+| `repos/oz-daml-contracts` | `github.com/peektism/oz-daml-contracts` | Canonical reusable DAML library scaffold | Public-API **extraction target** (gated by M1-PF-004 AGPL→MIT) |
+| `canton-stablecoin` | `github.com/OpenZeppelin/canton-stablecoin` | CIP-056 + CDP/clawback reference | Pattern reference for the sibling stablecoin / forced-burn work |
+
+**Contribution model (best practices, do not regress):**
+- Treat each repo as independent — inspect/commit with `git -C <child>`; never
+  assume the workspace root has git history, and never rewrite/reset/clean a
+  child repo unless explicitly asked (per `$CANTON_TOOLS_HOME/AGENTS.md`).
+- **Work off a feature branch and open a PR** for every tooling change — do not
+  commit to a repo's default branch. Keep PRs small and single-purpose, scoped to
+  one slice; land code + tests + docs together; reference the driving slice
+  (e.g. "AL-4: daml-verify capability relation") in the PR; keep the repo's own
+  CI/validation green (`cargo` for daml-lint, `python3 main.py`/`pytest` for
+  daml-verify, `dpm build`/`dpm test` for daml-props).
+- **Signed commits are required** for all PRs to the OpenZeppelin org repos. This
+  workspace signs via **SSH** (no GPG): `~/.ssh/id_ed25519_signing`, registered on
+  GitHub (`peektism`) under **Settings → SSH and GPG keys → _Signing keys_** — it
+  must be the **Signing Key** type, *not* Authentication, or commits show
+  `unknown_key` / unverified. Git is configured globally to sign everything
+  (`gpg.format=ssh`, `user.signingkey=~/.ssh/id_ed25519_signing.pub`,
+  `commit.gpgsign=true`, `tag.gpgsign=true`; `gpg.ssh.allowedSignersFile` for local
+  verify). The committer email (`asinghchrony@protonmail.com`) must be a **verified
+  email** on the account holding the key. To re-sign an already-pushed branch:
+  `git rebase -f <base>` (recreates + signs each commit), then
+  `git push --force-with-lease`; confirm with
+  `gh api repos/<org>/<repo>/commits/<sha> --jq '.commit.verification'` → `verified: true`.
+- The repo-local `canton-token-template/tools/{daml-lint,daml-verify}` are
+  **convenience clones** created by `scripts/setup.sh`; the **canonical source of
+  truth and the target for extensions is `$CANTON_TOOLS_HOME/tools/`** → the
+  upstream OZ repos. Land tool improvements upstream via PR, then re-pull locally.
+- The active `daml.yaml` SDK/Java pins (3.4.11 / OpenJDK 21) and the DPM-native
+  command conventions are shared workspace baselines — see
+  `$CANTON_TOOLS_HOME/AGENTS.md`.

@@ -29,6 +29,25 @@ transfer and §5.5 allocation rows. Public API extraction into
 `repos/oz-daml-contracts/` follows the workspace-level slice 18
 RI-backed extraction sequence; it is not part of this per-tool plan.
 
+## Administrative guardrail (prerequisite)
+
+The AccessControl / Ownable / Pausable layer in
+[ADMIN-LAYER-PLAN.md](ADMIN-LAYER-PLAN.md) is the security perimeter the V2
+surface plugs into. Per [PLAN.md §17.3](PLAN.md#17-active-and-future-slices-admin-layer--cip-112),
+the admin slices (AL-0..AL-3) land and are verified before V2 slices take a
+dependency on them. **Pause is origination control:** `assertNotPaused` gates the
+V2 **factory** chokepoints (`TransferFactory_Transfer`,
+`AllocationFactory_Allocate`, `SettlementFactory_SettleBatch`). It deliberately
+does **not** gate completion of committed flows (`Allocation_Settle`,
+`TransferInstruction_Accept`) — committed-settlement / counterparty semantics, and
+in a keyless UTXO model those contracts cannot read the factory flag without a
+spoofable hop ([ADMIN-LAYER-PLAN.md §4](ADMIN-LAYER-PLAN.md#4-pausable--origination-control-simpletokenrules)).
+**V2-10** adds an optional `BatchProcessor`-capability path for delegated batch
+settlement. Keyless constraint: all authority contracts are referenced by
+`ContractId` through `ChoiceContext`, never by contract key (LF 2.1); and
+"ownership" is the delegable `Admin` role, not a transfer of the instrument
+admin party.
+
 ## Anchors in the existing codebase
 
 `simple-token/daml/SimpleToken/` (per `tools/canton-token-template/docs/SCOPE.md`
@@ -1027,7 +1046,13 @@ New test scenarios from CIP-0112 to add:
 ## Verification pipeline impact
 
 `scripts/verify.sh` orchestrates `daml-lint` → `daml-props` → `daml-verify`
-today. Discovery findings:
+today. These three tools are independent OpenZeppelin repos in the shared
+workspace `$CANTON_TOOLS_HOME` (`/Users/amar/canton-tools/tools/`); the V2 slices
+that extend them (e.g. property/proof rows for allocations and settlement) do so
+via feature branches + PRs upstream, not by editing the `scripts/setup.sh`
+convenience clones — see
+[PLAN.md §17.6](PLAN.md#176-tooling-workspace-canton_tools_home--contribution-model).
+Discovery findings:
 
 - `daml-lint`: no V1-only assumptions. Confirm during the implementation
   slice; add a CIP-112 dual-implementation detector if surfacing is

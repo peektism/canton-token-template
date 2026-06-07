@@ -19,6 +19,15 @@ Three open-source verification tools and manual code review by the author were u
 
 ## Tools Used
 
+> **Tool provenance.** The three tools are independent OpenZeppelin repos that
+> live in the shared workspace `$CANTON_TOOLS_HOME` (`/Users/amar/canton-tools`):
+> `tools/daml-lint`, `tools/daml-props`, `tools/daml-verify` (see
+> `$CANTON_TOOLS_HOME/AGENTS.md`). The `canton-token-template/tools/` copies are
+> convenience clones produced by `scripts/setup.sh`; the **canonical source and
+> the target for extensions (e.g. AL-4's `daml-verify` capability relation) is the
+> upstream repo, contributed via a feature branch + PR** — see
+> [PLAN.md §17.6](PLAN.md#176-tooling-workspace-canton_tools_home--contribution-model).
+
 ### daml-lint (Static Analysis)
 
 Static analyzer for DAML that catches security anti-patterns through AST pattern matching. 6 detectors covering missing ensure clauses, unguarded division, missing positive-amount checks, archive-before-execute, head-of-list on queries, and unbounded fields.
@@ -172,6 +181,58 @@ per-account allocation model and is re-run against this code.
 | CIP112-C2: receiver-side top-up conservation | Receiver-side next reserve may be funded by `incomingCredit + authorizerTopUp`; the successor reserve must equal requested `nextIterationFunding`. | TARGET; covered today by focused Daml Script |
 | CIP112-A1: settlement actor authorization | Direct `Allocation_Settle` requires `admin + executors`; factory settlement requires `executors` and supplies default allocation actors. | TARGET; covered today by focused negative tests |
 | CIP112-A2: direct/factory validation boundary | Direct `Allocation_Settle` performs local actor and extra-side argument validation only; full batch transfer-leg shape and authorization matching remain factory-owned. | TARGET; covered today by focused negative tests |
+
+### Admin Layer Invariants (AccessControl / Ownable-as-Admin-role / Pausable)
+
+Introduced by slices AL-0..AL-3 (see [ADMIN-LAYER-PLAN.md §7](ADMIN-LAYER-PLAN.md#7-security-invariants-extends-planmd-9)).
+Covered today by Daml Script tests in `Test/Admin.daml`; the `daml-verify` rows
+are proof *targets*, not completed claims, until the symbolic model grows a
+capability relation.
+
+| Invariant | Statement | Status |
+|-----------|-----------|--------|
+| INV-25 | No factory **origination** choice (transfer V1/V2, allocation V1/V2, settlement-via-factory) succeeds while `paused` | Script: `test_pauseBlocksTransfer`, `test_pauseBlocksAllocation` |
+| INV-26 | Pause/unpause requires a **registry-wide** `Pauser` capability | Script: `test_pauseRequiresPauserCap` |
+| INV-27 | Capability honored only if `cap.admin == registry admin` | Script: `test_capabilityImpersonationFails` (indirect) |
+| INV-28 | Capability honored only if `cap.assignee == caller` (anti-impersonation) | Script: `test_capabilityImpersonationFails` |
+| INV-29 | Capability honored only if `cap.role == required role` | Script: `test_pauseRequiresPauserCap`, `test_nonAdminCannotDelegateIssue` |
+| INV-30 | Capability scope must authorize the operation (instrument-scoped cap ≠ registry-wide op) | Script: `test_scopedCapabilityCannotPauseRegistry` |
+| INV-31 | Capabilities issued/revoked only by the root `admin` or an `Admin`-capability holder; the **`Admin` role is root-managed** (delegates cannot issue/revoke `Admin`) | Script: `test_delegatedAdminGovernance`, `test_nonAdminCannotDelegateIssue`, `test_delegatedRevoke`, `test_delegatedCannotRevokeAdmin` |
+| INV-32 | A revoked capability can no longer authorize | Script: `test_revokeRole`, `test_revokedAdminCannotDelegate` |
+| INV-33 | Pause is origination control, not a fund freeze: recovery + committed-settlement completion stay open | Script: `test_pauseAllowsRecoveryBlocksOrigination` |
+| INV-34 | Read-only `Rules_GetPaused` succeeds while paused | Script: `test_publicFetchWhilePaused` |
+| INV-35 | Mint requires a `Minter` cap, positive amount, supported instrument; blocked while paused | Script: `test_mintRequiresMinterCapability`, `test_mintBlockedWhilePaused`, `test_mintDirectViaPreapproval`, `test_mintProposalWhenNoPreapproval` |
+| INV-36 | A capped `Minter` cannot exceed its `mintAllowance` (D3); each mint decrements it | Script: `test_cappedMinterAllowance` |
+| INV-37 | Advisory `TotalSupply` (D2) reconciles up/down, never negative | Script: `test_totalSupplyObservability` |
+| INV-38 | Forced burn (incl. in-flight/locked funds) requires an in-scope `Burner` cap; owner redemption needs none | Script: `test_forcedBurnRequiresBurnerCap`, `test_forcedBurnScopedToInstrument`, `test_forcedBurnLockedHolding`, `test_ownerRedemptionBurn` |
+| INV-39 | Every `SimpleHolding`/`LockedSimpleHolding` has `instrumentId.admin == admin` | template `ensure` clauses |
+| admin-authorization | `requireRole` rejects every `(caller, role, admin, scope)` tuple not matching a co-signed capability; `assertNotPaused` is a total guard on the origination set; capped mint is conserved | `daml-verify` **PROVED** (A1–A8, [OpenZeppelin/daml-verify#4](https://github.com/OpenZeppelin/daml-verify/pull/4)) + `daml-props` **state-machine** (pause / authorization / conservation over random sequences, [OpenZeppelin/daml-props#2](https://github.com/OpenZeppelin/daml-props/pull/2)); both show locally after the PRs merge + `setup.sh` re-pull |
+
+> daml-lint note: `Role` is a closed sum type and no admin template has unbounded
+> list fields (`RoleCapability.scope` is `Optional`, not a list) — no new
+> `unbounded-fields` findings.
+
+**Verification run (2026-06-04, SDK 3.4.11 / DPM 1.0.17 / OpenJDK 21.0.11):**
+`scripts/verify.sh` → **3 passed, 0 failed**.
+- `daml-lint`: PASS. **No findings in `SimpleToken/Admin/*`, `Supply.daml`,** or the
+  new `SimpleTokenRules`/`SimpleHolding`/`Preapproval` choices. The 7
+  `unbounded-fields` MEDIUMs are all pre-existing on other templates
+  (`extraObservers`, `supportedInstruments`, `senders`, `allocations`,
+  `inputHoldingCids`) — admin-only creation mitigates.
+- `daml-props` (`dpm test`): PASS — **141/141** (incl. 15 `Test/Admin.daml` + 10
+  `Test/MintBurn.daml` rows). The admin-layer state-machine rows (pause /
+  role-authorization / mint-allowance conservation, 5 property tests in
+  `Examples/AdminLayer/`) are **implemented and passing upstream** in
+  [OpenZeppelin/daml-props#2](https://github.com/OpenZeppelin/daml-props/pull/2);
+  they join the local count once that PR merges and `scripts/setup.sh` re-pulls.
+- `daml-verify`: PASS — 14/14 properties in the local `setup.sh` clone. The 9
+  C/D/T rows model this repo's transfer/allocation logic; the V1–V5 rows are the
+  tool's own stablecoin models. The AccessControl/Pausable/mint-cap proof rows
+  (A1–A8: `admin-authorization`, `scopeAuthorizes`, capped-mint conservation,
+  pause guard) are **implemented and proving upstream** in
+  [OpenZeppelin/daml-verify#4](https://github.com/OpenZeppelin/daml-verify/pull/4)
+  (AL-4 — 22/22 proved, pytest 22/22); they appear in the local count once that PR
+  merges and `scripts/setup.sh` re-pulls the tool.
 
 ## Temporal Proofs (daml-verify)
 

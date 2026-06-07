@@ -29,13 +29,25 @@ listLockedHoldings : Party -> InstrumentId -> Script [(ContractId Holding, Holdi
 listLockedHoldings p instrumentId =
   filter (\(_, hv) -> isSome hv.lock) <$> listHoldings p instrumentId
 
--- | Check exact balance.
-checkBalance : Party -> InstrumentId -> Decimal -> Script ()
-checkBalance p instrumentId expected = do
+-- | Assert that the summed amount of a party's holdings matching `keep` equals
+-- `expected`. Single-sources the balance-summing and mismatch reporting; the
+-- `label` distinguishes the variants below in failure messages.
+assertHoldingTotal : Text -> (HoldingView -> Bool) -> Party -> InstrumentId -> Decimal -> Script ()
+assertHoldingTotal label keep p instrumentId expected = do
   holdings <- listHoldings p instrumentId
-  let total = sum $ map (._2.amount) holdings
+  let total = sum $ map (._2.amount) $ filter (\(_, hv) -> keep hv) holdings
   unless (total == expected) $ fail $
-    show p <> ": balance " <> show total <> " /= expected " <> show expected
+    show p <> ": " <> label <> " " <> show total <> " /= expected " <> show expected
+
+-- | Check exact balance (includes locked holdings).
+checkBalance : Party -> InstrumentId -> Decimal -> Script ()
+checkBalance = assertHoldingTotal "balance" (const True)
+
+-- | Check exact UNLOCKED balance (excludes locked holdings). Use this to prove a
+-- holding became spendable — e.g. that funds were unlocked back to a sender —
+-- since `checkBalance` counts locked holdings toward the total.
+checkUnlockedBalance : Party -> InstrumentId -> Decimal -> Script ()
+checkUnlockedBalance = assertHoldingTotal "unlocked balance" (\hv -> not (isSome hv.lock))
 
 -- | Check that a holding with a specific amount exists.
 checkHoldingWithAmountExists : Party -> InstrumentId -> Decimal -> Script ()

@@ -64,3 +64,39 @@ template TransferPreapproval
             pure [toInterfaceContractId @Holding changeCid]
           else pure []
         pure ([toInterfaceContractId @Holding receiverCid], senderChangeCids)
+
+    -- | Direct-mint path (AL-5): create a newly-minted holding for the receiver,
+    -- reusing the receiver's authority from this preapproval (no input holdings —
+    -- minting increases supply). Mirrors `TransferPreapproval_Send` but with no
+    -- sender/inputs/change.
+    --
+    -- `Rules_Mint` is the capability-gated, pause-gated, allowance-metered entry
+    -- point and is the intended caller. This choice's controller is `admin`,
+    -- however, so the registry root CAN exercise it directly as a root override —
+    -- bypassing the `Minter` capability, the D3 allowance, the pause guard, and the
+    -- supported-instrument check. That is consistent with "admin is the root" (the
+    -- admin can equally self-issue an unlimited Minter), but operators should treat
+    -- direct use as an unmetered root mint. Non-admin parties cannot reach it.
+    nonconsuming choice TransferPreapproval_MintInto : ContractId Holding
+      with
+        mintInstrumentId : InstrumentId  -- ^ Instrument being minted (must match the preapproval).
+        amount : Decimal                 -- ^ Amount to mint into the receiver's holding.
+        holdingMeta : Metadata
+      controller admin
+      do
+        assertMsg "Preapproval instrumentId does not match mint instrumentId"
+          (instrumentId == mintInstrumentId)
+        assertMsg "Mint amount must be positive"
+          (amount > 0.0)
+        now <- getTime
+        case expiresAt of
+          None -> pure ()
+          Some deadline ->
+            assertMsg "Transfer preapproval has expired" (now < deadline)
+        cid <- create SimpleHolding with
+          admin
+          owner = receiver
+          instrumentId = mintInstrumentId
+          amount
+          meta = holdingMeta
+        pure (toInterfaceContractId @Holding cid)

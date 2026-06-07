@@ -1,0 +1,70 @@
+-- | Error message bindings for the administrative layer (AccessControl /
+-- Ownable-as-Admin-role / Pausable). Collected in one module so messages are
+-- consistent and greppable; referenced from `assertMsg`. Each binding is
+-- annotated with the invariant it enforces (see docs/ADMIN-LAYER-PLAN.md §7).
+module SimpleToken.Admin.Errors where
+
+-- Pausable
+------------
+
+-- | INV-25: gated factory origination choices must fail while the registry is paused.
+eRegistryPaused : Text
+eRegistryPaused = "simple-token: registry is paused"
+
+-- | INV-26: pause/unpause must change the state (OpenZeppelin Pausable semantics —
+-- `_pause`/`_unpause` revert when already in the target state). Avoids needless
+-- factory recreation on no-op calls.
+eRedundantPauseChange : Text
+eRedundantPauseChange = "simple-token: registry already in the requested pause state"
+
+-- AccessControl (capabilities)
+--------------------------------
+
+-- INV-27 (admin gate), INV-28 (assignee / anti-impersonation), and INV-29 (role
+-- gate) are now enforced by the decoupled OpenZeppelin AccessControl library
+-- (`OpenZeppelin.AccessControl.requireRole`), which owns their messages — see
+-- SimpleToken.Admin.Capability.requireRole (AL-7). The token retains only the
+-- gates the minimal primitive does not cover.
+
+-- | INV-30: a capability is only honored when its scope authorizes the operation.
+eCapabilityScopeMismatch : Text
+eCapabilityScopeMismatch = "simple-token: capability scope does not authorize this operation"
+
+-- | INV-31: a capability presented for revocation must have been issued by this registry.
+eCapabilityNotIssuedByThisAdmin : Text
+eCapabilityNotIssuedByThisAdmin = "simple-token: capability was not issued by this registry administrator"
+
+-- | INV-31: a governance delegate may only issue/revoke roles for which
+-- `SimpleToken.Admin.Roles.delegableRole` is `True`. `Admin` and (until their
+-- slice lands) the reserved roles are root-only — capping the hierarchy at one
+-- level and preventing re-delegation escalation and delegate-vs-delegate /
+-- delegate-vs-root governance changes.
+eRoleNotDelegable : Text
+eRoleNotDelegable = "simple-token: this role can only be managed by the genesis root"
+
+-- Supply management (mint / burn — AL-5/AL-6)
+----------------------------------------------
+
+-- | INV-35: a mint must be for a positive amount of a supported instrument.
+eMintAmountNotPositive : Text
+eMintAmountNotPositive = "simple-token: mint amount must be positive"
+
+-- | INV-36 (D3): a capped Minter capability cannot mint beyond its remaining allowance.
+eMintAllowanceExceeded : Text
+eMintAllowanceExceeded = "simple-token: mint exceeds the Minter capability's remaining allowance"
+
+-- | A capped-minter allowance must be non-negative.
+eMintAllowanceNegative : Text
+eMintAllowanceNegative = "simple-token: mint allowance must be non-negative"
+
+-- | INV-36 (D3): a capped Minter must mint atomically into a pre-authorized
+-- recipient (preapproval-direct path). The proposal (cold-recipient) path splits
+-- the mint across two transactions controlled by different parties and so cannot
+-- atomically enforce/decrement the allowance — it is restricted to unlimited
+-- minters. See docs/ADMIN-LAYER-PLAN.md §11.
+eCappedMinterRequiresPreapproval : Text
+eCappedMinterRequiresPreapproval = "simple-token: a capped Minter must mint via the recipient's preapproval (no proposal path)"
+
+-- | Reconciling supply must not drive the advisory total negative.
+eSupplyWouldGoNegative : Text
+eSupplyWouldGoNegative = "simple-token: total-supply adjustment would go negative"

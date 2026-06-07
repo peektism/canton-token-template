@@ -13,6 +13,17 @@ import SimpleToken.Holding
 import SimpleToken.Rules
 import SimpleToken.Preapproval
 import SimpleToken.ContextUtils
+import SimpleToken.Admin.Authority
+  ( TokenAdministrator(..)
+  , Admin_IssueRole(..)
+  , Admin_RevokeRole(..)
+  , Admin_IssueCappedMinter(..)
+  , Admin_DelegatedIssueRole(..)
+  , Admin_DelegatedRevokeRole(..)
+  )
+import SimpleToken.Admin.Capability (RoleCapability)
+import SimpleToken.Admin.Roles (Role)
+import SimpleToken.Supply
 
 import Daml.Script
 
@@ -64,6 +75,7 @@ initialize adminName instrumentName = do
   _ <- submit admin $ createCmd SimpleTokenRules with
     admin
     supportedInstruments = [instrumentName]
+    paused = False
   pure SimpleRegistry with admin; instrumentId
 
 -- | Initialize a multi-instrument registry.
@@ -77,6 +89,7 @@ initializeMulti adminName instrumentNames = do
   _ <- submit admin $ createCmd SimpleTokenRules with
     admin
     supportedInstruments = instrumentNames
+    paused = False
   pure SimpleRegistry with admin; instrumentId
 
 -- | Create a holding for a party (admin + owner must sign).
@@ -89,6 +102,28 @@ createHolding registry owner amount = do
     amount
     meta = emptyMetadata
   pure (toInterfaceContractId @Holding cid)
+
+-- | Create a locked holding directly (admin + owner sign; lock holder = admin).
+-- Used by clawback tests that need a standalone locked holding. NOTE: this uses
+-- `expiresAt = None`, a TEST-ONLY shape the production factories never create
+-- (they always set `Some executeBefore`/`settleBefore`); a None-expiry lock can
+-- only be consumed by forced burn (`LockedSimpleHolding_Unlock` requires an
+-- expiry). For wrapper-lifecycle tests, originate a real transfer/allocation
+-- instead so the lock carries a deadline.
+createLockedHolding : SimpleRegistry -> Party -> Decimal -> Script (ContractId LockedSimpleHolding)
+createLockedHolding registry owner amount =
+  submitMulti [registry.admin, owner] [] $ createCmd LockedSimpleHolding with
+    admin = registry.admin
+    owner
+    instrumentId = registry.instrumentId
+    amount
+    lock = Lock with
+      holders = [registry.admin]
+      expiresAt = None
+      expiresAfter = None
+      context = Some "test-lock"
+    extraObservers = []
+    meta = emptyMetadata
 
 -- | Create a holding for a specific instrument (for multi-instrument tests).
 createHoldingForInstrument : Party -> Party -> InstrumentId -> Decimal -> Script (ContractId Holding)
@@ -162,3 +197,119 @@ emptyExtraArgs : ExtraArgs
 emptyExtraArgs = ExtraArgs with
   context = emptyChoiceContext
   meta = emptyMetadata
+
+-- Admin layer helpers (Ownable / AccessControl / Pausable)
+------------------------------------------------------------
+
+-- | Create the genesis governance anchor for the registry administrator.
+createTokenAdministrator : SimpleRegistry -> Script (ContractId TokenAdministrator)
+createTokenAdministrator registry =
+  submit registry.admin $ createCmd TokenAdministrator with admin = registry.admin
+
+-- | Issue a registry-wide role capability to `assignee` via the genesis root.
+issueRole : SimpleRegistry -> ContractId TokenAdministrator -> Party -> Role -> Script (ContractId RoleCapability)
+issueRole registry adminCid assignee role =
+  submit registry.admin $ exerciseCmd adminCid Admin_IssueRole with
+    assignee; role; scope = None
+
+-- | Issue an instrument-scoped (least-privilege) role capability.
+issueScopedRole : SimpleRegistry -> ContractId TokenAdministrator -> Party -> Role -> InstrumentId -> Script (ContractId RoleCapability)
+issueScopedRole registry adminCid assignee role instrumentId =
+  submit registry.admin $ exerciseCmd adminCid Admin_IssueRole with
+    assignee; role; scope = Some instrumentId
+
+-- | Revoke a role capability via the genesis root.
+revokeRole : SimpleRegistry -> ContractId TokenAdministrator -> ContractId RoleCapability -> Script ()
+revokeRole registry adminCid capCid =
+  submit registry.admin $ exerciseCmd adminCid Admin_RevokeRole with capCid
+
+-- | Delegated issuance: `caller` (holding a registry-wide Admin capability) mints
+-- a registry-wide capability for `assignee`. The genesis anchor is disclosed to
+-- the delegate (the off-ledger service provides this disclosure in production).
+delegatedIssueRole : SimpleRegistry -> ContractId TokenAdministrator -> Party -> ContractId RoleCapability -> Party -> Role -> Script (ContractId RoleCapability)
+delegatedIssueRole registry adminCid caller adminCap assignee role = do
+  adminDisc <- queryDisc @TokenAdministrator registry.admin adminCid
+  submitWithDisc caller adminDisc $
+    exerciseCmd adminCid Admin_DelegatedIssueRole with
+      caller; adminCap; assignee; role; scope = None
+
+-- | Delegated revocation: `caller` (holding a registry-wide Admin capability)
+-- revokes a non-Admin capability. Both the anchor and the target capability are
+-- disclosed to the delegate (the delegate is not a stakeholder of capabilities
+-- issued to other parties; the off-ledger service provides these disclosures in
+-- production).
+delegatedRevokeRole : SimpleRegistry -> ContractId TokenAdministrator -> Party -> ContractId RoleCapability -> ContractId RoleCapability -> Script ()
+delegatedRevokeRole registry adminCid caller adminCap capCid = do
+  adminDisc <- queryDisc @TokenAdministrator registry.admin adminCid
+  capDisc <- queryDisc @RoleCapability registry.admin capCid
+  submitWithDisc caller (adminDisc <> capDisc) $
+    exerciseCmd adminCid Admin_DelegatedRevokeRole with
+      caller; adminCap; capCid
+
+-- | The current factory contract id together with a disclosure for it.
+currentRules : SimpleRegistry -> Script (ContractId SimpleTokenRules, Disclosures)
+currentRules registry = do
+  [(rulesCid, _)] <- query @SimpleTokenRules registry.admin
+  disc <- queryDisc @SimpleTokenRules registry.admin rulesCid
+  pure (rulesCid, disc)
+
+-- | Pause or unpause the registry as `pauser`, presenting their Pauser
+-- capability. Works whether `pauser` is the admin or a delegated party: the
+-- factory is disclosed, and the factory's own admin authority performs the
+-- recreate while the capability check gates who may trigger it.
+setPaused : SimpleRegistry -> Party -> ContractId RoleCapability -> Bool -> Script (ContractId SimpleTokenRules)
+setPaused registry pauser pauserCap newPaused = do
+  (rulesCid, disc) <- currentRules registry
+  submitWithDisc pauser disc $
+    exerciseCmd rulesCid Rules_SetPaused with actor = pauser; pauserCap; newPaused
+
+-- Supply management helpers (mint / burn — AL-5/AL-6)
+------------------------------------------------------
+
+-- | Issue a capped (D3) Minter capability with an instrument scope + allowance.
+issueCappedMinter : SimpleRegistry -> ContractId TokenAdministrator -> Party -> Optional InstrumentId -> Decimal -> Script (ContractId RoleCapability)
+issueCappedMinter registry adminCid assignee scope allowance =
+  submit registry.admin $ exerciseCmd adminCid Admin_IssueCappedMinter with
+    assignee; scope; allowance
+
+-- | Mint `amount` of the registry's instrument to `recipient` as `minter`,
+-- presenting `minterCap`. Discloses the factory and (for the direct path) the
+-- recipient's preapproval; A3 dispatch picks direct vs. proposal automatically.
+mintTo : SimpleRegistry -> Party -> ContractId RoleCapability -> Party -> Decimal -> Script Rules_MintResult
+mintTo registry minter minterCap recipient amount = do
+  (rulesCid, rulesDisc) <- currentRules registry
+  (preapprovalC, preapprovalD) <- lookupPreapprovalContext registry recipient
+  let extraArgs = ExtraArgs with context = preapprovalC; meta = emptyMetadata
+  submitWithDisc minter (rulesDisc <> preapprovalD) $
+    exerciseCmd rulesCid Rules_Mint with
+      minter; minterCap; recipient; amount
+      instrumentId = registry.instrumentId
+      extraArgs
+
+-- | Like `mintTo`, but asserts the mint submission fails (negative tests).
+mintToMustFail : SimpleRegistry -> Party -> ContractId RoleCapability -> Party -> Decimal -> Script ()
+mintToMustFail registry minter minterCap recipient amount = do
+  (rulesCid, rulesDisc) <- currentRules registry
+  (preapprovalC, preapprovalD) <- lookupPreapprovalContext registry recipient
+  let extraArgs = ExtraArgs with context = preapprovalC; meta = emptyMetadata
+  submitWithDiscMustFail minter (rulesDisc <> preapprovalD) $
+    exerciseCmd rulesCid Rules_Mint with
+      minter; minterCap; recipient; amount
+      instrumentId = registry.instrumentId
+      extraArgs
+
+-- | Create the advisory (D2) total-supply contract for the registry instrument.
+createTotalSupply : SimpleRegistry -> Script (ContractId TotalSupply)
+createTotalSupply registry =
+  submit registry.admin $ createCmd TotalSupply with
+    admin = registry.admin; instrumentId = registry.instrumentId; minted = 0.0
+
+-- | Reconcile the advisory total by `delta` (service-side, admin-controlled).
+adjustSupply : SimpleRegistry -> ContractId TotalSupply -> Decimal -> Script (ContractId TotalSupply)
+adjustSupply registry supplyCid delta =
+  submit registry.admin $ exerciseCmd supplyCid TotalSupply_AdjustMinted with delta
+
+-- | Read the advisory total.
+readSupply : SimpleRegistry -> ContractId TotalSupply -> Script Decimal
+readSupply registry supplyCid =
+  submit registry.admin $ exerciseCmd supplyCid TotalSupply_Read with actor = registry.admin
